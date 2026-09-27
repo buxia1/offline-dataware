@@ -1,0 +1,22 @@
+# ---------- 运行时数据（体积大、可重建）----------
+mysql/data/
+starrocks/fe/meta/
+starrocks/be/storage/
+starrocks/fe/log/
+starrocks/be/log/
+ds/logs/
+kafka/
+
+# ---------- 下载的二进制依赖（几十 MB，不该进仓库）----------
+ds/libs/*.jar
+ds/bin/docker
+spark/jars/*.jar
+
+# ---------- 密钥与本地配置 ----------
+.env.local
+*.pem
+
+# ---------- 系统文件 ----------
+.DS_Store
+Thumbs.db
+*.swp

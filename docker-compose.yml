@@ -1,0 +1,107 @@
+services:
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: kafka
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft 单节点身份
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      # 双 listener：容器内用 29092，主机侧用 9092
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # 单副本
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      # 存储留在容器内，不挂载
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      # 内存压到 512M
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+
+  starrocks:
+    image: starrocks/allin1-ubuntu:3.5.0
+    container_name: starrocks
+    hostname: starrocks
+    restart: unless-stopped
+    mem_limit: 3g
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+      - "8040:8040"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./starrocks/fe/meta:/data/deploy/starrocks/fe/meta
+      - ./starrocks/fe/log:/data/deploy/starrocks/fe/log
+      - ./starrocks/be/storage:/data/deploy/starrocks/be/storage
+      - ./starrocks/be/log:/data/deploy/starrocks/be/log
+
+  spark:
+    image: apache/spark:3.5.1
+    container_name: spark
+    hostname: spark
+    restart: unless-stopped
+    mem_limit: 2g
+    environment:
+      TZ: Asia/Shanghai
+    entrypoint: ["tail", "-f", "/dev/null"]
+    volumes:
+      - ./scripts:/opt/offline-dw/scripts
+      - ./sql:/opt/offline-dw/sql
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    hostname: mysql
+    restart: unless-stopped
+    mem_limit: 600m
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: dolphinscheduler
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --innodb_buffer_pool_size=134217728
+    ports:
+      - "13306:3306"
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+
+  dolphinscheduler:
+    image: apache/dolphinscheduler-standalone-server:3.2.0
+    container_name: dolphinscheduler
+    hostname: dolphinscheduler
+    restart: unless-stopped
+    mem_limit: 2g
+    depends_on:
+      - mysql
+    ports:
+      - "12345:12345"
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_TYPE: mysql
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/dolphinscheduler?useUnicode=true&characterEncoding=UTF-8&allowMultiQueries=true&allowPublicKeyRetrieval=true&useSSL=false
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root123
+      SPRING_JACKSON_TIME_ZONE: Asia/Shanghai
+    volumes:
+      - ./ds/logs:/opt/dolphinscheduler/logs
+      - ./ds/libs/mysql-connector-java-8.0.30.jar:/opt/dolphinscheduler/libs/standalone-server/mysql-connector-java-8.0.30.jar
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./ds/bin/docker:/usr/local/bin/docker:ro

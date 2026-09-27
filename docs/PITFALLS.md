@@ -1,0 +1,593 @@
+# 踩坑记录
+
+搭建这个骨架时实际遇到的问题。**每条都带真实报错信息**，方便以后直接搜索。
+
+按"再次遇到的可能性"排序，越靠前越容易再踩。
+
+---
+
+## 一、数据正确性（最隐蔽，最难查）
+
+### 1.1 时区不统一导致日期错一天
+
+**现象**
+
+数据看起来完全正常，但 `dt` 和 `order_time` 对不上：
+
+```
+| dt         | order_time          |
+| 2026-09-22 | 2026-09-23 04:51:06 |   ← 差一天
+```
+
+统计发现 **667 / 2000 行**有这个问题——**正好三分之一**。
+
+**原因**
+
+链路上有三处时区，默认值不一致：
+
+| 环节 | 默认时区 | 后果 |
+|---|---|---|
+| Python 生成器（跑在 WSL） | **UTC** | 生成的时间字符串是 UTC |
+| Spark 算 `dt = to_date(order_time)` | **UTC** | `dt` 是 UTC 日期，与 `order_time` 内部一致 |
+| JDBC 写入，URL 里写了 `serverTimezone=Asia/Shanghai` | **+8** | Connector/J 把时间戳平移了 8 小时 |
+
+结果：`order_time` 被 +8 平移，**但 `dt` 是 DATE 类型，不受时区转换影响**。
+
+`order_time` 落在 UTC 16:00~23:59 的 8 小时区间的记录，平移后跨过午夜 → `dt` 差一天。**8/24 = 1/3，与实测完全吻合。**
+
+**为什么难查**
+
+- 不报错，不崩溃
+- 前面几轮跑下来都"正常"，直到给 DWD 加分区才暴露（`dt` 是分区键，值错了写不进去）
+- `count(*)`、金额合计这些总量指标全都是对的，只有日期维度错
+
+**解法：三处统一成 `Asia/Shanghai`**
+
+```bash
+# 1. WSL
+sudo timedatectl set-timezone Asia/Shanghai
+
+# 2. spark 容器（docker-compose.yml）
+environment:
+  TZ: Asia/Shanghai
+
+# 3. Spark session（scripts/ods_order_to_starrocks.py）
+spark = (SparkSession.builder
+    .appName("ods_order")
+    .config("spark.sql.session.timeZone", "Asia/Shanghai")
+    .getOrCreate())
+```
+
+**核心原则：`serverTimezone` 必须等于 JVM 的默认时区。**
+
+**验证方法**
+
+```sql
+SELECT count(*) AS total,
+       count(CASE WHEN dt <> DATE(order_time) THEN 1 END) AS mismatch
+FROM ods.ods_order;
+-- mismatch 必须是 0
+```
+
+---
+
+### 1.2 bind mount 到不存在的路径不报错
+
+**现象**
+
+```yaml
+volumes:
+  - ./aaa:/完全/不存在的/路径
+```
+
+容器正常启动，看起来挂上了，**实际什么都没挂**——Docker 会创建那个空目录，两边都是空的。
+
+最坑的是：**你以为数据持久化了，其实还在容器层里，容器一重建就全丢。**
+
+**为什么踩到**
+
+StarRocks allin1 镜像的真实路径不是 `/opt/starrocks/`，而是 **`/data/deploy/starrocks/`**。按常规猜的路径一个都不存在。
+
+**解法：挂载后必须用探针文件验证**
+
+```bash
+# 在容器里创建文件
+docker compose exec starrocks touch /data/deploy/starrocks/fe/log/probe.txt
+
+# 在宿主机确认能看到
+ls -l ./starrocks/fe/log/probe.txt
+
+# 能看到 → 挂载真的生效了；看不到 → 挂了个空目录
+```
+
+**通用做法：任何 bind mount 配好后，都跑一次探针测试。**
+
+**怎么找真实路径**
+
+```bash
+docker compose exec starrocks sh -c \
+  'find / -xdev -maxdepth 6 \( -name fe.conf -o -name be.conf \) 2>/dev/null'
+```
+
+配置文件所在的目录就是安装根目录，数据目录在它旁边。
+
+---
+
+### 1.3 ODS 全量重读 Kafka 导致重复
+
+**现象**
+
+同一批 1000 条数据，DWD 里出现 2000 行。
+
+**原因**
+
+Spark 脚本用 `startingOffsets=earliest`，**每次执行都把 Kafka 里所有消息重读一遍**。Kafka 的消息不会因为被读走而消失（只受保留策略控制），所以跑两次就是两遍。
+
+**这是设计使然，不是 bug** —— ODS 是追加层，重复由 DWD 去重解决。
+
+**但做实验时会把数字搞乱**。判断方法：看重复行数是不是**正好是整数倍**（我们遇到过 116 和 66，正好是单批次 58 和 33 的两倍）。
+
+**解法**
+
+- 做对照实验前，先删 topic 重建 + `TRUNCATE` 下游表
+- 生产环境改用增量（`startingOffsets=latest` + 维护 offset），或换 StarRocks Routine Load
+
+---
+
+## 二、DolphinScheduler
+
+### 2.1 SQL 任务的参数是 JDBC 绑定，不是文本替换
+
+**现象**
+
+```sql
+INSERT OVERWRITE dwd.dwd_order_detail PARTITION (p${bizdate})
+```
+
+报错：
+
+```
+No viable statement for input 'PARTITION (p'20260920''
+```
+
+**原因**
+
+DS 的 SQL 任务把 `${param}` 编译成 **JDBC 的 `?` 占位符**，不是字符串替换。日志里能看到铁证：
+
+```
+[INFO] prepare statement replace sql :
+       DELETE FROM dwd.dwd_order_detail WHERE dt = STR_TO_DATE(?, '%Y%m%d')
+       sql parameters : {1=Property{prop='bizdate', type=VARCHAR, value='20260920'}}
+```
+
+**`?` 只能填"值"，不能填"名字"**（表名、列名、分区名都是名字）。
+
+数据库解析 SQL 骨架时 `?` 的值还没送到，**它连去哪张表找列都不知道，整句话没法解析**。
+
+这与 SQL 子句的执行顺序（FROM → WHERE）无关——**解析和绑定都发生在执行之前**。
+
+**解法：要拼 SQL 结构，必须用 Shell 任务**
+
+| | SQL 任务 | Shell 任务 |
+|---|---|---|
+| 替换方式 | JDBC 参数绑定（`?`） | **纯文本替换** |
+| 值位置 | ✓ | ✓ |
+| 标识符位置 | ❌ | ✓ |
+| 格式转换 | ❌ | ✓（shell 切片、`date` 命令） |
+
+**规则：参数只当"值"用 → SQL 任务；要拼"结构" → Shell 任务。**
+
+---
+
+### 2.2 StarRocks 的 DELETE 只接受字面量
+
+**现象**
+
+```sql
+DELETE FROM dwd.dwd_order_detail
+WHERE dt = STR_TO_DATE('${bizdate}', '%Y%m%d')
+```
+
+报错：
+
+```
+Right expr of binary predicate should be value.
+```
+
+**原因**
+
+StarRocks 的删除**不是当场删数据**，而是记录一条**"删除谓词"**（delete predicate）到元数据，后续读取时过滤、后台合并时才物理删除。
+
+**谓词要长期保存，所以条件必须是能写死的字面量**，不能是表达式或占位符。
+
+| 字面量 | 表达式 |
+|---|---|
+| `'2026-09-20'`、`123` | `STR_TO_DATE(...)`、`1+1`、`UPPER(name)` |
+
+**同样的 `WHERE`，在 `SELECT` 里能用表达式，在 `DELETE` 里不行。**
+
+**解法：别用 `DELETE`，改用 `INSERT OVERWRITE`**
+
+`INSERT OVERWRITE` 是写操作，条件允许表达式，而且是**原子的**。
+
+**另一个更重要的理由**：`DELETE` + `INSERT` 的两步方案本身就不安全——
+
+- 依赖 DELETE 立即生效（实测**没生效，数据翻倍了**：82 → 164）
+- 两步之间有空窗，查询会看到"数据不存在"
+- 任一步失败会留下半完成状态
+
+**`INSERT OVERWRITE` 要么全换要么不变，没有这些问题。**
+
+---
+
+### 2.3 cron 表达式是 6~7 位，不是 Linux 的 5 位
+
+| | 字段数 | 例子 |
+|---|---|---|
+| Linux crontab | **5 位**：分 时 日 月 周 | `0 2 * * *` |
+| **DolphinScheduler（Quartz）** | **6~7 位**：**秒** 分 时 日 月 周 [年] | `0 0 2 * * ?` |
+
+**最前面多一个"秒"，而且"周"那一栏通常写 `?` 而不是 `*`**（日和周互斥，写 `*` 部分解析器会报冲突）。
+
+直接从 Linux 抄过来的表达式**永远不触发，而且不报错**。
+
+---
+
+### 2.4 新建定时任务的开始时间默认是"次日"
+
+**现象**
+
+定时配好了、也上线了，**干等一整天都不触发**。
+
+**原因**
+
+新建定时时，开始时间默认填的是**次日 00:00:00**。即使上线，也要等到明天。
+
+**解法**
+
+编辑定时任务，把开始时间改成**今天**（或当前时间之前）。
+
+---
+
+### 2.5 两个「上线」缺一不可
+
+- **工作流定义** 要上线
+- **定时任务** 也要上线
+
+少一个都不会自动执行。
+
+---
+
+### 2.6 删除节点后必须重连连线
+
+在画布上删掉一个节点后，上下游的连线会断开，**必须手工把线接上**，否则 DAG 结构不完整，节点会被跳过。
+
+---
+
+## 三、StarRocks 表与分区
+
+### 3.1 分区列必须是 key 列的一部分
+
+**现象**
+
+```sql
+DUPLICATE KEY(order_id)
+PARTITION BY RANGE(dt)
+```
+
+建表直接报错。
+
+**解法**
+
+```sql
+DUPLICATE KEY(order_id, dt)   -- dt 进 key
+```
+
+**副作用**：key 列必须是表的**前几列**，所以 `dt` 要从最后一列挪到前面。**这会静默弄坏现有的 `INSERT INTO ... SELECT`**——那种写法是按位置对应的，不看列名。
+
+**解法**：永远写显式列名。
+
+```sql
+INSERT INTO dwd.dwd_order_detail (order_id, dt, user_id, ...)
+SELECT order_id, dt, user_id, ... FROM ...
+```
+
+**这是 SQL 的通用纪律：别依赖列的位置，永远写列名。**
+
+---
+
+### 3.2 动态分区**不回溯**创建历史分区
+
+**现象**
+
+```sql
+PARTITION BY RANGE(dt) ()
+PROPERTIES (
+  "dynamic_partition.enable" = "true",
+  "dynamic_partition.start" = "-30",   -- 以为会创建过去 30 天
+  "dynamic_partition.end" = "3"
+)
+```
+
+结果只创建了 **4 个分区**（今天 ~ 今天+3），历史一天都没有。
+
+导入历史数据报错：
+
+```
+Error: The row is out of partition ranges. Please add a new partition.
+```
+
+**`dynamic_partition.start` 的作用是「保留」多少天历史（用于删除），不是「创建」。**
+
+**解法：手工补历史分区（这叫"补数"）**
+
+先关掉动态分区（否则不允许手工加）：
+
+```sql
+ALTER TABLE dwd.dwd_order_detail SET ("dynamic_partition.enable" = "false");
+
+ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260920
+  VALUES [('2026-09-20'), ('2026-09-21'));
+-- ... 每天一条
+```
+
+**生产上更推荐「表达式分区」**，任何日期都能按需自动建分区，没有这个范围问题。
+
+---
+
+### 3.3 动态分区表不允许手工 ADD/DROP PARTITION
+
+**现象**
+
+```
+Cannot add/drop partition on a Dynamic Partition Table,
+Use command ALTER TABLE tbl_name SET ("dynamic_partition.enable" = "false") firstly.
+```
+
+按报错提示先关掉即可：
+
+```sql
+ALTER TABLE dwd.dwd_order_detail SET ("dynamic_partition.enable" = "false");
+```
+
+---
+
+### 3.4 BE 自动探测内存不准，能拖垮整机
+
+**现象**
+
+```sql
+SHOW PROC '/backends'\G
+-- MemLimit: 6.282GB     ← 容器总共才 8GB！
+```
+
+BE 按"系统内存的 90%"自算上限，**在 cgroup 环境里探测不准**（StarRocks 官方 issue #43225、#29631 有记录）。一个失控查询就能把整台机器拖崩。
+
+**解法：容器级硬限制**
+
+```yaml
+starrocks:
+  mem_limit: 3g      # 加一行
+```
+
+改完 BE 的 `MemLimit` 降到 2.43GB。**这是硬保险，BE 再怎么涨也越不过 3GB。**
+
+---
+
+### 3.5 表模型选错会导致重跑数据翻倍
+
+| 表模型 | 重复写入的行为 | 适用层 |
+|---|---|---|
+| `DUPLICATE KEY` | **追加**，数据翻倍 | ODS、DWD（事实明细） |
+| `PRIMARY KEY` | **同键覆盖**，幂等 | DWS、ADS（汇总快照） |
+
+给 `DUPLICATE KEY` 的表配定时任务，**每跑一次数据就多一份**。
+
+---
+
+## 四、Spark 与依赖
+
+### 4.1 Ivy 缓存目录不可写
+
+**现象**
+
+```
+Exception in thread "main" java.io.FileNotFoundException:
+/home/spark/.ivy2/cache/resolved-org.apache.spark-spark-submit-parent-xxx.xml
+```
+
+**原因**
+
+Spark 官方镜像以 `spark` 用户运行，HOME 是 `/home/spark`，**该用户没权限创建 `.ivy2` 目录**。
+
+**解法**：把缓存指到全局可写的 `/tmp`
+
+```bash
+--conf spark.jars.ivy=/tmp/.ivy2
+```
+
+**代价**：容器重建（`docker compose up -d spark`）缓存就没了，下次要重下 30MB。
+
+---
+
+### 4.2 国内访问 Maven Central 会断流
+
+**现象**
+
+```
+[FAILED] com.mysql#mysql-connector-j;8.4.0!mysql-connector-j.jar:
+Downloaded file size (2211840) doesn't match expected Content Length (2533399)
+
+Server access error ... (javax.net.ssl.SSLHandshakeException: Remote host terminated the handshake)
+```
+
+**解法**
+
+```bash
+# 1. 先清掉失败的缓存（必须，否则 Ivy 认为这个坐标已处理过）
+docker compose exec spark bash -c \
+  'rm -rf /tmp/.ivy2/cache/com.mysql; rm -f /tmp/.ivy2/jars/com.mysql*'
+
+# 2. 用阿里云镜像重跑
+--repositories https://maven.aliyun.com/repository/public
+```
+
+**更稳的方案**：`curl` 手动下载（自带重试）后挂载进容器
+
+```bash
+curl -L --retry 5 --retry-delay 3 -o spark/jars/mysql-connector-j-8.4.0.jar \
+  https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar
+```
+
+```yaml
+volumes:
+  - ./spark/jars/mysql-connector-j-8.4.0.jar:/opt/spark/jars/mysql-connector-j-8.4.0.jar:ro
+```
+
+**挂单个文件是安全的**——不会遮蔽 `/opt/spark/jars` 目录里自带的几百个 jar。**挂整个目录才会。**
+
+---
+
+## 五、Kafka
+
+### 5.1 advertised listener 配错会静默超时
+
+**现象**
+
+客户端能连上 `kafka:29092`，然后卡住超时。**用 `nc`、`telnet`、`ping` 测试全都是通的。**
+
+**原因**
+
+Kafka 客户端连接分两个阶段：
+
+1. 连 bootstrap server
+2. 发 `METADATA` 请求，broker 返回一份**自己写的地址表**
+3. 客户端**断开**，按表里的地址重新连接
+
+第 3 步用的是 `ADVERTISED_LISTENERS` 里配的地址，**不是客户端连进来的地址**。
+
+只配 `localhost:9092` 的话，Spark 容器拿到的地址就是 `localhost:9092`——**那是容器自己**。
+
+**为什么难查**：TCP 层成功、元数据请求成功，只有第三步失败。所以所有连通性测试都显示"正常"。
+
+**解法：双 listener**
+
+```yaml
+KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+```
+
+| listener | 给谁用 |
+|---|---|
+| `PLAINTEXT://kafka:29092` | **容器之间**（Spark 等） |
+| `PLAINTEXT_HOST://localhost:9092` | WSL 主机 / Windows 侧 |
+
+**规则：客户端从哪条 listener 进来，broker 就报那条 listener 对应的 advertised 地址。**
+
+**真正的验证方法**（需要一个 Kafka 客户端从别的容器发起）：
+
+```bash
+docker network ls | grep offline
+docker run --rm --network offline-dw_default apache/kafka:3.8.1 \
+  /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+```
+
+---
+
+### 5.2 单节点必须显式设置单副本
+
+**现象**
+
+Kafka 启动后卡在创建内部 topic。
+
+**原因**
+
+Kafka 的 `__consumer_offsets` 等内部 topic **默认要 3 副本**，单节点凑不出来，一直重试超时。
+
+**解法**
+
+```yaml
+KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+```
+
+**StarRocks 也一样**：单 BE 建表必须写 `"replication_num" = "1"`，否则报
+`Failed to find enough host with storage medium and tag`。
+
+---
+
+## 六、Docker 与 WSL
+
+### 6.1 项目代码必须放在 WSL 文件系统里
+
+**不要放在 `/mnt/d/` 或 `/mnt/e/`。**
+
+跨文件系统读写在 WSL2 里慢 **5~10 倍**，Kafka 和 Spark 会被拖死。
+
+放 `~/`（`/home/<user>/`）下面。
+
+### 6.2 WSL 内存配置在 `.wslconfig`，不在单个发行版里
+
+```ini
+[wsl2]
+memory=8GB
+```
+
+这个设置**对所有发行版生效**（Ubuntu + docker-desktop 共享同一个虚拟机），改了要 `wsl --shutdown` 重进。
+
+### 6.3 Docker 磁盘镜像会疯涨，要提前挪到非系统盘
+
+`docker_data.vhdx` 存放所有镜像、容器、数据卷，**只涨不缩**。
+
+这套栈跑起来 30~60GB 是常态。Docker Desktop → Settings → **Resources → Advanced → Disk image location** 可以改位置（**不在 WSL Integration 那一页**）。
+
+---
+
+## 七、shell 引号
+
+### 7.1 双引号里套双引号会被 bash 吃掉
+
+**现象**
+
+```bash
+docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot \
+  -e "ALTER TABLE tbl SET ("dynamic_partition.enable" = "false");"
+```
+
+bash 遇到第一个内层 `"` 就认为外层字符串结束了，实际传给 mysql 的是：
+
+```
+ALTER TABLE tbl SET (dynamic_partition.enable = false);
+```
+
+引号没了 → 语法错误。
+
+**三种解法**
+
+| 解法 | 写法 |
+|---|---|
+| 内层改单引号 | `-e "ALTER TABLE t SET ('k' = 'v');"` |
+| 转义 | `-e "ALTER TABLE t SET (\"k\" = \"v\");"` |
+| **写进 .sql 文件** ← 推荐 | `mysql ... < xxx.sql` |
+
+**一旦 SQL 里开始出现引号，就该用文件而不是 `-e "..."`。**
+
+---
+
+## 八、一条通用的排查思路
+
+**要证明"A 导致了 B"，光看 B 的样子不够——先让 B 消失，再看 A 能不能把它变回来。**
+
+验证调度是否真的生效：
+
+```bash
+# 1. 手工清空所有下游表
+# 2. 确认全是 0
+# 3. 点执行
+# 4. 数据自己回来了 → 只可能是调度器干的
+```
+
+**"先破坏，再重建"比"对比结果"强得多。**
+
+**更省事的做法：在设计工作流时就把"清空"节点放进去。** 它既解决了幂等问题，又让整个流程变成自证的——不用事后想办法证明。
