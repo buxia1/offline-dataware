@@ -15,9 +15,24 @@
                     └──────────────────────────────────────────┘
                                         │
                                         ▼
+  订单链路（已接入 DS 调度）
   Python 脚本  ──►  Kafka  ──►  Spark  ──►  StarRocks
-  模拟数据        消息队列      批处理       ODS → DWD → DWS → ADS
+  模拟订单        消息队列      批处理       ODS → DWD → DWS → ADS
+
+  商品 / 维度链路（手工执行，尚未接调度）
+  Python 脚本  ──►  CSV  ──►  Stream Load  ──►  StarRocks
+  模拟商品快照     文件同步     HTTP 导入       ODS → DIM(SCD2) → DWD
 ```
+
+**两条链路的差异是刻意的**：
+
+| | 订单链路 | 商品链路 |
+|---|---|---|
+| 数据形态 | **事件流**，一条一条持续产生 | **实体状态**，每天一份全量快照 |
+| 传输方式 | Kafka + Spark | CSV 文件 + Stream Load |
+| 同步节奏 | 按天增量 | 按天全量快照 |
+
+真实业务里商品也是整表导出走 DataX，不走消息队列 —— **事件用流、实体用快照**是通用的分层原则。
 
 | 组件 | 版本 | 职责 | 端口 |
 |---|---|---|---|
@@ -35,6 +50,7 @@
 offline-dw/
 ├── docker-compose.yml              所有服务定义
 ├── README.md
+├── data/dim/                        商品快照 CSV（生成物，不进版本库）
 ├── docs/
 │   ├── PITFALLS.md                 踩坑记录（最有价值的部分）
 │   └── dolphinscheduler-workflow.md  DS 工作流的节点配置
@@ -43,11 +59,23 @@ offline-dw/
 │   ├── dwd_order_detail.sql
 │   ├── dwd_add_history_partitions.sql
 │   ├── dws_user_order_day.sql
-│   └── ads_daily_sales.sql
+│   ├── ads_daily_sales.sql
+│   │   ── 商品 / 维度链路 ──
+│   ├── ods_product.sql                    商品快照落地层（保留全部历史）
+│   ├── dim_product.sql                    商品维度 SCD1（只有当前状态）
+│   ├── dim_product_load.sql               SCD1 装载
+│   ├── dim_product_scd2.sql               商品维度 SCD2 拉链表
+│   ├── dim_product_scd2_load.sql          SCD2 装载（TRUNCATE + INSERT 合一）
+│   ├── dwd_order_sku_detail.sql           订单 + 商品属性宽表
+│   ├── dwd_order_sku_detail_add_partitions.sql  补历史分区
+│   └── dwd_order_sku_detail_load.sql      物化装载（Shell 模板）
 ├── scripts/
-│   ├── gen_mock_orders.py          模拟数据生成器
+│   ├── gen_mock_orders.py          模拟订单生成器
 │   ├── ods_order_to_starrocks.py   Spark 作业：Kafka → ODS
-│   └── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
+│   ├── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
+│   ├── gen_mock_products.py        模拟商品快照生成器（支持 --date 造历史）
+│   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
+│   └── dwd_sku_load.sh             商品宽表逐天物化
 ├── kafka/                          空目录（Kafka 数据不挂载）
 ├── starrocks/
 │   ├── fe/{conf,log,meta}          meta 挂载用于持久化
@@ -171,6 +199,20 @@ docker compose exec spark /opt/spark/bin/spark-submit \
   --repositories https://maven.aliyun.com/repository/public
 ```
 
+### 5b. 商品链路（独立于订单链路）
+
+商品/维度链路额外需要 5 张表：
+
+```bash
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
+```
+
+完整跑法见「商品 / 维度链路」一节。
+
 ### 6. DolphinScheduler
 
 浏览器打开 <http://localhost:12345/dolphinscheduler/ui>
@@ -186,9 +228,64 @@ docker compose exec spark /opt/spark/bin/spark-submit \
 | 层 | 表模型 | 说明 |
 |---|---|---|
 | **ODS** | `DUPLICATE KEY` | 原始落地，纯追加，保留所有脏数据 |
+| **DIM** | `PRIMARY KEY` | 维度表。SCD1 只留当前状态；SCD2 拉链表留全部版本 |
 | **DWD** | `DUPLICATE KEY` + 按 `dt` 分区 | 清洗后的订单明细，一行一个订单 |
 | **DWS** | `PRIMARY KEY(user_id, dt)` | 按用户按天汇总（原子指标） |
 | **ADS** | `PRIMARY KEY(dt)` | 每日大盘（派生指标：客单价、支付率） |
+
+**商品链路的分层落点**：
+
+```
+ods.ods_product            每天一份全量快照（DUPLICATE KEY，一行不覆盖）
+        │
+        ├──► dim.dim_product         SCD1：每商品 1 行，只有"现在"
+        │
+        └──► dim.dim_product_scd2    SCD2：每商品 N 行（N=变更次数+1），能回答"当时"
+                    │
+                    └──► dwd.dwd_order_sku_detail
+                         订单 + 下单当天的商品属性（品类/品牌/单价）
+```
+
+**SCD1 和 SCD2 的区别**（同一份 ODS 原料，两种用法）：
+
+| | `dim_product`（SCD1） | `dim_product_scd2`（SCD2） |
+|---|---|---|
+| 主键 | `product_id` | `(product_id, valid_from)` |
+| 行数 | 每商品 1 行 | 每商品 N 行（N = 变更次数 + 1） |
+| 时间列 | 无 | `valid_from` / `valid_to` / `is_current` |
+| 能回答 | 商品**现在**是什么品类 | 商品**在 9-20 那天**是什么品类 |
+| 用途 | 看当前状态 | 历史回溯（订单口径必须用这个） |
+
+**为什么 SCD2 的 `valid_to` 用哨兵值 `9999-12-31` 而不是 `NULL`**：JOIN 条件要写 `dt BETWEEN valid_from AND valid_to`，`BETWEEN` 遇到 `NULL` 返回 `NULL`，当前版本就永远匹配不上。
+
+**⚠️ 全局必须过的不变式**（改任何装载 SQL 之后都重跑一遍）：
+
+```sql
+-- ① 每个商品恰好一个当前版本，ratio 必须 = 1.00
+SELECT count(*) AS rows_, count(DISTINCT product_id) AS pids,
+       sum(is_current) AS cur,
+       round(sum(is_current)/count(DISTINCT product_id), 2) AS ratio
+FROM dim.dim_product_scd2;
+
+-- ② 版本区间无重叠、无空洞 → broken_links 必须 = 0
+SELECT sum(CASE WHEN next_from IS NULL THEN 0
+                WHEN DATE_ADD(valid_to, INTERVAL 1 DAY) <> next_from THEN 1
+                ELSE 0 END) AS broken_links
+FROM (SELECT product_id, valid_to,
+             LEAD(valid_from) OVER (PARTITION BY product_id ORDER BY valid_from) AS next_from
+      FROM dim.dim_product_scd2) t;
+
+-- ③ is_current 与 valid_to 自洽 → 两个都必须是 0
+SELECT sum(CASE WHEN is_current = 1 AND valid_to <> DATE '9999-12-31' THEN 1 ELSE 0 END) AS bad_current,
+       sum(CASE WHEN is_current = 0 AND valid_to  = DATE '9999-12-31' THEN 1 ELSE 0 END) AS bad_closed
+FROM dim.dim_product_scd2;
+
+-- ④ 物化对账：行数和金额必须完全相等
+SELECT (SELECT count(*) FROM dwd.dwd_order_detail)                AS order_rows,
+       (SELECT count(*) FROM dwd.dwd_order_sku_detail)            AS sku_rows,
+       (SELECT round(sum(amount),2) FROM dwd.dwd_order_detail)    AS order_total,
+       (SELECT round(sum(amount),2) FROM dwd.dwd_order_sku_detail) AS sku_total;
+```
 
 **清洗规则（DWD）：**
 
@@ -199,6 +296,87 @@ docker compose exec spark /opt/spark/bin/spark-submit \
 | 同一 `order_id` 只保留金额最大的一条 | 约 2% |
 
 **去重排序键用 `ABS(amount)` 而不是 `amount`** —— 负数只是脏数据，金额的绝对值才是业务事实。
+
+---
+
+## 商品 / 维度链路
+
+### 怎么跑
+
+```bash
+cd ~/offline-dw
+
+# 1. 生成商品快照 CSV（--date 造历史快照）
+python3 scripts/gen_mock_products.py --date 2026-09-20
+python3 scripts/gen_mock_products.py --date 2026-09-21
+python3 scripts/gen_mock_products.py --date 2026-09-26
+
+# 2. 建表（只需一次）
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
+
+# 3. CSV → ODS（Stream Load，snapshot_date 从文件名自动解析）
+bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260920.csv
+bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260921.csv
+bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260926.csv
+
+# 4. DIM 层：SCD1 快照 与 SCD2 拉链表
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_load.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2_load.sql
+
+# 5. DWD 宽表：订单 + 下单当天的商品属性（逐天 INSERT OVERWRITE）
+bash scripts/dwd_sku_load.sh
+
+# 6. 验证（4 条不变式见上一节）
+docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+SELECT count(*) AS rows_, count(DISTINCT product_id) AS pids, sum(is_current) AS cur,
+       round(sum(is_current)/count(DISTINCT product_id),2) AS ratio
+FROM dim.dim_product_scd2;"
+```
+
+### ⚠️ SCD2 装载必须是"清空 + 重建"一次执行
+
+`sql/dim_product_scd2_load.sql` 里 **`TRUNCATE` 和 `INSERT` 写在同一个文件**，理由：
+
+`is_current` 没有任何约束能保护它。主键 `(product_id, valid_from)` 只保证"版本不重复"，**保证不了"每个商品恰好一个 `is_current=1`"** —— 那是业务语义，只能靠装载 SQL 算对。
+
+如果只跑 `INSERT`（不清空），重跑会叠加出**一个商品两个"当前版本"**，`ratio` 变成 `2.00`，而且**不报错**。
+
+> **规则：需要"清空 + 重建"的操作必须放在同一个文件里，一次执行。**
+> 一个"可以忘记执行就会弄坏数据"的文件拆分，是设计缺陷，不是使用者的错。
+
+### 验证版本数是否合理（比 `ratio` 更强）
+
+```sql
+-- 版本数 = 该商品真正发生变更的次数 + 1，不是快照天数
+SELECT product_id, count(*) AS versions
+FROM dim.dim_product_scd2 GROUP BY product_id HAVING count(*) > 1 ORDER BY product_id;
+
+-- 交叉验证：各快照之间真正有差异的商品数，应该和上面的商品集合一致
+SELECT count(*) AS changed_products FROM ods.ods_product a JOIN ods.ods_product b
+  ON a.product_id = b.product_id
+ AND a.snapshot_date = '2026-09-20' AND b.snapshot_date = '2026-09-21'
+WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
+```
+
+**本项目实际结果**：09-26 那批和 09-21 **完全相同**（差异 0 行），所以每个商品只有 2 个版本（09-20、09-21）—— **快照相同不产生新版本，这是 SCD2 的正确行为**，不是漏数据。
+
+### 为什么必须物化到 DWD
+
+`dwd_order_sku_detail` 的 JOIN 条件是 `o.dt BETWEEN s.valid_from AND s.valid_to`，**这是范围 JOIN，哈希优化用不上**（哈希只能回答"相不相等"，回答不了"落不落在区间里"）。
+
+实测对比：
+
+| 写法 | 耗时 |
+|---|---|
+| 单表聚合（无 JOIN） | 0.37 秒 |
+| 等值 JOIN（把 `BETWEEN` 去掉） | 0.37 秒 |
+| **`BETWEEN` 范围 JOIN** | **1 分 41 秒** |
+
+所以把 JOIN 的结果**物化**到 DWD，让这个代价**每天付一次**，而不是每次查询都付。
 
 ---
 
@@ -226,8 +404,12 @@ truncate_ods → ods_spark → dwd_overwrite → dws_agg → ads_metric
 
 | 层 | 靠什么保证 |
 |---|---|
-| ODS | 工作流开头 `TRUNCATE`，从 Kafka 全量重建 |
-| DWD | `INSERT OVERWRITE ... PARTITION (p<日期>)`，原子覆盖当天分区 |
+| ODS（订单） | 工作流开头 `TRUNCATE`，从 Kafka 全量重建 |
+| ODS（商品） | 用文件名解析出的 `label` 做 Stream Load 事务标签，**同一天重复导入会被拒绝** |
+| DWD（订单） | `INSERT OVERWRITE ... PARTITION (p<日期>)`，原子覆盖当天分区 |
+| DWD（商品宽表） | 同上，`dwd_sku_load.sh` 逐天 `INSERT OVERWRITE` |
+| DIM（SCD1） | `PRIMARY KEY` 表模型，同键自动覆盖 |
+| **DIM（SCD2）** | **`TRUNCATE` + `INSERT` 合一的装载 SQL**（主键挡不住版本漂移，见上文） |
 | DWS / ADS | `PRIMARY KEY` 表模型，同键自动覆盖 |
 
 **验证方法**：连续执行两次工作流，对比三层的行数和金额，必须完全一致。
@@ -252,6 +434,24 @@ SELECT dt, count(*) AS cnt FROM dwd.dwd_order_detail GROUP BY dt ORDER BY dt;"
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B -e "
 SHOW PARTITIONS FROM dwd.dwd_order_detail;" | cut -f2 | sort
 
+# SCD2 不变式：ratio 必须 = 1.00
+docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+SELECT count(*) AS rows_, sum(is_current) AS cur,
+       round(sum(is_current)/count(DISTINCT product_id),2) AS ratio
+FROM dim.dim_product_scd2;"
+
+# 物化对账：两边行数与金额必须完全相等
+docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+SELECT (SELECT count(*) FROM dwd.dwd_order_detail)                 AS order_rows,
+       (SELECT count(*) FROM dwd.dwd_order_sku_detail)             AS sku_rows,
+       (SELECT round(sum(amount),2) FROM dwd.dwd_order_detail)     AS order_total,
+       (SELECT round(sum(amount),2) FROM dwd.dwd_order_sku_detail) AS sku_total;"
+
+# 业务报表：各品类每天销售额
+docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+SELECT dt, category, count(*) AS orders, round(sum(amount),2) AS sales
+FROM dwd.dwd_order_sku_detail GROUP BY dt, category ORDER BY dt, sales DESC;"
+
 # 容器状态与内存
 docker compose ps
 docker stats --no-stream
@@ -270,15 +470,22 @@ docker compose restart dolphinscheduler
 3. **StarRocks 用的是 allin1 单容器**（FE + BE 合一），仅供开发验证，不能上生产。
 4. **Kafka 数据未挂载**（放在容器内 `/tmp`），容器重建即丢失。ODS 层靠工作流重跑重建。
 5. **Spark 依赖缓存也在容器内**（`/tmp/.ivy2`），容器重建要重新下载 30MB。
+6. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
+7. **商品链路未接入 DS 调度** —— 目前是手工执行 `bash scripts/*.sh`。
+8. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
 
 ## 后续方向
 
-- [ ] 数据质量检查节点（DQC）
+- [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
+- [ ] **把商品/维度链路接进 DolphinScheduler**
+- [ ] 数据质量检查节点（DQC）—— 把上面的 4 条不变式固化成 DS 节点
+- [ ] SCD2 改增量维护，并与全量重建做等价性验证
+- [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
 - [ ] 作业失败告警（邮件 / 钉钉）
-- [ ] 用 DS 补数回填历史数据
-- [ ] 维度建模：商品维度、用户维度、缓慢变化维（SCD）
+- [ ] 用 DS 补数回填历史数据（**注意：DWD 那天的分区必须先存在**）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
+- [ ] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
 
 ---
 

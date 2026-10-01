@@ -20,3 +20,6 @@ spark/jars/*.jar
 .DS_Store
 Thumbs.db
 *.swp
+
+# ---------- 生成物（可重建，内容随运行时刻变化）----------
+data/
