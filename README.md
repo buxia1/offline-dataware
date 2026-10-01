@@ -429,6 +429,27 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 
 **这是「静默损坏」类问题** —— 只有靠执行策略从源头禁止并发才能防住。
 
+### 补数（回填历史）
+
+**补数的完整链条**（因为商品链路读订单链路的 DWD）：
+
+```
+① 补订单链路 offline_dataware      → dwd_order_detail 多出几天
+② 补 dwd_order_sku_detail 的分区    → 手工 ALTER（见「已知限制 9」）
+③ 跑商品链路 dim_product_chain      → dwd_order_sku_detail 自动跟上
+```
+
+**第③ 步为什么能自动跟上**：`dwd_sku_load.sh` 里是 `SELECT DISTINCT dt FROM dwd_order_detail` —— **动态取天数**，不写死。
+
+**实测的两个坑**：
+
+| 坑 | 表现 | 正确做法 |
+|---|---|---|
+| **日期偏移** | 补数范围写 `09-22 ~ 09-26`，**实际处理的是 `09-21 ~ 09-25`** | `${system.biz.date}` = **调度日期 − 1 天**。验证方法：看 DS 日志里的 `D=20xxxxxx` |
+| **实例被静默丢掉** | 5 个日期的实例**只跑了 1 个**，而且不报错 | 执行方式必须选「**串行执行**」—— 工作流执行策略是「串行丢弃」，并行补数会被丢掉 |
+
+**先看日志验证日期映射，再决定补数范围** —— 别猜。
+
 详细节点配置见 `docs/dolphinscheduler-workflow.md`。
 
 ---
@@ -542,7 +563,7 @@ docker compose restart dolphinscheduler
 6. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
 7. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
 8. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
-9. **补数前必须先确认分区存在** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919`、`p20260922`~`p20260925` 等分区（动态分区只创建"未来"，不创建历史）。
+9. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这个痛点会反复出现**，修法方向见「后续方向」。
 10. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
 
 ## 后续方向
@@ -550,12 +571,13 @@ docker compose restart dolphinscheduler
 - [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
 - [x] **把商品/维度链路接进 DolphinScheduler**（含跨工作流依赖 + 定时）
 - [x] 数据质量检查节点（DQC）—— 5 项检查 + 自检
+- [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
+- [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
+- [ ] **修掉「补数要手工补分区」这个痛点** —— 两个方向：在 `dwd_sku_load.sh` 里**自动 `ADD PARTITION`**，或把 `dwd_order_sku_detail` 改成**表达式分区**（PITFALLS §3.2 已推荐过，任何日期按需自动建分区）
+- [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
 - [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
-- [ ] 用 DS 补数回填历史数据（**注意：DWD 那天的分区必须先存在**）
-- [ ] 补上 `ods_order` 里 09-22~09-25 那 4 天（有数据但从未 materialize 进 DWD）
-- [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
 - [ ] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
