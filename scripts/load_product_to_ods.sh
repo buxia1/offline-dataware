@@ -19,6 +19,11 @@
 
 set -e
 
+# ---- 目标 StarRocks 主机 ----
+# 宿主上直接跑：默认 localhost
+# 在容器里跑（DS 调度时）：传 SR_HOST=starrocks
+SR_HOST="${SR_HOST:-localhost}"
+
 # ---- 参数校验 ----
 CSV="$1"
 if [ -z "$CSV" ]; then
@@ -38,8 +43,18 @@ fi
 D=$(basename "$CSV" .csv | rev | cut -c1-8 | rev)
 DF="${D:0:4}-${D:4:2}-${D:6:2}"
 
+# ---- 导入标签（每次运行唯一）----
+# 标签是 StarRocks"同一次导入只生效一次"的保护，存在 FE 元数据里，
+# TRUNCATE 清不掉它，默认保留 3 天（label_keep_max_second=259200）。
+# 固定标签会导致重跑被 "Label Already Exists" 拒绝 → 工作流无法重跑。
+# 本链路每次都是"清空 + 全量重灌"，重跑结果必然一致，不需要标签防重复。
+LABEL="ods_product_${D}_$(date +%s)"
+
+
 echo "CSV 文件   : $CSV"
 echo "快照日期   : $D  →  $DF"
+echo "目标主机   : $SR_HOST:8040"
+echo "导入标签   : $LABEL"
 
 # ---- Stream Load ----
 # 【每个 header 的作用】
@@ -58,7 +73,7 @@ echo "快照日期   : $D  →  $DF"
 #   label             : 事务标签。同一个 label 重复提交会被拒绝（幂等保护）
 #   -T                : upload-file，把文件内容 PUT 上去
 RESP=$(curl -s -L -X PUT \
-  "http://localhost:8040/api/ods/ods_product/_stream_load" \
+  "http://${SR_HOST}:8040/api/ods/ods_product/_stream_load" \
   -H "Authorization: Basic cm9vdDo=" \
   -H "Expect: 100-continue" \
   -H "format: csv" \
@@ -67,7 +82,7 @@ RESP=$(curl -s -L -X PUT \
   -H "strict_mode: true" \
   -H "max_filter_ratio: 0" \
   -H "columns: product_id, product_name, category, brand, price, status, update_time, snapshot_date='${DF}'" \
-  -H "label: ods_product_${D}" \
+  -H "label: ${LABEL}" \
   -T "$CSV")
 
 echo "$RESP"

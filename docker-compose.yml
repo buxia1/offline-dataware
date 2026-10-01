@@ -61,6 +61,7 @@ services:
     volumes:
       - ./scripts:/opt/offline-dw/scripts
       - ./sql:/opt/offline-dw/sql
+      - ./data:/opt/offline-dw/data
 
   mysql:
     image: mysql:8.0
@@ -105,3 +106,5 @@ services:
       - ./ds/libs/mysql-connector-java-8.0.30.jar:/opt/dolphinscheduler/libs/standalone-server/mysql-connector-java-8.0.30.jar
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ds/bin/docker:/usr/local/bin/docker:ro
+      - ./sql:/opt/offline-dw/sql:ro
+      - ./scripts:/opt/offline-dw/scripts:ro
