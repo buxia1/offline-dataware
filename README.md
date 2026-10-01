@@ -15,13 +15,14 @@
                     └──────────────────────────────────────────┘
                                         │
                                         ▼
-  订单链路（已接入 DS 调度）
+  订单链路（DS 工作流 offline_dataware）
   Python 脚本  ──►  Kafka  ──►  Spark  ──►  StarRocks
   模拟订单        消息队列      批处理       ODS → DWD → DWS → ADS
 
-  商品 / 维度链路（手工执行，尚未接调度）
+  商品 / 维度链路（DS 工作流 dim_product_chain）
   Python 脚本  ──►  CSV  ──►  Stream Load  ──►  StarRocks
-  模拟商品快照     文件同步     HTTP 导入       ODS → DIM(SCD2) → DWD
+  模拟商品快照     文件同步     HTTP 导入       ODS → DIM(SCD1/SCD2) → DWD
+  ⚠️ 生成器不在调度里（CSV 视为"上游同步"），调度从 Stream Load 开始
 ```
 
 **两条链路的差异是刻意的**：
@@ -268,7 +269,11 @@ SELECT count(*) AS rows_, count(DISTINCT product_id) AS pids,
 FROM dim.dim_product_scd2;
 
 -- ② 版本区间无重叠、无空洞 → broken_links 必须 = 0
+--   ⚠️ 第二行 WHEN 不能省。DATE_ADD(DATE '9999-12-31', INTERVAL 1 DAY) 返回 NULL，
+--   而 NULL <> next_from 是 NULL（不是 TRUE），CASE 会落到 ELSE 0 ——
+--   于是"永久有效的版本后面又跟了一个版本"这种断裂会被静默放过。
 SELECT sum(CASE WHEN next_from IS NULL THEN 0
+                WHEN valid_to = DATE '9999-12-31' THEN 1
                 WHEN DATE_ADD(valid_to, INTERVAL 1 DAY) <> next_from THEN 1
                 ELSE 0 END) AS broken_links
 FROM (SELECT product_id, valid_to,
@@ -382,17 +387,47 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 
 ## 调度
 
-工作流 `offline_dataware`，5 个节点串行：
+**两个工作流，商品链路依赖订单链路**：
 
 ```
-truncate_ods → ods_spark → dwd_overwrite → dws_agg → ads_metric
-    SQL          Shell          Shell          SQL        SQL
+┌─ offline_dataware（订单链路，每天 02:00）──────────────────────┐
+│  truncate_ods → ods_spark → dwd_delete → dws_agg → ads_metric  │
+│     SQL          Shell        Shell        SQL        SQL      │
+└────────────────────────────────────────────────────────────────┘
+                              │ 今天成功
+                              ▼
+┌─ dim_product_chain（商品链路，每天 03:00）──────────────────────────┐
+│  wait_order_chain → truncate_and_load_ods → dim_product_load →      │
+│     DEPENDENT            Shell                   Shell              │
+│        → dim_product_scd2_load → dwd_sku_reload → dq_check          │
+│                 Shell                 Shell          Shell          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-- 日期参数用内置的 `${system.biz.date}`（`yyyyMMdd`，即"昨天"）
-- **DWD 用 Shell 任务而不是 SQL 任务**（原因见 PITFALLS：DS 的 SQL 任务参数是 JDBC 绑定，拼不了分区名）
-- 定时：`0 0 2 * * ?`（每天凌晨 2 点）
-- 回填历史数据用 DS 的**补数**功能
+### 商品链路为什么「定时」和「依赖」两个都要
+
+| | 作用 | 缺了会怎样 |
+|---|---|---|
+| **定时 03:00** | **触发**工作流 | 没有任何东西会启动它，`wait_order_chain` 永远不会被评估 |
+| **`wait_order_chain`**（依赖节点）| **确认**订单链路今天已经成功 | 订单链路慢或失败时会读到过期的 `dwd_order_detail`，算出错的结果 |
+
+依赖节点配置：类型「工作流」→ `offline_dataware` → 任务「**ALL**」→ 周期「今天」→ 失败策略「**等待**」。
+
+### 两个工作流都必须用「串行丢弃」
+
+`offline_dataware` 和 `dim_product_chain` 的执行策略都是 **`SERIAL_DISCARD`（串行丢弃）**，不是默认的「并行」。
+
+**原因**：两者都含 `TRUNCATE`。如果允许同一工作流的两个实例并发运行，会出现：
+
+```
+实例A: TRUNCATE ods_product ✓
+实例A: 导入 CSV-09-20 ✓
+实例B: TRUNCATE ods_product      ← 把 A 刚导入的清掉了
+        ↓
+最终既丢数据又重复，而且不报错
+```
+
+**这是「静默损坏」类问题** —— 只有靠执行策略从源头禁止并发才能防住。
 
 详细节点配置见 `docs/dolphinscheduler-workflow.md`。
 
@@ -405,7 +440,7 @@ truncate_ods → ods_spark → dwd_overwrite → dws_agg → ads_metric
 | 层 | 靠什么保证 |
 |---|---|
 | ODS（订单） | 工作流开头 `TRUNCATE`，从 Kafka 全量重建 |
-| ODS（商品） | 用文件名解析出的 `label` 做 Stream Load 事务标签，**同一天重复导入会被拒绝** |
+| ODS（商品） | 工作流开头 `TRUNCATE ods_product`，再全量重灌所有快照；Stream Load 标签**每次运行唯一** |
 | DWD（订单） | `INSERT OVERWRITE ... PARTITION (p<日期>)`，原子覆盖当天分区 |
 | DWD（商品宽表） | 同上，`dwd_sku_load.sh` 逐天 `INSERT OVERWRITE` |
 | DIM（SCD1） | `PRIMARY KEY` 表模型，同键自动覆盖 |
@@ -413,6 +448,22 @@ truncate_ods → ods_spark → dwd_overwrite → dws_agg → ads_metric
 | DWS / ADS | `PRIMARY KEY` 表模型，同键自动覆盖 |
 
 **验证方法**：连续执行两次工作流，对比三层的行数和金额，必须完全一致。
+
+### 更严格：用指纹验证
+
+行数一样**不代表**数据一样 —— 品类改了、版本区间挪了，行数都可能纹丝不动。用 `sql/fingerprint_product_chain.sql` 把**每一行的每一列**都算进一个数字：
+
+```bash
+# 跑工作流【之前】记一次
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
+
+# 执行工作流，然后用【同一条命令】再记一次
+# 四个指纹必须一字不差
+```
+
+原理：`sum(crc32(一行所有列拼成的字符串))`。用 `sum` 而不是整表算 md5，是因为**数据库里行的物理顺序不保证**，而 `sum` 与顺序无关 —— 否则同样的数据会算出不同指纹，白查半天。
+
+**它还能发现「非确定性」**：如果**没改任何代码**，两次指纹却不同 → 说明链路里藏了不确定性（SQL 里用了 `now()`、或 `ORDER BY` 有并列值导致每次取到不同的行）。**这类 bug 极难发现，指纹几乎是唯一能抓住它的手段。**
 
 ---
 
@@ -439,6 +490,24 @@ docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT count(*) AS rows_, sum(is_current) AS cur,
        round(sum(is_current)/count(DISTINCT product_id),2) AS ratio
 FROM dim.dim_product_scd2;"
+
+# 【一条命令跑完 5 项数据质量检查】全部通过 = 没有任何输出，退出码 0
+bash scripts/dqc_dim_product.sh
+
+# 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_dim_product_selftest.sql
+
+# 【指纹】跑工作流前后各执行一次，输出必须一字不差
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
+
+# 两个工作流的真实状态（权威来源，导出 JSON 不可信，见「重要提醒」）
+docker compose exec -T mysql mysql -uroot -proot123 dolphinscheduler -e "
+SELECT p.name, p.version, p.release_state AS def_online,
+       p.execution_type AS exec_type, s.crontab, s.release_state AS sched_online
+FROM t_ds_process_definition p
+LEFT JOIN t_ds_schedules s ON s.process_definition_code = p.code
+ORDER BY p.name;" 2>/dev/null
+# def_online/sched_online: 1=上线 0=下线    exec_type: 0=并行 1=串行等待 2=串行丢弃
 
 # 物化对账：两边行数与金额必须完全相等
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
@@ -471,18 +540,22 @@ docker compose restart dolphinscheduler
 4. **Kafka 数据未挂载**（放在容器内 `/tmp`），容器重建即丢失。ODS 层靠工作流重跑重建。
 5. **Spark 依赖缓存也在容器内**（`/tmp/.ivy2`），容器重建要重新下载 30MB。
 6. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
-7. **商品链路未接入 DS 调度** —— 目前是手工执行 `bash scripts/*.sh`。
+7. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
 8. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
+9. **补数前必须先确认分区存在** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919`、`p20260922`~`p20260925` 等分区（动态分区只创建"未来"，不创建历史）。
+10. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
 
 ## 后续方向
 
 - [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
-- [ ] **把商品/维度链路接进 DolphinScheduler**
-- [ ] 数据质量检查节点（DQC）—— 把上面的 4 条不变式固化成 DS 节点
+- [x] **把商品/维度链路接进 DolphinScheduler**（含跨工作流依赖 + 定时）
+- [x] 数据质量检查节点（DQC）—— 5 项检查 + 自检
+- [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
-- [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] 用 DS 补数回填历史数据（**注意：DWD 那天的分区必须先存在**）
+- [ ] 补上 `ods_order` 里 09-22~09-25 那 4 天（有数据但从未 materialize 进 DWD）
+- [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
 - [ ] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
@@ -493,5 +566,28 @@ docker compose restart dolphinscheduler
 
 **DolphinScheduler 的工作流定义只存在于 MySQL 里**，不是文件。
 
-- 建议在 DS 里用「导出工作流」功能导出 JSON，放进仓库 `dolphin/` 目录
+- 用「导出工作流」功能导出 JSON，放进仓库 `dolphin/` 目录
 - 否则一旦 MySQL 数据卷损坏，所有工作流都要手工重建
+- **文件名用工作流名，不要用 DS 自动生成的 `workflow_<时间戳>.json`**：
+
+```
+dolphin/
+├── offline_dataware.json      ← 订单链路
+└── dim_product_chain.json     ← 商品链路
+```
+
+**为什么要固定文件名**：时间戳命名每次导出都产生新文件，`dolphin/` 越堆越多、分不清哪份是当前的，而且 **git 里看不到"改了什么"**。固定文件名可以覆盖式更新，`git diff dolphin/dim_product_chain.json` 就能直接看出"这次给 DAG 加了哪个节点"。
+
+### ⚠️ 导出的 JSON 有两个不可信之处
+
+**① `schedule.releaseState` 永远是 `OFFLINE`**
+
+实测：订单链路的定时**确实在上线运行**（每天 02:00 都在跑），但它导出的 JSON 里同样写着 `OFFLINE`。这是 **DS 3.2.0 导出功能的固有行为**，不是你的配置有问题。
+
+> **含义：从 JSON 导入工作流后，定时默认是「下线」状态，必须手工点一次「上线」。** 否则你会以为恢复了，其实定时没生效。
+
+**② 它不含节点脚本内容**
+
+节点体里只有"去读 `sql/xxx.sql`"或"执行 `scripts/xxx.sh`"（见「为什么节点引用文件」）。**所以恢复时必须同时拿到仓库的 `sql/` 和 `scripts/`** —— 单靠一个 JSON 跑不起来。
+
+**要确认工作流的真实状态，查数据库，不要看 JSON**（命令见「运维命令」）。
