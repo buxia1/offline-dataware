@@ -72,7 +72,7 @@ docker compose exec dolphinscheduler docker ps
 工作流名 `offline_dataware`，6 个节点串行：
 
 ```
-① truncate_ods ──► ② ods_spark ──► ③ dwd_delete ──► ④ dws_agg ──► ⑤ ads_metric ──► ⑥ dq_check_order
+① truncate_ods ──► ② ods_spark ──► ③ dwd_delete ──► ④ dws_agg ──► ⑤ ads_metric ──► ⑥ dqc_order_chain
      SQL              Shell              Shell               SQL           SQL              Shell
    非查询                                非查询             非查询         非查询
 ```
@@ -285,7 +285,7 @@ SUM(paid_amount - refund_amount)          ✗ 换成比率时结果会完全不�
 
 ---
 
-## ⑥ dq_check_order
+## ⑥ dqc_order_chain
 
 | 字段 | 值 |
 |---|---|
