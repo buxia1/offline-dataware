@@ -84,7 +84,10 @@ offline-dw/
 │   └── be/{conf,log,storage}
 ├── mysql/{conf,data}
 ├── spark/{conf,jars}
-└── ds/{bin,libs,logs}
+└── ds/
+    ├── alerts/notify.sh            失败告警脚本（Script 通道 → /opt/ds-alerts）
+    ├── bin/docker
+    └── libs/
 ```
 
 **没有进版本库的**（见 `.gitignore`）：运行时数据（meta/storage/data/logs）和下载的二进制依赖（jar）。
@@ -526,6 +529,20 @@ docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_order_chain_s
 # 【指纹】跑工作流前后各执行一次，输出必须一字不差
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
 
+# 【失败告警】脚本收到的告警（Script 通道）
+docker exec dolphinscheduler cat /tmp/ds-alerts.log
+
+# 告警是否落库、发给了哪个组、发送成功没
+docker exec mysql mysql -uroot -proot123 dolphinscheduler -e "
+SELECT a.id, a.title, a.alert_group_id, s.send_status, s.log
+FROM t_ds_alert a LEFT JOIN t_ds_alert_send_status s ON s.alert_id = a.id
+ORDER BY a.id DESC LIMIT 5;"
+
+# 两个定时任务的告警配置（warning_type: 0=NONE 1=SUCCESS 2=FAILURE 3=ALL）
+docker exec mysql mysql -uroot -proot123 dolphinscheduler -e "
+SELECT p.name, s.warning_type, s.warning_group_id
+FROM t_ds_schedules s JOIN t_ds_process_definition p ON p.code = s.process_definition_code;"
+
 # 两个工作流的真实状态（权威来源，导出 JSON 不可信，见「重要提醒」）
 docker compose exec -T mysql mysql -uroot -proot123 dolphinscheduler -e "
 SELECT p.name, p.version, p.release_state AS def_online,
@@ -589,7 +606,12 @@ docker compose restart dolphinscheduler
   - **⑤ 只查上界**：`dwd_overwrite.sh` 用 `ROW_NUMBER()` 按 `order_id` 去重 → DWD 会低于"ODS 非空行数"，下界不是不变式（实测 3 天不满足）
   - **④ 有已知盲区**：`paid_cnt = 0` 时 `NULLIF` 返回 `NULL` → 客单价检查失效；自检留了用例 4e 如实记录
   - 自检 **18 个用例**；踩坑：`UNION ALL` 的列名以第一个 `SELECT` 为准，漏写 `AS violations` 会报 `Column 'violations' cannot be resolved`（PITFALLS §3.11）
-- [ ] 作业失败告警（邮件 / 钉钉）
+- [x] **作业失败告警** —— 用 **Script 通道**（`ds/alerts/notify.sh`，本地零外部依赖，也是以后换邮件/钉钉的"调试口"）。
+  - **三层结构**：告警实例 → 告警组 → **定时上的告警类型+告警组**（缺第三层 = 前面全白做，且不报错）
+  - **告警组不在工作流编辑界面**，在**定时**里；且 `warningType=NONE` 时**下拉根本不渲染**
+  - **DS 用命名参数调脚本**：`notify.sh -t "标题" -c "内容"`，**不是 `$1`/`$2`**（第一版就踩了这个，日志里记下的是 `-t`）
+  - 实测端到端：故意让 `truncate_ods` 报错 → `t_ds_alert` 落库（`alertGroupId=2`）→ `t_ds_alert_send_status=SUCCESS` → 脚本日志收到「start process failed」
+  - 细节见 PITFALLS §2.7
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）

@@ -264,6 +264,185 @@ StarRocks 的删除**不是当场删数据**，而是记录一条**"删除谓词
 
 ---
 
+### 2.7 告警：4 个连在一起的坑（配一次要踩全）
+
+**背景：DS 的告警是"三层结构"，缺一层就静默失效。**
+
+```
+① 告警实例（通道：邮件/钉钉/Script…）
+      ↑ 被引用
+② 告警组（出事通知谁）
+      ↑ 被引用
+③ 定时任务上的【告警类型 + 告警组】   ← 缺这层 = 前面全白做，且不报错
+```
+
+以下 4 条**每条都会让告警静默失效**，而且报错信息完全指不到原因。
+
+---
+
+#### 坑 1：告警组**不在工作流编辑界面**，在【定时】里
+
+**现象**
+
+在工作流定义里翻遍也找不到「告警组」这个字段 —— 只有**手动点「运行」**时弹窗里才有。
+
+**原因**
+
+`t_ds_process_definition` 表**有** `warning_group_id` 列，但 **DS 3.2.0 的 UI 不暴露它**。
+
+查前端 bundle 里的字段分布，`warningGroupId` 只出现在：
+
+```
+start-modal.js          ← 手动运行弹窗
+timing-modal.js         ← 定时配置弹窗   ★ 永久生效的那个
+dag-startup-param.js
+use-start.js / use-modal.js
+```
+
+**永久生效的入口**：
+
+```
+项目管理 → 工作流定义 → 点该工作流的「定时」 → 编辑
+  → 【告警类型】改成「失败」 → 才会出现【告警组】下拉
+```
+
+**两个入口的分工**（**不是二选一**）：
+
+| 入口 | 生效范围 |
+|---|---|
+| **定时 → 告警组** | **自动调度**失败（每天 02:00/03:00 那种，人不在电脑前）|
+| **运行弹窗 → 告警组** | **只对那一次手动执行**生效，不落库 |
+
+**底层证据**：`ProcessAlertManager.sendAlertProcessInstance()` 里取的是
+
+```java
+processInstance.getWarningGroupId()    // ← 从【流程实例】取，不是从工作流定义
+```
+
+自动调度时，实例的告警组来自**定时的 `warning_group_id`**；手动执行时来自**运行弹窗选的值**。
+
+---
+
+#### 坑 2：`warningType = NONE` 时，告警组下拉**根本不显示**
+
+**现象**
+
+进了定时编辑页，**找不到「告警组」下拉** —— 以为这个版本没这功能。
+
+**原因**
+
+前端源码里的渲染条件：
+
+```js
+this.timingForm.warningType !== "NONE" && renderAlertGroupSelect()
+```
+
+**告警类型是 `NONE` 时，下拉框直接不渲染。** 所以必须**先**把告警类型改成「失败」或「全部」，下拉才会出现。
+
+**顺序错了就会以为"没这个功能"。**
+
+---
+
+#### 坑 3：Script 插件用**命名参数**调用，不是位置参数 `$1`/`$2`
+
+**现象**
+
+Script 告警脚本按常规写成 `$1` = 标题、`$2` = 内容，结果收到的日志是：
+
+```
+标题: -t
+内容: 告警标题
+```
+
+**参数整体错位。**
+
+**原因**
+
+`alert-server` 的 `ScriptSender` 是这样拼命令的（从字节码常量池里挖出来的）：
+
+```
+/bin/sh  <脚本路径>  -t  "<标题>"  -c  "<内容>"  [-p  "<userParams>"]
+```
+
+**是命名选项，不是位置参数。** 用 `$1`/`$2` 读，拿到的是 `-t`、`-c` 这些**选项字符串本身**。
+
+**解法：用 `getopts` 解析**
+
+```bash
+while getopts "t:c:p:" opt; do
+    case "$opt" in
+        t) TITLE="$OPTARG" ;;
+        c) CONTENT="$OPTARG" ;;
+        p) USER_PARAMS="$OPTARG" ;;
+    esac
+done
+```
+
+**顺带两条**：
+
+- 脚本**必须 `exit 0`** —— 返回非 0 会被 alert-server 记为"发送失败"，告警进重试队列
+- 脚本**必须可执行**（`chmod +x`），而且 DS 容器里 `./scripts` 是**只读挂载**，告警脚本要放**新挂载目录**（本项目用 `./ds/alerts:/opt/ds-alerts`，**不带 `:ro`**）
+
+---
+
+#### 坑 4：「创建租户」≠ 能用，还要在 worker 容器里 `useradd`
+
+**租户是什么**：任务在 worker 容器里以哪个 **Linux 用户**执行。DS 提交任务时会执行类似
+
+```bash
+sudo -u <租户名> bash -c "..."
+```
+
+**所以租户名必须在 worker 容器里是一个真实存在的用户。**
+
+| 场景 | 要不要建租户 |
+|---|---|
+| 本项目（standalone，容器 root，`default` 已在用，工作流跑得通）| **不用建** |
+| 多团队隔离权限/资源 | 建，每个团队一个 |
+| 任务必须用特定系统用户（如 `hadoop`）| 建，并在容器里 `useradd` |
+
+**踩了会怎样**：DS 里建好租户、填上名字，任务执行时报
+
+```
+sudo: unknown user: <租户名>
+```
+
+**注意**：**告警实例不需要租户** —— 所以告警的编辑弹窗里根本没有这个字段。看到「租户」只在**用户管理**和**工作流节点**上。
+
+---
+
+#### 怎么验证告警真的通了（别只看"配好了"）
+
+**推荐做法：造一次真失败**，而不是依赖"测试发送"按钮（**DS 3.2.0 的 Script 插件弹窗里没有那个按钮** —— 前端只对手部分插件渲染）。
+
+| # | 验证点 | 命令 / 位置 |
+|---|---|---|
+| 1 | 告警落库 | `SELECT id, alert_type, alert_status, title FROM t_ds_alert;` |
+| 2 | **发给了哪个组** | 该表 `alert_group_id` 字段 |
+| 3 | 通道发送结果 | `SELECT * FROM t_ds_alert_send_status;`（`send_status=1` + `send script alert msg success`）|
+| 4 | 脚本真的收到 | 脚本自己写的日志文件 |
+
+**实测的完整链路（2026-10-03，故意让 `truncate_ods` 报 SQL 语法错）**：
+
+```
+① 任务失败
+② master 的 ProcessAlertManager.sendAlertProcessInstance()
+     ├─ 拼标题 "start process failed"
+     ├─ 拼内容 ProjectAlertContent JSON
+     ├─ getWarningGroupId() → 2
+     └─ AlertDao.addAlert() → 写 t_ds_alert
+③ alert-server 轮询 t_ds_alert → 按 alert_group_id=2 顺外键查
+     组2 → alert_instance_ids="1" → 实例1 → plugin_define_id=2 → "Script"
+④ SPI 加载 dolphinscheduler-alert-script-3.2.0.jar
+     → 执行 notify.sh -t "..." -c "..."
+⑤ 脚本写日志 ✅
+⑥ 回写 t_ds_alert_send_status（send_status=1）
+```
+
+**关键设计**：master 与 alert-server **不直接通信**，而是**用 `t_ds_alert` 表当队列**。好处是 master 写完立刻返回（发邮件超时也不影响工作流）、失败可重试、可多实例不重复发。代价是有**秒级延迟**（实测落库→脚本收到约 2 秒）。
+
+---
+
 ## 三、StarRocks 表与分区
 
 ### 3.1 分区列必须是 key 列的一部分

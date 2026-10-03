@@ -373,6 +373,160 @@ DS 会为范围内每一天生成一次执行，并把那天的日期作为"业�
 
 > 补数有一个前提：**DWD 表里那一天的分区必须已经存在**。动态分区不会回溯创建历史分区，需要先手工 `ALTER TABLE ... ADD PARTITION`（见 `sql/dwd_add_history_partitions.sql`）。
 
+## 失败告警
+
+**为什么必须有**：DQC 负责"坏了拦住工作流"，但**拦住了你并不知道**。两条链路都在凌晨 02:00 / 03:00 跑，人不在电脑前 —— 没有告警，你要等到第二天自己去看才发现。
+
+> **DQC 和告警是一对**：DQC 让工作流失败，告警让你知道它失败了。
+
+### 三层结构（缺一层就静默失效）
+
+```
+① 告警实例（通道：Script / 邮件 / 钉钉…）
+      ↑ 被引用
+② 告警组（出事通知谁）
+      ↑ 被引用
+③ 定时任务上的【告警类型 + 告警组】   ← 缺这层 = 前面全白做，且不报错
+```
+
+### 本项目用 Script 通道
+
+```bash
+# 脚本位置（挂载在 DS 容器里）
+/opt/ds-alerts/notify.sh
+
+# 看告警记录
+docker exec dolphinscheduler cat /tmp/ds-alerts.log
+```
+
+| 项 | 值 |
+|---|---|
+| 告警脚本 | `ds/alerts/notify.sh` |
+| 容器内路径 | `/opt/ds-alerts/notify.sh` |
+| 挂载 | `docker-compose.yml` → `./ds/alerts:/opt/ds-alerts`（**不带 `:ro`**）|
+| 日志 | 容器内 `/tmp/ds-alerts.log` |
+
+**为什么用 Script 而不是邮件/钉钉**：本地环境没有邮箱/机器人账号，Script 通道**零外部依赖**；而且它同时是个"万能调试口" —— 以后换邮件/钉钉前，先用它把链路验证一遍。
+
+**⚠️ DS 用命名参数调用脚本**（实测确认）：
+
+```
+/bin/sh /opt/ds-alerts/notify.sh -t "<标题>" -c "<内容>" [-p "<userParams>"]
+```
+
+**不是位置参数！** 用 `$1`/`$2` 读会拿到 `-t`/`-c` 本身。脚本必须用 `getopts` 解析（见 PITFALLS §2.7 坑 3）。
+
+### 配置步骤
+
+**① 建告警实例**
+
+`安全中心 → 告警实例管理 → 创建告警实例`
+
+| 字段 | 值 |
+|---|---|
+| 告警实例名称 | `本地日志告警` |
+| 选择插件 | `Script` |
+| 告警类型 | **`failure`** |
+| 脚本路径 | `/opt/ds-alerts/notify.sh`（**容器内绝对路径**）|
+| 类型 | `SHELL` |
+| 自定义参数 | 留空 |
+
+**② 建告警组**
+
+`安全中心 → 告警组管理 → 创建告警组` → 名称 `数据仓库告警组` → **勾选 `本地日志告警`**
+
+**③ 挂到定时上（最容易漏的一步）**
+
+`项目管理 → 工作流定义 → 点该工作流的「定时」→ 编辑`
+
+1. 先把 **告警类型** 从 `NONE` 改成 **`失败`**
+2. **此时才会出现「告警组」下拉** —— 选 `数据仓库告警组`
+3. 保存
+
+> ⚠️ **告警组不在工作流编辑界面**（DS 3.2.0 的 UI 不暴露 `t_ds_process_definition.warning_group_id`），在**定时**里。
+> ⚠️ **`warningType = NONE` 时告警组下拉根本不渲染** —— 顺序错了会以为"没这个功能"。
+> **两个工作流都要配**：`offline_dataware`、`dim_product_chain`。
+
+### 为什么配在「定时」而不是「运行弹窗」
+
+底层取的是 **`ProcessInstance.getWarningGroupId()`**（见 `ProcessAlertManager`）：
+
+| 入口 | 谁用 | 生效范围 |
+|---|---|---|
+| **定时 → 告警组** | 自动调度 | **永久**，凌晨失败也通知你 ✅ |
+| **运行弹窗 → 告警组** | 手动执行 | 只对**那一次**生效，不落库 |
+
+**所以运行弹窗那个下拉不能替代定时配置。**
+
+### 失败是怎么变成通知的
+
+```
+① 任务失败
+② master 的 ProcessAlertManager.sendAlertProcessInstance()
+     ├─ 拼标题 "start process failed"
+     ├─ 拼内容 ProjectAlertContent JSON（项目/工作流/失败任务/状态/日志路径）
+     ├─ getWarningGroupId()  ← 从【流程实例】取
+     └─ AlertDao.addAlert()  → 写 t_ds_alert 表
+③ alert-server 轮询 t_ds_alert
+     → 按 alert_group_id 顺外键查：组 → 实例 → 插件（Script）
+④ SPI 加载 dolphinscheduler-alert-script-3.2.0.jar
+     → 执行 notify.sh -t "..." -c "..."
+⑤ 脚本写 /tmp/ds-alerts.log ✅
+⑥ 回写 t_ds_alert_send_status
+```
+
+**关键设计：master 和 alert-server 不直接通信，用 `t_ds_alert` 表当队列。**
+
+| 好处 | 说明 |
+|---|---|
+| 解耦 | 发邮件超时 30 秒也不阻塞工作流 |
+| 可重试 | 发失败，下次轮询继续 |
+| 不丢消息 | alert-server 重启，告警还在表里 |
+
+**代价**：秒级延迟（实测落库 → 脚本收到约 **2 秒**）。
+
+### 验证（**造一次真失败**，别只看"配好了"）
+
+**DS 3.2.0 的 Script 插件弹窗里没有「测试发送」按钮**（前端只对部分插件渲染），所以用真失败验证：
+
+1. 复制一份工作流，改名如 `test_alert_fail`
+2. 把第一个节点 `truncate_ods` 的 SQL 改成故意的语法错（如 `SELECT * FROM 不存在的表`）→ **第一秒就失败，不碰数据**
+3. 保存 → 点「运行」→ **在运行弹窗里也选上告警组**（让手动执行也发）
+4. 查四个点：
+
+```bash
+# 1. 脚本真的收到（标题/内容各归其位）
+docker exec dolphinscheduler cat /tmp/ds-alerts.log
+
+# 2. 告警落库 + 发给了哪个组
+docker exec mysql mysql -uroot -proot123 dolphinscheduler -B -e \
+  "SELECT id, alert_type, alert_status, alert_group_id, title FROM t_ds_alert ORDER BY id DESC LIMIT 3;"
+
+# 3. 通道发送结果
+docker exec mysql mysql -uroot -proot123 dolphinscheduler -B -e \
+  "SELECT alert_id, alert_plugin_instance_id, send_status, log FROM t_ds_alert_send_status ORDER BY id DESC LIMIT 3;"
+
+# 4. 实例上的告警组
+docker exec mysql mysql -uroot -proot123 dolphinscheduler -B -e \
+  "SELECT id, name, warning_group_id FROM t_ds_process_instance ORDER BY id DESC LIMIT 3;"
+```
+
+**期望**：脚本日志出现 `标题: start process failed`、内容含失败任务名与 `logPath`；`t_ds_alert_send_status.send_status = 1` 且 log 为 `send script alert msg success`。
+
+5. **验证完删掉 `test_alert_fail`**（否则它会跟着定时跑，天天报假警）
+
+### 换邮件 / 钉钉怎么配
+
+| 通道 | 关键参数 | 坑 |
+|---|---|---|
+| **Email** | `serverHost` / `serverPort` / `sender` / `User` / `Password` | 密码要填 **SMTP 授权码**，不是登录密码；QQ/163 用 `465` + `sslEnable=YES`，`smtpSslTrust=*` |
+| **DingTalk** | `WebHook` | 若机器人开了「自定义关键词」安全设置，`Keyword` 必须填一个**会出现在告警消息里**的词，否则钉钉拒收 |
+| **Feishu** | `WebHook` | 同上 |
+
+**换通道时链路已经验证过了** —— 只需新建一个告警实例、加进告警组，**不用碰工作流和定时**。
+
+---
+
 ## 遗留的任务定义（不要删）
 
 DS 的任务定义表里有 3 个**已不在任何工作流中**的节点，是早期版本留下来的：
