@@ -465,14 +465,15 @@ bash /opt/offline-dw/scripts/dwd_sku_load.sh
 
 **必须在 DS 容器里跑**（脚本内部要 `docker exec`，只有 DS 容器有 docker CLI）。
 
-脚本做两件事（细节见脚本内注释）：
+脚本做三件事（细节见脚本内注释）：
 
 - **从 `SELECT DISTINCT dt FROM dwd_order_detail` 动态取天数** —— 不写死。写死的日期列表在新增一天订单后会**静默漏算**。
+- **自动补齐缺失的历史分区** —— 对比"有数据的天" vs "现有分区"，缺的自动 `ADD PARTITION`（补分区前要关掉动态分区，用 `trap` 兜底恢复，见 PITFALLS §3.8）。
 - 逐天 `INSERT OVERWRITE`，SQL 从 `sql/dwd_order_sku_detail_load.sql` 读（不内联）。
 
 **为什么必须覆盖全部天**：SCD2 是全量重建的，重建一次所有天的匹配结果都可能变。
 
-**已知限制**：`INSERT OVERWRITE ... PARTITION (p<日期>)` 要求分区已存在。如果哪天回填了新的一天订单而 `dwd_order_sku_detail` 没有那天的分区，这里会失败（**大声失败，好事**），需要先按 `sql/dwd_order_sku_detail_add_partitions.sql` 的写法补分区。
+**已解决（2026-10-03）**：以前 `INSERT OVERWRITE ... PARTITION (p<日期>)` 要求分区已存在，回填新的一天订单而没有对应分区时会失败，需要手工补。现在**脚本开头自动补齐**：对比 `dwd_order_detail` 有数据的天 vs `dwd_order_sku_detail` 现有分区，缺的自动 `ADD PARTITION`。实测：删掉 `p20260922` 后跑脚本，分区自动补回、130 行重新物化、指纹不变、`dynamic_partition.enable` 仍为 `true`（PITFALLS §3.8）。
 
 ## ⑥ dq_check
 

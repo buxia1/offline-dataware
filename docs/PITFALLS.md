@@ -331,7 +331,9 @@ ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260920
 -- ... 每天一条
 ```
 
-**生产上更推荐「表达式分区」**，任何日期都能按需自动建分区，没有这个范围问题。
+**曾经的推荐是「表达式分区」，经实测已否决**（它确实能自动建分区，但会废掉逐天 `INSERT OVERWRITE ... PARTITION (pX)`）—— 详见 **§3.7**。
+
+**这张表实际的解法：在物化脚本里自动补分区**（对比"有数据的天" vs "现有分区"，缺的自动 `ADD PARTITION`）—— 详见 **§3.8**。
 
 ---
 
@@ -349,6 +351,20 @@ Use command ALTER TABLE tbl_name SET ("dynamic_partition.enable" = "false") firs
 ```sql
 ALTER TABLE dwd.dwd_order_detail SET ("dynamic_partition.enable" = "false");
 ```
+
+**⚠️ 关掉之后必须自己记得开回来** —— 这个开关是**手工状态位，没有任何东西会自动恢复它**。忘了开，后果是：
+
+- 将来**新的日期分区不再自动创建**（到了那天才发现，导入直接报错）
+- 而且**不会报任何错、不会有任何警告** —— 表照样能查、旧数据照样在
+
+**这条坑在同一个项目里踩过两次**：
+
+| 位置 | 情况 |
+|---|---|
+| `sql/dwd_add_history_partitions.sql` | 原版结尾**漏了** `SET ... = 'true'`，跑一次就把开关永久留在 `false`（已补） |
+| `scripts/dwd_sku_load.sh` | 用 `trap ... EXIT` 兜底：**无论成功、失败还是被 Ctrl-C，都保证恢复** |
+
+**通用做法：任何"改状态 → 干活 → 改回来"的流程，都要用 `trap` 兜底，别指望自己记得。**
 
 ---
 
@@ -382,6 +398,105 @@ starrocks:
 | `PRIMARY KEY` | **同键覆盖**，幂等 | DWS、ADS（汇总快照） |
 
 给 `DUPLICATE KEY` 的表配定时任务，**每跑一次数据就多一份**。
+
+---
+
+### 3.6 `INSERT OVERWRITE` 撞上"分区必须先存在"
+
+**现象**
+
+```sql
+INSERT OVERWRITE dwd.dwd_order_sku_detail PARTITION (p20260922)
+SELECT ...;
+```
+
+报错：
+
+```
+Error: The row is out of partition ranges. Please add a new partition.
+```
+
+**很多引擎的 `INSERT OVERWRITE ... PARTITION (pX)` 会顺手把分区建出来，StarRocks 不会。** 它要求 `pX` **已经存在**，否则直接失败。
+
+**为什么容易踩**
+
+动态分区**只创建"未来"、不创建历史**（§3.2）。所以：
+
+- 正常每天跑 → `p<今天>` 由动态分区提前建好了 → 一直正常
+- 一旦**补数**回填历史某天 → 那天没有分区 → 失败
+
+**实测**：`dwd_order_sku_detail` 缺 `p20260922` 分区时，这个失败是**大声的**（好事，不会静默产错数据），但足以让整个工作流中断。
+
+**解法**：在物化脚本开头自动补分区（§3.8）。
+
+**⚠️ 别顺便改用表达式分区** —— 它有更麻烦的后遗症（§3.7）。
+
+---
+
+### 3.7 表达式分区能自动建分区，但**废掉按分区名 `INSERT OVERWRITE`**
+
+**背景**：既然动态分区不建历史分区（§3.2），很自然会想：**换成表达式分区是不是一劳永逸？**
+
+**隔离实验**（独立测试库 `scratch_test`，做完即 `DROP`，未触碰真实表）：
+
+| 测试 | 结果 |
+|---|---|
+| `PARTITION BY date_trunc('day', dt)` 建表 | ✅ 成功 |
+| 插入两个**从未声明**的日期 | ✅ 分区 `p20260115` / `p20260320` **自动创建**，命名规则和动态分区一样 |
+| **`INSERT OVERWRITE ... PARTITION (p20260115)`** | ❌ **报错**：`Currently, only List partitions are supported.` |
+| 整表 `INSERT OVERWRITE`（不带 `PARTITION`） | ✅ 能，但**语义是替换整张表**（旧分区结构留着，数据清空） |
+
+**结论：表达式分区确实能自动建分区，但代价是废掉「逐天 `INSERT OVERWRITE ... PARTITION (pX)`」—— 而那是逐天物化方案的核心。**
+
+**它还会丢掉动态分区的自动清理**（`dynamic_partition.start = -30` 自动删旧分区），旧分区只增不减。
+
+**这个行为很反直觉**：分区确实自己长出来了，但**逐分区写入的语法反而没了** —— 两者不能兼得。
+
+**所以本项目的选择是"方案 A"**：保留动态分区（拿到自动清理）+ 在 `dwd_sku_load.sh` 里脚本级自动补分区（§3.8）。
+
+---
+
+### 3.8 脚本里自动补分区：`trap` + `grep -x` + 右开区间
+
+**做法**：物化脚本开头对比「源表有数据的天」vs「目标表现有的分区」，缺的自动补。
+
+```bash
+EXISTING=$(docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B \
+           -e "SHOW PARTITIONS FROM dwd.dwd_order_sku_detail" | cut -f2)
+
+MISSING=""
+for DF in $DAYS; do
+    D=$(echo "$DF" | tr -d '-')
+    echo "$EXISTING" | grep -qx "p${D}" || MISSING="$MISSING $D"
+done
+```
+
+**三处必须做对，错一处就是静默故障：**
+
+| # | 要点 | 错了会怎样 |
+|---|---|---|
+| ① | **`trap` 必须在"关开关"之前注册** | 中途失败 → `set -e` 直接退出 → 开关**永久留在 `false`**（§3.3），且不报错 |
+| ② | **`grep` 必须带 `-x`**（整行匹配） | 少了它 `"p2026092"` 会**误匹配** `"p20260922"` → 漏建分区 |
+| ③ | **`VALUES` 上界必须写"下一天"** | 写当天 = **空区间**；写后天 = **吞掉中间那天**（静默错误） |
+
+```bash
+# ① 先注册恢复动作，再动开关
+trap restore_dynamic_partition EXIT
+
+# ③ VALUES 左闭右开，上界 = 下一天
+NEXT=$(date -d "$DF2 + 1 day" +%Y-%m-%d)
+echo "ALTER TABLE dwd.dwd_order_sku_detail ADD PARTITION p${D} VALUES [('${DF2}'), ('${NEXT}'));"
+```
+
+**只在真要补分区时才注册 `trap`** —— 让 99% 的正常运行**完全不碰**那个开关。
+
+**实测验证**（2026-10-03）：
+
+- 删掉 `p20260922` 后再跑脚本 → 分区被自动补回，`130` 行数据重新物化
+- `p20260922` 的 `VersionCount = 2` → 铁证"先建分区、再 `INSERT OVERWRITE`"两步都在同一次运行里发生了
+- 复查指纹 **一字未变**（`1959155153321`）→ 幂等
+- 复查 `dynamic_partition.enable = true` → `trap` 生效
+- 日志出现 `分区已齐全`（无缺失时的分支）与 `需要补的分区：` / `✅ 分区已补齐`（有缺失时的分支）
 
 ---
 

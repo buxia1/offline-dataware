@@ -68,7 +68,6 @@ offline-dw/
 │   ├── dim_product_scd2.sql               商品维度 SCD2 拉链表
 │   ├── dim_product_scd2_load.sql          SCD2 装载（TRUNCATE + INSERT 合一）
 │   ├── dwd_order_sku_detail.sql           订单 + 商品属性宽表
-│   ├── dwd_order_sku_detail_add_partitions.sql  补历史分区
 │   └── dwd_order_sku_detail_load.sql      物化装载（Shell 模板）
 ├── scripts/
 │   ├── gen_mock_orders.py          模拟订单生成器
@@ -209,8 +208,9 @@ docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_produ
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
 ```
+
+建表**不需要**再手工 `ADD PARTITION`：缺失的历史分区由 `scripts/dwd_sku_load.sh` 在物化前自动补齐（见「商品 / 维度链路」）。
 
 完整跑法见「商品 / 维度链路」一节。
 
@@ -321,7 +321,6 @@ docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_produ
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
 
 # 3. CSV → ODS（Stream Load，snapshot_date 从文件名自动解析）
 bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260920.csv
@@ -563,7 +562,7 @@ docker compose restart dolphinscheduler
 6. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
 7. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
 8. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
-9. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这个痛点会反复出现**，修法方向见「后续方向」。
+9. **补数不再需要手工补分区**（已修复）—— `dwd_sku_load.sh` 在物化前会对比「`dwd_order_detail` 有数据的天」与「`dwd_order_sku_detail` 现有的分区」，缺的**自动** `ADD PARTITION`，并保证 `dynamic_partition.enable` 无论成功失败都恢复成 `true`（`trap`）。**但只覆盖 `dwd_order_sku_detail`**：订单链路的 `dwd_order_detail` 仍靠 `sql/dwd_add_history_partitions.sql` 手工补。理由是动态分区**只创建"未来"，不创建历史**（PITFALLS §3.2）。
 10. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
 
 ## 后续方向
@@ -573,7 +572,8 @@ docker compose restart dolphinscheduler
 - [x] 数据质量检查节点（DQC）—— 5 项检查 + 自检
 - [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
-- [ ] **修掉「补数要手工补分区」这个痛点** —— 两个方向：在 `dwd_sku_load.sh` 里**自动 `ADD PARTITION`**，或把 `dwd_order_sku_detail` 改成**表达式分区**（PITFALLS §3.2 已推荐过，任何日期按需自动建分区）
+- [x] **修掉「补数要手工补分区」这个痛点** —— 选了**方案 A**：在 `dwd_sku_load.sh` 里自动 `ADD PARTITION`（对比 `dwd_order_detail` 有数据的天 vs 现有分区）。
+  - **没选表达式分区** —— 隔离实验证明它**会废掉逐天 `INSERT OVERWRITE ... PARTITION (pX)`**（报 `Currently, only List partitions are supported.`），而那正是物化方案的核心；还会失去动态分区的自动清理。见 PITFALLS §3.6
 - [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
 - [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
