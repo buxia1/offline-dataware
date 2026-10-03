@@ -500,6 +500,108 @@ echo "ALTER TABLE dwd.dwd_order_sku_detail ADD PARTITION p${D} VALUES [('${DF2}'
 
 ---
 
+### 3.9 StarRocks 不支持"关联子查询里用非等值谓词"
+
+**现象**
+
+想找"在维表里找不到对应版本"的孤儿行，最容易写出的写法是：
+
+```sql
+SELECT count(*)
+FROM dwd.dwd_order_sku_detail sku
+WHERE NOT EXISTS (
+    SELECT 1 FROM dim.dim_product_scd2 s
+    WHERE s.product_id = sku.product_id
+      AND sku.dt BETWEEN s.valid_from AND s.valid_to   -- ← 非等值，就是这里
+);
+```
+
+报错：
+
+```
+ERROR 1064 (HY000): Getting analyzing error.
+Detail message: Not support Non-EQ correlated predicate in correlated subquery.
+```
+
+**原因**
+
+关联子查询里，`s.product_id = sku.product_id` 是**等值**谓词（StarRocks 能把它改写成 JOIN），但 `sku.dt BETWEEN ...` 是**非等值**谓词，**它不支持**。
+
+**为什么容易踩**
+
+「拉链表"当时口径"查询」的**标准写法**就是 `BETWEEN valid_from AND valid_to`（同一个文件里的 `dwd_order_sku_detail_load.sql` 就是这么 JOIN 的，完全合法）。但那个是**普通 JOIN**；**一旦挪进 `NOT EXISTS` / 关联子查询，就撞上这个限制**。
+
+> **区别**：普通 `JOIN ... ON a = b AND c BETWEEN d AND e` ✅ 合法；`NOT EXISTS` 里同样的条件 ❌ 不合法。
+
+**解法：改成 `LEFT JOIN ... IS NULL`**
+
+```sql
+SELECT count(*)
+FROM (
+    SELECT s.product_id AS matched
+    FROM dwd.dwd_order_sku_detail sku
+    LEFT JOIN dim.dim_product_scd2 s
+      ON sku.product_id = s.product_id
+     AND sku.dt BETWEEN s.valid_from AND s.valid_to
+) t
+WHERE matched IS NULL
+```
+
+**⚠️ 别被"JOIN 不上所以该用 `NOT EXISTS`"的语义直觉带偏** —— 语义上 `NOT EXISTS` 更贴切，但**引擎不支持**。`LEFT JOIN ... IS NULL` 是等价改写。
+
+**真实影响**：DQC 检查⑥（重物化属性一致）里的孤儿行检测，最初就是被这个报错挡住的。
+
+---
+
+### 3.10 SQL 报"语法错误在某行"，真凶往往在**文件末尾**
+
+**现象**
+
+`sql/dqc_dim_product.sql` 里少了一个右括号（`AS BIGINT)` 应为 `AS BIGINT))`），报错却是：
+
+```
+ERROR 1064 (HY000) at line 20: Getting syntax error at line 102, column 0.
+Detail message: No viable statement for input 'WITH checks AS ( ...
+```
+
+**报了 `line 102`，但真正的错误在文件末尾（line 119）。**
+
+**原因**
+
+`CAST(` 没闭合 → 这个 `SELECT` 没结束 → **CTE `checks` 没结束** → 后面的主查询
+
+```sql
+SELECT check_name, violations FROM checks WHERE violations <> 0;
+```
+
+被**吞进了 CTE 内部** → 整个 `WITH ... AS (` 结构崩塌 → 解析器在**中途**迷路，报错位置乱跳。
+
+**怎么一眼看穿**
+
+关键线索是报错里的 **`Unexpected input '<EOF>'`** —— 它说的是"**输入提前结束了**"，也就是**括号/引号没配平**。
+
+用最简例子复现：
+
+```sql
+SELECT CAST( (SELECT 1) + (SELECT 2) AS BIGINT     -- 少一个 )
+```
+```
+ERROR 1064: Unexpected input '<EOF>', the most similar input is {')'}
+```
+
+**报错直接点名缺 `)`。**
+
+**排查纪律**
+
+| ❌ 不要 | ✅ 要 |
+|---|---|
+| 盯着报错说的那一行看 | **先检查括号/引号是否配平**（尤其长嵌套 SQL）|
+| 逐行删代码试 | 读报错末尾有没有 `Unexpected input '<EOF>'` |
+
+> **通用规律：CTE / 子查询里的括号一旦缺失，报错位置会出现在任何地方，唯独不会指向真正缺括号的那一行。**
+
+---
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写

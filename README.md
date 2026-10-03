@@ -511,7 +511,7 @@ SELECT count(*) AS rows_, sum(is_current) AS cur,
        round(sum(is_current)/count(DISTINCT product_id),2) AS ratio
 FROM dim.dim_product_scd2;"
 
-# 【一条命令跑完 5 项数据质量检查】全部通过 = 没有任何输出，退出码 0
+# 【一条命令跑完 6 项数据质量检查】全部通过 = 没有任何输出，退出码 0
 bash scripts/dqc_dim_product.sh
 
 # 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
@@ -569,12 +569,15 @@ docker compose restart dolphinscheduler
 
 - [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
 - [x] **把商品/维度链路接进 DolphinScheduler**（含跨工作流依赖 + 定时）
-- [x] 数据质量检查节点（DQC）—— 5 项检查 + 自检
+- [x] 数据质量检查节点（DQC）—— **6** 项检查 + 自检（13 个用例）
 - [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
 - [x] **修掉「补数要手工补分区」这个痛点** —— 选了**方案 A**：在 `dwd_sku_load.sh` 里自动 `ADD PARTITION`（对比 `dwd_order_detail` 有数据的天 vs 现有分区）。
   - **没选表达式分区** —— 隔离实验证明它**会废掉逐天 `INSERT OVERWRITE ... PARTITION (pX)`**（报 `Currently, only List partitions are supported.`），而那正是物化方案的核心；还会失去动态分区的自动清理。见 PITFALLS §3.6
-- [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
+- [x] **DQC 加一条「重算对账」**（⑥ 重物化属性一致）—— 原 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"：SCD2 改了但没重物化时，**行数金额都不变**，④⑤ 照样通过。
+  - **两条查询缺一不可**：① 范围 JOIN 后比属性（抓"值变了"）；② `LEFT JOIN ... IS NULL` 数孤儿行（抓"版本区间挪了 → 宽表那行被 JOIN 静默吞掉"）。
+  - 实测：内存改 1 个商品品类 → 报 **13**；版本区间推迟 1 天 → 报 **4** 行孤儿；两种情况下**现有 ④⑤ 都纹丝不动**。
+  - 踩坑：`NOT EXISTS` 里放非等值谓词会被 StarRocks 拒绝（PITFALLS §3.9）
 - [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
