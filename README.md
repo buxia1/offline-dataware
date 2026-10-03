@@ -54,7 +54,8 @@ offline-dw/
 ├── data/dim/                        商品快照 CSV（生成物，不进版本库）
 ├── docs/
 │   ├── PITFALLS.md                 踩坑记录（最有价值的部分）
-│   └── dolphinscheduler-workflow.md  DS 工作流的节点配置
+│   ├── dolphinscheduler-workflow.md  DS 工作流的节点配置
+│   └── dimension-modeling.md       维度建模与 SCD2 拉链表
 ├── sql/                            各层建表与转换 SQL
 │   ├── ods_order.sql
 │   ├── dwd_order_detail.sql
@@ -616,7 +617,8 @@ docker compose restart dolphinscheduler
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
-- [ ] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
+- [x] **`docs/dimension-modeling.md`**：维度建模 + SCD1/SCD2 完整说明（10 节，全部落在本项目真实表和数据上）
+  - 含「事实表三种粒度」、SCD2 四个设计要点（主键/哨兵值/**闭区间**/批次时间）、四步推导、**版本数 = 变更次数 + 1（≠ 快照天数）**、**孤儿行**失效模式、四条验证不变式
 
 ---
 
