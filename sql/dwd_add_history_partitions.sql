@@ -14,3 +14,5 @@ ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260923 VALUES [('2026-09-23'),
 ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260924 VALUES [('2026-09-24'), ('2026-09-25'));
 ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260925 VALUES [('2026-09-25'), ('2026-09-26'));
 ALTER TABLE dwd.dwd_order_detail ADD PARTITION p20260926 VALUES [('2026-09-26'), ('2026-09-27'));
+
+ALTER TABLE dwd.dwd_order_detail SET ('dynamic_partition.enable' = 'true');
