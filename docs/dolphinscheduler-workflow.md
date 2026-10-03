@@ -69,11 +69,11 @@ docker compose exec dolphinscheduler docker ps
 
 ## 工作流结构
 
-工作流名 `offline_dataware`，5 个节点串行：
+工作流名 `offline_dataware`，6 个节点串行：
 
 ```
-① truncate_ods ──► ② ods_spark ──► ③ dwd_delete ──► ④ dws_agg ──► ⑤ ads_metric
-     SQL              Shell              Shell               SQL           SQL
+① truncate_ods ──► ② ods_spark ──► ③ dwd_delete ──► ④ dws_agg ──► ⑤ ads_metric ──► ⑥ dq_check_order
+     SQL              Shell              Shell               SQL           SQL              Shell
    非查询                                非查询             非查询         非查询
 ```
 
@@ -282,6 +282,40 @@ SUM(paid_amount - refund_amount)          ✗ 换成比率时结果会完全不�
 当某个日期支付订单数是 0 时，分母变 `NULL`，结果是 `NULL` 而不是**报错**。
 
 **这是给定时任务准备的**：手工跑时数据总有支付订单看不出问题；哪天上游异常、某天真的零支付，作业会半夜崩掉，你第二天早上才发现。
+
+---
+
+## ⑥ dq_check_order
+
+| 字段 | 值 |
+|---|---|
+| 任务类型 | SHELL |
+
+```bash
+bash /opt/offline-dw/scripts/dqc_order_chain.sh
+```
+
+**必须在 DS 容器里跑**（脚本内部要 `docker exec`，只有 DS 容器有 docker CLI）。
+
+**为什么订单链路也需要 DQC**：这条链是三级汇总（DWD → DWS → ADS），而**汇总的错法是静默的** —— 某天没汇总，那天数据凭空消失，但没有任何报错。商品链路的 `dqc_dim_product.sh` 只管维度表，管不到这三张表。
+
+它查 6 项（**全部通过 = 没有任何输出 + 退出码 0**）：
+
+| # | 检查 | 抓什么 |
+|---|---|---|
+| ① | DWS 汇总与 DWD 一致 | DWS 的 `user_id × dt` 每格都必须等于 DWD 的分组结果 |
+| ② | DWS 覆盖 DWD 全部日期 | 某天整个没汇总（DWD 有、DWS 没有）|
+| ③ | ADS 与 DWS 汇总一致 | 日报指标对不上按天汇总 |
+| ④ | 派生指标自洽 | `net_amount` / `avg_order_amount` / `pay_rate` 公式写错 |
+| ⑤ | DWD 行数不超过 ODS | 清洗环节把行数搞多了（DWD 只该过滤 + 去重）|
+
+**⚠️ ⑤ 只查上界，不能查下界**：`dwd_overwrite.sh` 用 `ROW_NUMBER()` 按 `order_id` 去重，同一天同一个 `order_id` 有多行时会被**合并** → DWD 会**低于** "ODS 里 `user_id` 非空的行数"。实测有 3 天如此。写成下界检查会**永远红灯**。
+
+**⚠️ 检查④ 有一个已知盲区**：`paid_cnt = 0` 时 `NULLIF(paid_cnt, 0)` 返回 `NULL` → `ABS(NULL - x)` 是 `NULL` → `CASE` 落到 `ELSE 0`，客单价错了也抓不到。自检里专门留了一个用例（4e）**如实记录这个盲区**，没有掩盖。
+
+**自检**：`sql/dqc_order_chain_selftest.sql` 用内存假数据证明这些规则真能发现问题（**18 个用例**：① 4 个、② 3 个、③ 3 个、④ 6 个、⑤ 2 个）。
+
+**覆盖范围会随时间自然收窄**：`dwd_order_detail` 是动态分区表（`dynamic_partition.start = -30`），30 天前的分区会被自动删除；而 DWS/ADS **不是分区表**，旧行会一直留着。所以越久以前的日期，②③ 越无法校验。这是设计使然，不是 bug。
 
 ---
 

@@ -73,9 +73,11 @@ offline-dw/
 │   ├── gen_mock_orders.py          模拟订单生成器
 │   ├── ods_order_to_starrocks.py   Spark 作业：Kafka → ODS
 │   ├── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
+│   ├── dqc_order_chain.sh          订单链路 DQC（6 项，给 DS 用）
 │   ├── gen_mock_products.py        模拟商品快照生成器（支持 --date 造历史）
 │   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
-│   └── dwd_sku_load.sh             商品宽表逐天物化
+│   ├── dwd_sku_load.sh             商品宽表逐天物化（自动补分区）
+│   └── dqc_dim_product.sh          商品链路 DQC（6 项，给 DS 用）
 ├── kafka/                          空目录（Kafka 数据不挂载）
 ├── starrocks/
 │   ├── fe/{conf,log,meta}          meta 挂载用于持久化
@@ -517,6 +519,10 @@ bash scripts/dqc_dim_product.sh
 # 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_dim_product_selftest.sql
 
+# 订单链路 DQC（DWD → DWS → ADS 三级汇总对账，6 项）
+bash scripts/dqc_order_chain.sh
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_order_chain_selftest.sql
+
 # 【指纹】跑工作流前后各执行一次，输出必须一字不差
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
 
@@ -578,6 +584,11 @@ docker compose restart dolphinscheduler
   - **两条查询缺一不可**：① 范围 JOIN 后比属性（抓"值变了"）；② `LEFT JOIN ... IS NULL` 数孤儿行（抓"版本区间挪了 → 宽表那行被 JOIN 静默吞掉"）。
   - 实测：内存改 1 个商品品类 → 报 **13**；版本区间推迟 1 天 → 报 **4** 行孤儿；两种情况下**现有 ④⑤ 都纹丝不动**。
   - 踩坑：`NOT EXISTS` 里放非等值谓词会被 StarRocks 拒绝（PITFALLS §3.9）
+- [x] **订单链路也加上 DQC**（`dqc_order_chain.sh`，6 项）—— 之前 DWS/ADS 完全没有校验，是明显的覆盖空洞。
+  - **①** DWS 与 DWD 逐格对账（同粒度 `user_id × dt`，两边都是 709 格）· **②** DWS 覆盖 DWD 全部日期 · **③** ADS 与 DWS 按天汇总一致 · **④** 派生指标自洽 · **⑤** DWD 行数不超过 ODS
+  - **⑤ 只查上界**：`dwd_overwrite.sh` 用 `ROW_NUMBER()` 按 `order_id` 去重 → DWD 会低于"ODS 非空行数"，下界不是不变式（实测 3 天不满足）
+  - **④ 有已知盲区**：`paid_cnt = 0` 时 `NULLIF` 返回 `NULL` → 客单价检查失效；自检留了用例 4e 如实记录
+  - 自检 **18 个用例**；踩坑：`UNION ALL` 的列名以第一个 `SELECT` 为准，漏写 `AS violations` 会报 `Column 'violations' cannot be resolved`（PITFALLS §3.11）
 - [ ] 作业失败告警（邮件 / 钉钉）
 - [ ] SCD2 改增量维护，并与全量重建做等价性验证
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）

@@ -602,6 +602,90 @@ ERROR 1064: Unexpected input '<EOF>', the most similar input is {')'}
 
 ---
 
+### 3.11 `UNION ALL` 的列名以**第一个 `SELECT`** 为准 —— 漏写别名报错完全指错方向
+
+**现象**
+
+`WITH checks AS (... UNION ALL ...)` 里有 5 个分支，**每一个都漏写了列别名**：
+
+```sql
+WITH checks AS (
+    SELECT '① ...' AS check_name,
+           CAST(... AS BIGINT)                    -- ← 少 AS violations
+    UNION ALL
+    SELECT '② ...' AS check_name,
+           CAST(count(*) AS BIGINT)               -- ← 少 AS violations
+    ...
+)
+SELECT check_name, violations FROM checks WHERE violations <> 0;
+```
+
+报错：
+
+```
+ERROR 1064 (HY000): Getting analyzing error.
+Detail message: Column 'violations' cannot be resolved.
+```
+
+**报错只说"`violations` 解析不了"，完全不会提"你少写了列别名"，也不指向任何一行。**
+
+**原因**
+
+`UNION ALL` 的结果集**只以第一个 `SELECT` 的列名为准**，后面的分支不参与命名。
+
+- 第一项漏别名 → 第二列**无名**
+- 无名 → 整个 CTE 没有 `violations` 这一列
+- → 最后 `SELECT violations` 失败
+
+**为什么极难查（本次踩坑真实过程）**
+
+| 假象 | 真相 |
+|---|---|
+| 单独跑某一项 → 正常 | 我的测试串里**恰好带了别名**，和文件里的不是同一段 SQL |
+| 怀疑是中文注释 / BOM / 编码 | `cat -A`、`xxd`、去注释版全部排除 |
+| 怀疑是 `NOT IN` 优化器问题 | 那只是叠加进来的**第二个**独立问题（§3.12）|
+
+**真正的定位方法：把文件里每个分支结尾那一行 diff 出来。**
+
+```bash
+grep -n "AS BIGINT" sql/dqc_order_chain.sql
+# 正确应为：  ... AS BIGINT) AS violations
+# 全是：      ... AS BIGINT)          ← 一眼看出 5 个分支都缺
+```
+
+**通用纪律：写 `UNION ALL` 的 CTE，让每个分支都把两个列别名写全**（`check_name` 和 `violations`），不要只写第一个。
+
+> **教训比坑本身更重要**：**"我的测试通过了"不等于"文件里的代码通过了"** —— 一定要拿**文件里的原文**去跑，而不是手打一份看起来一样的。
+
+---
+
+### 3.12 StarRocks 在小派生表上的优化器怪癖（自检里踩到）
+
+自检用 `UNION ALL` 造**内存假表**（不落真实表）时，接连踩到 3 个和真实表上表现**不一样**的行为：
+
+| # | 写法 | 现象 |
+|---|---|---|
+| 1 | `NOT IN (SELECT ... )`，派生表只有 **1 行** | `ERROR 1064: nest-loop join not support: NULL_AWARE_LEFT_ANTI_JOIN`（同样写法在真实表上完全正常）|
+| 2 | `LEFT JOIN ... WHERE w.dt IS NULL` | **结果错误**：`LEFT JOIN` 输出明明是 2 行、`matched` 有 `NULL`，但 `COUNT(*)` 返回 **0** |
+| 3 | `ABS(10.00 - 10.01) >= 0.01` 做小数差异用例 | 判定**不稳定**：单独跑返回 1，放进带 `sum()`/`CAST()` 的语句里返回 0（常量折叠踩到精度边界）|
+
+**应对**
+
+| 场景 | 做法 |
+|---|---|
+| 自检里判断"某天在目标表里一条都没有" | 用**标量子查询**：`WHERE (SELECT count(*) FROM w WHERE w.dt = d.dt) = 0`（§2 实测稳定）|
+| 自检的数值用例 | **一律用整数计数**（`ABS(a.order_cnt - b.c)`），不要用小数差异 |
+| 真实表上的金额比对 | **不受影响** —— 那是真的列，不是字面量。检查④ 照常用 `>= 0.01` |
+
+**纪律：自检代码和被测代码要分开考虑。**
+
+被测 SQL 跑在**真实表**上，可以用 `NOT IN`、小数容差；
+自检 SQL 跑在**内存假表**上，要避开优化器在小数据上的退化路径。
+
+> 这类"小数据上结果不同"的问题**只在自检里出现**，很容易被误判成"检查逻辑写错了"，从而改坏本来正确的检查。
+
+---
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写
