@@ -108,3 +108,5 @@ services:
       - ./ds/bin/docker:/usr/local/bin/docker:ro
       - ./sql:/opt/offline-dw/sql:ro
       - ./scripts:/opt/offline-dw/scripts:ro
+      - ./ds/alerts:/opt/ds-alerts
+
