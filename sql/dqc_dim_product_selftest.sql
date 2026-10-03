@@ -100,3 +100,53 @@ SELECT '③ 故障：is_current=0 但 valid_to 是哨兵值', '1',
                 WHEN is_current = 0 AND valid_to  = DATE '9999-12-31' THEN 1
                 ELSE 0 END), 0) AS BIGINT)
 FROM (SELECT 0 AS is_current, DATE '9999-12-31' AS valid_to) t;
+
+
+
+-- ============ 第四部分：⑥ 重物化属性一致 ============
+-- 在内存里造两张假表（sku / scd2），把 ⑥ 的判定逻辑原样跑一遍。
+-- 三个用例必须恰好覆盖两种盲区，否则自检本身就是瞎的。
+
+-- 用例1：正常 —— 属性完全一致 → 期望 0
+SELECT '⑥ 正常：属性完全一致' AS 用例, '0' AS expect,
+       CAST(COALESCE(sum(CASE WHEN NOT (sku.category <=> s.category
+                                       AND sku.brand    <=> s.brand
+                                       AND sku.sku_price<=> s.price)
+                              THEN 1 ELSE 0 END), 0) AS BIGINT) AS actual
+FROM (          SELECT 1 AS product_id, DATE '2026-09-20' AS dt,
+                       '数码' AS category, 'A' AS brand, 100 AS sku_price) sku
+JOIN (          SELECT 1 AS product_id, DATE '2026-09-20' AS valid_from,
+                       DATE '9999-12-31' AS valid_to,
+                       '数码' AS category, 'A' AS brand, 100 AS price) s
+  ON sku.product_id = s.product_id
+ AND sku.dt BETWEEN s.valid_from AND s.valid_to
+
+UNION ALL
+
+-- 用例2：盲区(1) —— SCD2 已改成家电，宽表还留着数码 → 期望 1
+SELECT '⑥ 故障：SCD2 改了品类，宽表没重物化', '1',
+       CAST(COALESCE(sum(CASE WHEN NOT (sku.category <=> s.category
+                                       AND sku.brand    <=> s.brand
+                                       AND sku.sku_price<=> s.price)
+                              THEN 1 ELSE 0 END), 0) AS BIGINT)
+FROM (          SELECT 1 AS product_id, DATE '2026-09-20' AS dt,
+                       '数码' AS category, 'A' AS brand, 100 AS sku_price) sku
+JOIN (          SELECT 1 AS product_id, DATE '2026-09-20' AS valid_from,
+                       DATE '9999-12-31' AS valid_to,
+                       '家电' AS category, 'A' AS brand, 100 AS price) s
+  ON sku.product_id = s.product_id
+ AND sku.dt BETWEEN s.valid_from AND s.valid_to
+
+UNION ALL
+
+-- 用例3：盲区(2) —— 宽表 09-20 的行，SCD2 里版本从 09-21 才开始
+--        → 范围 JOIN 不成立 → 宽表那行消失 → 必须靠 LEFT JOIN 抓
+SELECT '⑥ 故障：宽表行在 SCD2 里找不到版本', '1',
+       CAST(COALESCE(sum(CASE WHEN s.product_id IS NULL THEN 1 ELSE 0 END), 0) AS BIGINT)
+FROM (          SELECT 1 AS product_id, DATE '2026-09-20' AS dt,
+                       '数码' AS category, 'A' AS brand, 100 AS sku_price) sku
+LEFT JOIN (     SELECT 1 AS product_id, DATE '2026-09-21' AS valid_from,
+                       DATE '9999-12-31' AS valid_to,
+                       '数码' AS category, 'A' AS brand, 100 AS price) s
+  ON sku.product_id = s.product_id
+ AND sku.dt BETWEEN s.valid_from AND s.valid_to;

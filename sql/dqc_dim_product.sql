@@ -71,7 +71,53 @@ WITH checks AS (
                (SELECT COALESCE(sum(amount), 0) FROM dwd.dwd_order_detail)
              - (SELECT COALESCE(sum(amount), 0) FROM dwd.dwd_order_sku_detail)
            ) < 0.01 THEN 0 ELSE 1 END AS BIGINT)
-)
+
+    UNION ALL
+
+    -- ⑥ 重物化对账：宽表里的商品属性，必须等于 SCD2 对该日期算出的属性
+    --
+    -- 【为什么需要这一项】
+    --   现有 ④⑤ 是拿【宽表】比【订单明细】。但订单明细里根本没有
+    --   category/brand/price —— 所以这两项压根没检查商品属性。
+    --   结果：SCD2 变了而宽表没重物化时，④⑤ 永远通过（行数金额都不变）。
+    --
+    -- 【两个盲区，各用一条查询盖住】
+    --   (1) JOIN 得上但属性值不同   → 数不一致的行
+    --   (2) JOIN 不上（找不到版本） → 数孤儿行
+    --       第 (2) 种最阴险：范围 JOIN 条件不满足时，宽表那行会
+    --       【直接消失】，连比较的机会都没有，计数纹丝不动。
+    --
+    -- 【为什么用 <=> 而不是 <>】
+    --   这一列现在没有 NULL，但 NULL <=> NULL 返回 TRUE（安全的"相等"），
+    --   而 NULL <> x 返回 NULL 不是 TRUE → 会把该行【静默漏掉】。
+    --   你的 ② 号检查就踩过同款坑（DATE_ADD(哨兵值) 返回 NULL）。
+    --
+    -- 【为什么用 LEFT JOIN 而不是 NOT EXISTS】
+    --   StarRocks 不支持"关联子查询里用非等值谓词"：
+    --   NOT EXISTS (... WHERE sku.dt BETWEEN s.valid_from AND s.valid_to)
+    --   → ERROR 1064: Not support Non-EQ correlated predicate in correlated subquery
+    SELECT '⑥ 重物化属性一致',
+           CAST(
+             (SELECT count(*)
+              FROM dwd.dwd_order_sku_detail sku
+              JOIN dim.dim_product_scd2 s
+                ON sku.product_id = s.product_id
+               AND sku.dt BETWEEN s.valid_from AND s.valid_to
+              WHERE NOT (sku.category  <=> s.category
+                     AND sku.brand     <=> s.brand
+                     AND sku.sku_price <=> s.price))
+             +
+             (SELECT count(*)
+              FROM (
+                  SELECT s.product_id AS matched
+                  FROM dwd.dwd_order_sku_detail sku
+                  LEFT JOIN dim.dim_product_scd2 s
+                    ON sku.product_id = s.product_id
+                   AND sku.dt BETWEEN s.valid_from AND s.valid_to
+              ) t
+              WHERE matched IS NULL)
+           AS BIGINT))
+
 SELECT check_name, violations
 FROM checks
 WHERE violations <> 0;
