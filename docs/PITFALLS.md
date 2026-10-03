@@ -686,6 +686,68 @@ grep -n "AS BIGINT" sql/dqc_order_chain.sql
 
 ---
 
+### 3.13 工作目录里的临时 `.py` 文件会**静默遮蔽标准库**
+
+**现象**
+
+在项目/工作目录下放了一个临时脚本 `bisect.py`，之后**任何**在那目录里跑的 Python 程序都可能崩：
+
+```
+ImportError: cannot import name 'bisect' from 'bisect'
+             (/mnt/d/develop/workspace/.../bisect.py)
+```
+
+真正诡异的是**报错的地方和那个文件毫无关系** —— 崩在 `random` → `tempfile` 的导入链上：
+
+```
+File ".../tempfile.py", line 184, in <module>
+    from random import Random as _Random
+File ".../random.py", line 56, in <module>
+    from bisect import bisect as _bisect
+ImportError: cannot import name 'bisect' from 'bisect'
+```
+
+**原因**
+
+Python 的导入查找顺序里，**当前工作目录（`sys.path[0]`）排在最前面**。
+
+所以 `bisect.py` 会**盖住**标准库的 `bisect` 模块 —— 而 `random`、`tempfile` 等一堆标准库模块**内部依赖 `bisect`**，于是它们全部炸掉。
+
+**为什么难查**
+
+- 报错说的是 `random` / `tempfile` / `apport`，**没有一行提到你放的那个文件**
+- 那个文件本身可能只是几行无关的调试代码，看起来完全无害
+- 只有仔细读 `from bisect import ... from (/path/bisect.py)` 那一行才会发现真凶
+
+**危险文件名清单**（不要放在工作目录 / 项目根目录）
+
+| 类别 | 例子 |
+|---|---|
+| 标准库模块 | `bisect.py`、`random.py`、`json.py`、`types.py`、`queue.py`、`select.py`、`code.py`、`io.py`、`string.py`、`copy.py` |
+| 常用三方库 | `pandas.py`、`numpy.py`、`spark.py` |
+
+**解法**
+
+1. **临时脚本一律放 `/tmp`**，不要放在项目目录或工作目录里
+2. 名字加前缀避免撞库：`tmp_bisect.py`、`probe_bisect.py`
+3. 已经踩了：把文件删掉或改名，**不用改任何代码**
+
+**验证命令**（看工作目录有没有遮蔽标准库的文件）
+
+```bash
+python3 -c "
+import sys, os
+stdlib = set(sys.stdlib_module_names) if hasattr(sys,'stdlib_module_names') else set()
+hits = [f for f in os.listdir('.') if f.endswith('.py') and f[:-3] in stdlib]
+print('遮蔽标准库的文件:', hits or '无')
+"
+```
+
+> **通用规律：临时文件要么放 `/tmp`，要么加前缀。**
+> 放在工作目录里，且名字正好撞上标准库 —— 会破坏**同目录下所有** Python 程序，而且报错完全不指向它。
+
+---
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写

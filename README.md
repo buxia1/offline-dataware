@@ -391,10 +391,10 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 **两个工作流，商品链路依赖订单链路**：
 
 ```
-┌─ offline_dataware（订单链路，每天 02:00）──────────────────────┐
-│  truncate_ods → ods_spark → dwd_delete → dws_agg → ads_metric  │
-│     SQL          Shell        Shell        SQL        SQL      │
-└────────────────────────────────────────────────────────────────┘
+┌─ offline_dataware（订单链路，每天 02:00）────────────────────────────────────────────────┐
+│  truncate_ods → ods_spark → dwd_delete → dws_agg → ads_metric → dqc_order_chain │
+│  SQL            Shell       Shell        SQL       SQL          Shell           │
+└─────────────────────────────────────────────────────────────────────────────────┘
                               │ 今天成功
                               ▼
 ┌─ dim_product_chain（商品链路，每天 03:00）──────────────────────────┐

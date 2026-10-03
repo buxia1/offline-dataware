@@ -21,7 +21,7 @@
 
 # 工作流一：offline_dataware
 
-订单链路（Kafka → ODS → DWD → DWS → ADS），5 个节点。
+订单链路（Kafka → ODS → DWD → DWS → ADS），6 个节点。
 
 ## 前置准备
 
