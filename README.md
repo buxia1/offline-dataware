@@ -78,6 +78,7 @@ offline-dw/
 │   ├── gen_mock_products.py        模拟商品快照生成器（支持 --date 造历史）
 │   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
 │   ├── dwd_sku_load.sh             商品宽表逐天物化（自动补分区）
+│   ├── dim_product_scd2_incremental.sh  SCD2 增量维护（三道防线）
 │   └── dqc_dim_product.sh          商品链路 DQC（6 项，给 DS 用）
 ├── kafka/                          空目录（Kafka 数据不挂载）
 ├── starrocks/
@@ -613,7 +614,11 @@ docker compose restart dolphinscheduler
   - **DS 用命名参数调脚本**：`notify.sh -t "标题" -c "内容"`，**不是 `$1`/`$2`**（第一版就踩了这个，日志里记下的是 `-t`）
   - 实测端到端：故意让 `truncate_ods` 报错 → `t_ds_alert` 落库（`alertGroupId=2`）→ `t_ds_alert_send_status=SUCCESS` → 脚本日志收到「start process failed」
   - 细节见 PITFALLS §2.7
-- [ ] SCD2 改增量维护，并与全量重建做等价性验证
+- [x] **SCD2 改增量维护，并与全量重建做等价性验证** —— `scripts/dim_product_scd2_incremental.sh`（UPDATE 关闭旧版本 + INSERT 新版本）。
+  - **等价性实测通过**：增量与全量重建**指纹一字不差**（300 行 / 50 当前版本 / `712112208566`）
+  - **三道防线**：① 无新快照提前退出（防"成功但没做事"）· ② **替换后校验 `${LAST}` 已消失**（防静默 no-op）· ③ 跑完校验区间无断裂 + 每商品恰好一个当前版本
+  - **4 个坑**：`UPDATE` 不接受表别名 · CTE 只作用于紧随其后的那一条语句 · `prev_date IS NULL` 在全量与增量里语义不同 · **模板占位符未替换 → `> NULL` → 0 行命中 → 静默 no-op**
+  - 见 PITFALLS §3.14 / §3.15 / §3.16 / §7.2
 - [ ] 累积快照事实表（下单 → 支付 → 发货 → 完成）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）

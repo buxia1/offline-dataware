@@ -927,6 +927,182 @@ print('遮蔽标准库的文件:', hits or '无')
 
 ---
 
+### 3.14 StarRocks 的 `UPDATE` **不接受表别名**
+
+**现象**
+
+```sql
+UPDATE dim.dim_product_scd2 AS s
+SET s.is_current = 0
+WHERE s.is_current = 1;
+```
+
+报错：
+
+```
+ERROR 1064 (HY000): Getting syntax error at line 1, column 24.
+Detail message: Unexpected input 'AS', the most similar input is {'SET'}.
+```
+
+**换了写法也一样不行**（实测，StarRocks 3.5.0）：
+
+| 写法 | 结果 |
+|---|---|
+| `UPDATE t AS s SET s.x = 1` | ❌ `Unexpected input 'AS'` |
+| `UPDATE t s SET s.x = 1`（裸别名）| ❌ `Unexpected input 's'` |
+| `UPDATE t JOIN other ON ... SET t.x = 1` | ❌ `Unexpected input 's'` |
+| **`UPDATE t SET x = 1 WHERE t.y = ...`**（全表名）| ✅ **唯一可行** |
+
+**解法：所有列引用都写全表名，不用别名**
+
+```sql
+UPDATE dim.dim_product_scd2
+SET is_current = 0,
+    valid_to = ( ... WHERE m.product_id = dim.dim_product_scd2.product_id ... )
+WHERE is_current = 1;
+```
+
+**和 MySQL 的差异**：MySQL 里 `UPDATE t AS s` 是合法且常用的。**从 MySQL 迁移过来的 SQL 会在这里直接报错**（好在这个错很响，不会静默）。
+
+**✅ 好消息：`UPDATE` 的其他能力都正常**
+
+| 能力 | 支持 |
+|---|---|
+| `SET` 里放**不关联**的标量子查询 | ✅ |
+| `SET` 里放**关联**子查询（用全表名）| ✅ |
+| `WHERE EXISTS (...)` 关联子查询 | ✅ |
+| `SET` 里 `DATE_SUB((子查询), INTERVAL 1 DAY)` | ✅ |
+| 派生表里带窗口函数，外层再关联 | ✅ |
+| `MERGE INTO` | ❌ **不支持**（`Unexpected input 'MERGE'`）|
+
+**所以"先 UPDATE 关闭旧版本、再 INSERT 新版本"这套 SCD2 增量维护，不需要 `MERGE` 就能做。**
+
+---
+
+### 3.15 CTE 的作用域**只覆盖紧随其后的那一条语句**
+
+**现象**
+
+多语句脚本里，`WITH` 定义的 CTE 被后面的独立语句引用：
+
+```sql
+WITH marked AS (SELECT ...)
+UPDATE ... WHERE ... EXISTS (SELECT 1 FROM marked ...);   -- ✅ 这条能用 marked
+
+INSERT INTO ... SELECT ... FROM marked;                    -- ❌ 这条用不了
+```
+
+第二条报错可能是**误导性的**：
+
+```
+ERROR 1046 (3D000): No database selected
+```
+
+**报"没选数据库"，是因为 StarRocks 把 `marked` 当成了「表名」** —— CTE 已经不在作用域里了。
+
+**原因**
+
+`WITH ... AS ( ... )` 是**绑定到紧随其后的那一条语句**的，**不是会话级变量**。
+
+**解法：每一条需要它的语句，都把自己的 CTE 重新写一遍**
+
+```sql
+WITH m AS (SELECT ...) INSERT ... SELECT ... FROM m;    -- 第1条：自带 CTE
+-- 中间不能插别的
+UPDATE ... SET x = (SELECT ... FROM (SELECT ...) m ...); -- 第2条：把推导重写一遍
+```
+
+**⚠️ 这也意味着：`WITH ... AS (...)` 后面跟多条语句时，只有第一条能用到 CTE。** 别指望"定义一次、多处复用"。
+
+**代价**：SCD2 增量维护里，"哪些是新变更"这段推导要在 `UPDATE` 和 `INSERT` 里**各写一遍**（实测确实要这样，没有 workaround）。
+
+**如果实在想避免重复**：把推导结果先落到一张**临时表**，两条语句都读它（本项目未采用，因为要管临时表的清理）。
+
+---
+
+### 3.16 `prev_date IS NULL` 在「全量重建」与「增量维护」里**语义不同**（静默多版本）
+
+**背景**
+
+SCD2 判断"是否产生新版本"用同一段模式：
+
+```sql
+LAG(snapshot_date) OVER (PARTITION BY product_id ORDER BY snapshot_date) AS prev_date
+...
+WHERE prev_date IS NULL                          -- 「第一行」
+   OR NOT (category <=> prev_category AND ...)   -- 「和上一行不同」
+```
+
+**同一段 SQL，在全量和增量里含义完全不同：**
+
+| 场景 | `LAG` 的窗口范围 | `prev_date IS NULL` 意味着 |
+|---|---|---|
+| **全量重建**（从 ODS 整表推）| 全部历史快照 | 这个商品**首次出现** → **该建版本** ✅ |
+| **增量维护**（只处理新快照）| **只在新快照集合内** | **新集合的第一条** → **可能等于现有当前版本** → **不该建版本** ❌ |
+
+**踩坑现象（实测）**
+
+商品1 的历史：`09-20 家电 → 09-21 图书 → 09-26 图书 → 09-27 服饰`
+
+- 全量重建：**3 个版本**（09-20 / 09-21 / 09-27）—— 09-26 和上一版本同为"图书"，**不建**
+- 增量维护（错误版）：**4 个版本** —— 因为 09-26 是新集合的第一条，`prev_date IS NULL` **无条件选中了它**
+
+```
+增量多出：09-26 图书  ← 和当前版本完全相同的"冗余版本"
+```
+
+**这个 bug 的特征：不报错、行数变多、`ratio` 仍然是 1**（每个商品仍只有一个当前版本），
+**只有做等价性验证（增量 vs 全量 指纹对比）才能发现。**
+
+**解法：第一条和后续行，用不同的比较对象**
+
+```sql
+LEFT JOIN dim.dim_product_scd2 s                    -- 取现有当前版本
+       ON s.product_id = lg.product_id AND s.is_current = 1
+WHERE ( lg.prev_date IS NULL                                            -- 新集合第一条
+        AND NOT (lg.category <=> s.category AND ...) )                  -- → 比【SCD2 当前版本】
+   OR ( lg.prev_date IS NOT NULL                                        -- 后续行
+        AND NOT (lg.category <=> lg.prev_category AND ...) )            -- → 比【上一条快照】
+```
+
+**判据**：
+- **第一条新快照**：和**现有当前版本**比，不同才建版本
+- **后续新快照**：和**上一条新快照**比，不同才建版本
+
+**⚠️ 顺带一个 StarRocks 限制**：上面那个"取现有当前版本"的关联，**`EXISTS` 里放非等值谓词会被拒绝**（§3.9）：
+
+```
+ERROR 1064: Not support Non-EQ correlated predicate in correlated subquery
+```
+
+但**这里用的是等值关联**（`s.product_id = lg.product_id`），所以 `LEFT JOIN` 完全可行 —— 这也正是**为什么必须用 `LEFT JOIN ... IS NULL` 而不是 `NOT EXISTS`** 的又一个实例。
+
+**等价性验证的做法**（这才是唯一能发现这类 bug 的办法）
+
+```bash
+# 1. 克隆一份数据，或记下当前指纹
+# 2. 跑增量 → 记指纹
+# 3. 跑全量重建 → 记指纹
+# 4. 两个指纹必须【一字不差】
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
+```
+
+**实测结果**（本项目，起点 09-21 → 处理 09-26 + 09-27）：
+
+| 路径 | 行数 | 当前版本数 | 指纹 |
+|---|---|---|---|
+| 全量重建 | 150 | 50 | `350365544376` |
+| 增量（修正版）| 150 | 50 | `350365544376` ✅ |
+
+**逐行 `EXCEPT` 差异 = 0 / 0**（双向都无差异）。
+
+> **通用规律：凡是"把全量逻辑改成增量"的重构，都必须做等价性验证。**
+> **光看行数不够** —— 本次是行数变了（150 → 200）才暴露；
+> 但也可能行数一样、只是值不同（那样就得靠指纹或逐列对比）。
+> 见本项目 `sql/fingerprint_product_chain.sql` 的设计理由："行数一样不代表数据一样"。
+
+---
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写
@@ -1086,7 +1262,7 @@ memory=8GB
 
 ---
 
-## 七、shell 引号
+## 七、shell 引号与模板占位符
 
 ### 7.1 双引号里套双引号会被 bash 吃掉
 
@@ -1114,6 +1290,95 @@ ALTER TABLE tbl SET (dynamic_partition.enable = false);
 | **写进 .sql 文件** ← 推荐 | `mysql ... < xxx.sql` |
 
 **一旦 SQL 里开始出现引号，就该用文件而不是 `-e "..."`。**
+
+---
+
+### 7.2 模板占位符没被替换 → SQL 变成 `> NULL` → **静默 no-op**
+
+**现象**
+
+SQL 文件里用占位符做参数，直接执行它：
+
+```bash
+docker exec -i starrocks mysql ... < sql/dim_product_scd2_incremental.sql
+```
+
+**没有任何报错，退出码 0，但表一行都没变。**
+
+**原因**
+
+SQL 里写的是：
+
+```sql
+WHERE l.snapshot_date > '${LAST}'
+```
+
+`${LAST}` 是**项目自定义的占位符**，不是 shell 变量 —— `mysql < 文件` **不会替换它**。于是实际执行的是字面量 `'${LAST}'`。
+
+关键一步：
+
+```
+CAST('${LAST}' AS DATE)  →  NULL
+```
+
+于是条件变成：
+
+```sql
+snapshot_date > NULL     →  恒为 NULL（不是 TRUE）
+```
+
+**`WHERE` 全都过滤掉 → 0 行命中 → UPDATE 不动、INSERT 不插 → 表纹丝不动。**
+
+**实测证据**
+
+| 条件 | 命中行数 |
+|---|---|
+| `snapshot_date > '${LAST}'`（未替换）| **0** |
+| `snapshot_date > '2026-09-27'`（正确替换）| **50** |
+| `CAST('${LAST}' AS DATE)` | **`NULL`** |
+
+**为什么难发现**
+
+- **不报错**（`> NULL` 是合法表达式，只是永远不成立）
+- **退出码 0**（SQL 执行成功了，只是没匹配到行）
+- **"跑完了"的观感和"成功"完全一样** —— 直到你发现表没变，开始怀疑是不是逻辑写错了
+
+> **这是 `NULL` 比较陷阱的第 N 个变体。** 同类：`BETWEEN` 遇 `NULL`（§3.7）、`DATE_ADD(哨兵值)` 返回 `NULL` 导致检查静默放过（§2.7 / DQC ②）、`NULL <> x` 不是 `TRUE`。
+> **共同点：`NULL` 参与的判断既不报错、也不为真，而是"消失"。**
+
+**本项目里正确套路的范例**：`scripts/dwd_sku_load.sh`
+
+```bash
+sed -e "s/\${D}/${D}/g" -e "s/\${DF}/${DF}/g" "$SQL_FILE" \
+  | docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot
+```
+
+**解法：占位符必须有"外壳脚本"做替换，而且替换后要自检**
+
+```bash
+TMP_SQL=$(mktemp /tmp/xxx.XXXXXX.sql)
+sed "s/\${LAST}/${LAST}/g" "$SQL_FILE" > "$TMP_SQL"
+
+# ★ 关键：替换完立刻检查占位符是否真的消失了
+if grep -q '\${LAST}' "$TMP_SQL"; then
+    echo "❌ 占位符 \${LAST} 未被替换 —— 拒绝执行（否则会静默 no-op）"
+    exit 1
+fi
+```
+
+**三道防线（配这种"模板 + 外壳"脚本时都该有）**
+
+| # | 防线 | 防什么 |
+|---|---|---|
+| ① | **没有新数据就提前退出并打印** | 防"成功但没做事"，让人分不清"没数据"和"脚本坏了" |
+| ② | **替换后校验占位符已消失** | 防本节这个坑 —— **静默 no-op** |
+| ③ | **跑完做不变式校验**（如区间无断裂、每商品一个当前版本）| 防逻辑写对但结果坏 |
+
+**通用规律**
+
+> **任何"SQL 模板 + 外壳脚本替换"的设计，都必须有防线②。**
+> 否则**替换规则一失效（变量名改了、sed 写错、路径变了），整个脚本就退化成"什么都不做但报成功"** ——
+> 而这比报错危险得多，因为**报错会让人去修，静默成功不会**。
 
 ---
 
