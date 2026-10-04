@@ -412,6 +412,9 @@ docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_produ
 | 表达式分区会废掉逐天 `INSERT OVERWRITE PARTITION` | §3.7 |
 | StarRocks 不支持关联子查询里的非等值谓词（影响孤儿行检查）| §3.9 |
 | `UNION ALL` 的列名以第一个 `SELECT` 为准 | §3.11 |
+| **`UPDATE` 不接受表别名**（做增量关闭旧版本时会撞到）| §3.14 |
+| **CTE 只作用于紧随其后的那一条语句**（多语句不能用同一个 CTE）| §3.15 |
+| **`prev_date IS NULL` 在全量与增量里语义不同**（静默多版本，只有等价性验证能发现）| §3.16 |
 
 ---
 
