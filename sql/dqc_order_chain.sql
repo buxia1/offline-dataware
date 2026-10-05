@@ -43,9 +43,11 @@ WITH checks AS (
     UNION ALL
 
     -- ② DWD 有数据的天，DWS 必须有（抓"整天没汇总"）
+    --   dt <= '${AS_OF}'：正常运行传"昨天"，补数时传当次业务日期
+    --   → 逐天重建时只检查"已重建到的那天"，不会因为"后面的天还没做"而红灯
     SELECT '② DWS 覆盖 DWD 全部日期' AS check_name,
            CAST(count(*) AS BIGINT) AS violations
-    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail) d
+    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
     WHERE d.dt NOT IN (SELECT dt FROM dws.dws_user_order_day)
 
     UNION ALL
@@ -89,9 +91,30 @@ WITH checks AS (
     --   实测有 3 天不满足。写成检查会永远红灯。
     SELECT '⑤ DWD 行数不超过 ODS' AS check_name,
            CAST(COALESCE(sum(CASE WHEN d.c > o.c THEN 1 ELSE 0 END), 0) AS BIGINT) AS violations
-    FROM (SELECT dt, count(*) c FROM dwd.dwd_order_detail GROUP BY dt) d
-    JOIN (SELECT dt, count(*) c FROM ods.ods_order      GROUP BY dt) o
+    FROM (SELECT dt, count(*) c FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}' GROUP BY dt) d
+    JOIN (SELECT dt, count(*) c FROM ods.ods_order      WHERE dt <= '${AS_OF}' GROUP BY dt) o
       ON d.dt = o.dt
+    UNION ALL
+
+    -- ⑤a ODS 必须非空
+    --    ⑤ 用的是 INNER JOIN：上游全空时【一行都匹配不上】→ violations=0 → 静默绿灯。
+    --    而"上游全空"是最严重的数据事故，必须单独拦。
+    --    （标量子查询比 IN 单行派生表稳：见 PITFALLS §3.12）
+    SELECT '⑤b ODS 覆盖 DWD 全部日期' AS check_name,
+           CAST(count(*) AS BIGINT) AS violations
+    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
+    LEFT JOIN (SELECT DISTINCT dt FROM ods.ods_order WHERE dt <= '${AS_OF}') o ON o.dt = d.dt
+    WHERE o.dt IS NULL
+
+    UNION ALL
+
+    -- ⑤b DWD 的每一天，ODS 里必须都有（抓"上游部分丢失"）
+    --    LEFT JOIN ... IS NULL 而不是 NOT IN / NOT EXISTS：见 PITFALLS §3.9
+    SELECT '⑤b ODS 覆盖 DWD 全部日期' AS check_name,
+           CAST(count(*) AS BIGINT) AS violations
+    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail) d
+    LEFT JOIN (SELECT DISTINCT dt FROM ods.ods_order) o ON o.dt = d.dt
+    WHERE o.dt IS NULL
 )
 SELECT check_name, violations
 FROM checks

@@ -5,6 +5,7 @@ from pyspark.sql.functions import col, from_json, to_date
 from pyspark.sql.types import (
     DecimalType, LongType, StringType, StructField, StructType,
 )
+import sys
 
 KAFKA_BOOTSTRAP = "kafka:29092"
 TOPIC = "ods_order"
@@ -46,10 +47,20 @@ rows = (
 )
 
 rows.cache()
+n = rows.count()
 print("=" * 60)
-print(u"从 Kafka 读到的行数: %d" % rows.count())
+print(u"从 Kafka 读到的行数: %d" % n)
 rows.show(truncate=False)
 print("=" * 60)
+
+# ★ 新增：读到 0 行必须失败退出
+#   上游节点是 truncate_ods（先清表再灌）→ 读到 0 行 = 表被清空却报成功
+#   = 静默清库。必须让它变红。
+if n == 0:
+    print(u"❌ 从 Kafka 读到 0 行 —— 拒绝以成功收场")
+    print(u"   排查：1) topic retention 是否已过期  2) topic 是否为空")
+    spark.stop()
+    sys.exit(1)
 
 (
     rows.write.format("jdbc")

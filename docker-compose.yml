@@ -95,6 +95,7 @@ services:
       - "12345:12345"
     environment:
       TZ: Asia/Shanghai
+      JAVA_OPTS: "-Xms512m -Xmx1024m -Xmn256m -XX:MaxMetaspaceSize=256m"
       DATABASE_TYPE: mysql
       SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/dolphinscheduler?useUnicode=true&characterEncoding=UTF-8&allowMultiQueries=true&allowPublicKeyRetrieval=true&useSSL=false
