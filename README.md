@@ -684,11 +684,10 @@ docker compose restart dolphinscheduler
 
 - [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
 - [x] **把商品/维度链路接进 DolphinScheduler**（含跨工作流依赖 + 定时）
-- [x] 数据质量检查节点（DQC）—— 5 项检查 + 自检
+- [x] 数据质量检查节点（DQC）—— 6 项检查 + 自检
 - [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
-- [ ] **修掉「补数要手工补分区」这个痛点** —— 两个方向：在 `dwd_sku_load.sh` 里**自动 `ADD PARTITION`**，或把 `dwd_order_sku_detail` 改成**表达式分区**（PITFALLS §3.2 已推荐过，任何日期按需自动建分区）
-- [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
+- [x] **DQC 加一条「重算对账」** —— `⑥ 重物化属性一致`：宽表里的商品属性必须等于 SCD2 对该日期算出的属性。盖住两个盲区：属性值不同、以及 **JOIN 不上的孤儿行**（范围 JOIN 不满足时那行会直接消失，计数纹丝不动）。写 `<=>` 而非 `<>`（NULL 安全），用 `LEFT JOIN` 而非 `NOT EXISTS`（StarRocks 不支持关联子查询里的非等值谓词）
 - [x] 作业失败告警（邮件 / 钉钉）—— DS 里两个工作流都配了 `warning_type=2` + 告警组
 - [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/dim_product_scd2_incremental.sh`，指纹一字不差）
 - [x] **累积快照事实表**（下单 → 支付 → 发货 → 完成）—— 表/视图/装载/五道防线，**09-20 ~ 09-28 共 900 行**，卡单三类可见
@@ -698,6 +697,10 @@ docker compose restart dolphinscheduler
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
+
+**可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
+
+- [ ] `dwd_order_sku_detail` 改**表达式分区** —— 现在是动态分区（`dynamic_partition.history_partition_num=0`：**只建未来、不建历史**），所以补历史某天前需要手工 `ALTER TABLE ... ADD PARTITION`。**这是 StarRocks 动态分区的固有行为，属运维常规动作**（建表时也用 `sql/dwd_add_history_partitions.sql` 补过 `p20260915`~`p20260919`）；改成表达式分区可一劳永逸消掉它（PITFALLS §3.2 推荐过）
 
 ---
 
