@@ -418,9 +418,9 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 
 | 表 | 模型 | 说明 |
 |---|---|---|
-| `ods.ods_order_event` | `DUPLICATE KEY` | 事件流落地（事件：`order`/`pay`/`ship`/`finish`/`cancel`）。⚠️ 当前 991 行 = 612 去重对（摄入不幂等导致 09-20/09-21 翻倍，见「幂等性」）|
+| `ods.ods_order_event` | `DUPLICATE KEY` | 事件流落地（事件：`order`/`pay`/`ship`/`finish`/`cancel`）。行数 == `(order_id,event_type)` 去重对数（有防线⑤ 守着）|
 | `ods.ods_kafka_offset` | `PRIMARY KEY(topic, partition_id)` | **消费位点表** —— 记住"读到哪了"，增量摄入靠它 |
-| `dwd.dwd_order_lifecycle` | `PRIMARY KEY(order_id)` | **累积快照**：五个里程碑列 + 派生列。当前 **300 行**（09-20 ~ 09-22）|
+| `dwd.dwd_order_lifecycle` | `PRIMARY KEY(order_id)` | **累积快照**：五个里程碑列 + 派生列。当前 **900 行**（09-20 ~ 09-28）|
 | `dwd.v_order_lifecycle_expected` | 视图 | 由事件流推导"期望快照"，装载与对账的**单一真相源** |
 
 **怎么跑**（逐天，三步）
@@ -614,7 +614,7 @@ docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT dt, count(*) AS rows_, count(DISTINCT concat(order_id,'-',event_type)) AS pairs
 FROM ods.ods_order_event GROUP BY dt ORDER BY dt;"
 
-# 事件流摄入（当前是整表替换；改增量后只读新消息）
+# 事件流摄入（增量：只读位点之后的新消息；--reset 才是清表重灌）
 bash scripts/ods_order_event_ingest.sh
 
 # 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
@@ -689,15 +689,15 @@ docker compose restart dolphinscheduler
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
 - [ ] **修掉「补数要手工补分区」这个痛点** —— 两个方向：在 `dwd_sku_load.sh` 里**自动 `ADD PARTITION`**，或把 `dwd_order_sku_detail` 改成**表达式分区**（PITFALLS §3.2 已推荐过，任何日期按需自动建分区）
 - [ ] **DQC 加一条「重算对账」** —— 现有 5 项查不出 `dwd_order_sku_detail` 的"口径陈旧"（SCD2 改了但没重物化时，行数金额都不变）
-- [ ] 作业失败告警（邮件 / 钉钉）
-- [ ] SCD2 改增量维护，并与全量重建做等价性验证
-- [x] 累积快照事实表（下单 → 支付 → 发货 → 完成）—— 表/装载/防线已落地，逐天回放进行中
-- [ ] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表，`sql/ods_kafka_offset.sql` 已建）—— 现状是 `earliest` 全量重读 + append，**不幂等**
-- [ ] **把订单事件 / 累积快照链路接进 DS**（2 个节点：`ods_event_spark` → `dwd_lifecycle_load`）
-- [ ] **累积快照逐天回放完 09-21 ~ 09-27**（目标：`dwd_order_lifecycle` 800 行，卡单三类可见）
+- [x] 作业失败告警（邮件 / 钉钉）—— DS 里两个工作流都配了 `warning_type=2` + 告警组
+- [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/dim_product_scd2_incremental.sh`，指纹一字不差）
+- [x] **累积快照事实表**（下单 → 支付 → 发货 → 完成）—— 表/视图/装载/五道防线，**09-20 ~ 09-28 共 900 行**，卡单三类可见
+- [x] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表）—— 幂等已实测（重跑 `读到 0 行`）
+- [x] **把订单事件 / 累积快照链路接进 DS**（工作流三 `order_event_chain`：`ods_event_spark` → `dwd_lifecycle_load`，02:30，失败策略 `END`）
+- [x] **累积快照逐天回放**（09-20 ~ 09-28，`dwd_order_lifecycle` **900 行**，卡单三类可见）
 - [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
 - [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
-- [ ] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
+- [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
 
 ---
 
