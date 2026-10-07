@@ -72,6 +72,16 @@ if ! printf '%s' "$FROM_DT" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
     exit 1
 fi
 
+# ---- 防线⓪（新）：事件表本身不能是空的 ----
+# 空集不是"没问题"，是"没检查到"。上游被 retention 清空时，
+# 防线① 那句 exit 0 会把它伪装成"正常无事可做"。
+EVT_TOTAL=$($QUERY "SELECT count(*) FROM ods.ods_order_event")
+echo "事件表总行数: $EVT_TOTAL"
+if [ "$EVT_TOTAL" = "0" ]; then
+    echo "❌ ods_order_event 是空的 —— 拒绝继续（空集不是没问题，是没检查到）"
+    exit 1
+fi
+
 # ---- 防线①：范围内没有订单 → 明确退出 ----
 SCOPE=$($QUERY "SELECT count(DISTINCT order_id) FROM ods.ods_order_event WHERE dt >= '$FROM_DT'")
 echo "范围内订单数: $SCOPE"
@@ -140,8 +150,15 @@ BAD_LAG=$($QUERY "SELECT count(*) FROM $TABLE
                      OR (pay_lag_hours IS NULL AND pay_time IS NOT NULL)")
 BAD_STAGE=$($QUERY "SELECT count(*) FROM $TABLE WHERE current_stage IS NULL")
 
+# 事件表全表不变式：行数必须 == (order_id,event_type) 去重对数
+# 注意【不能用 count(DISTINCT order_id)】：一个订单本来就有多个事件（order/pay/ship…），
+# 那样永远不相等 —— 必须按 (order_id, event_type) 这对来数
+EVT_ROWS=$($QUERY "SELECT count(*) FROM ods.ods_order_event")
+EVT_PAIRS=$($QUERY "SELECT count(DISTINCT concat(order_id, '-', event_type)) FROM ods.ods_order_event")
+
 echo
 echo "=== 不变式校验 ==="
+printf "  事件表行数/去重对数         : %s / %s   （必须相等）\n" "$EVT_ROWS" "$EVT_PAIRS"
 printf "  期望行数(视图)              : %s\n" "$EXPECT"
 printf "  实际行数                    : %s\n" "$ROWS"
 printf "  唯一订单数                  : %s\n" "$IDS"
@@ -176,6 +193,13 @@ if [ "$BAD_LAG" != "0" ]; then
 fi
 if [ "$BAD_STAGE" != "0" ]; then
     echo "❌ current_stage 为空 —— 派生 CASE 没兜住"
+    FAIL=1
+fi
+
+if [ "$EVT_ROWS" != "$EVT_PAIRS" ]; then
+    echo "❌ 事件表有重复：行数($EVT_ROWS) ≠ (order_id,event_type)去重对数($EVT_PAIRS)"
+    echo "   —— 摄入脚本被重复执行过；重复会让【行数不可信】并放大视图扫描量"
+    echo "   恢复: TRUNCATE TABLE ods.ods_order_event; 再从 Kafka 重灌一次"
     FAIL=1
 fi
 

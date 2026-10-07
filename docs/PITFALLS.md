@@ -123,14 +123,24 @@ docker compose exec starrocks sh -c \
 
 Spark 脚本用 `startingOffsets=earliest`，**每次执行都把 Kafka 里所有消息重读一遍**。Kafka 的消息不会因为被读走而消失（只受保留策略控制），所以跑两次就是两遍。
 
-**这是设计使然，不是 bug** —— ODS 是追加层，重复由 DWD 去重解决。
+**⚠️ 本节原结论「这是设计使然，不是 bug —— 重复由 DWD 去重解决」是错的，2026-10-07 已实测推翻。**
+
+**为什么错**：那个"设计"只对**主键模型**成立。
+
+| 表 | 模型 | 重复消息的结局 |
+|---|---|---|
+| `ods_order` | `PRIMARY KEY(order_id)` | 自动折叠 ✅ |
+| `ods_order_event` | `DUPLICATE KEY(order_id)` | **原样保留** ❌ |
+
+而 `dwd_order_lifecycle` 是**累积快照**（PK 表），它按 `order_id` UPSERT —— **等于默认"每个订单的每个里程碑在事件表里只有一行"**。这个前提在 `DUPLICATE KEY` 下不成立。详见 §3.17。
 
 **但做实验时会把数字搞乱**。判断方法：看重复行数是不是**正好是整数倍**（我们遇到过 116 和 66，正好是单批次 58 和 33 的两倍）。
 
 **解法**
 
 - 做对照实验前，先删 topic 重建 + `TRUNCATE` 下游表
-- 生产环境改用增量（`startingOffsets=latest` + 维护 offset），或换 StarRocks Routine Load
+- 生产环境改用**增量**（维护 offset，每次只读新消息），或换 StarRocks Routine Load
+- ⚠️ **不要**用"先 `TRUNCATE` 再从 Kafka 全量重灌"当长期方案 —— Kafka 有 retention，消息一旦过期，清表就等于**清库**（2026-10-05 事故的根因）。它只能当**回补手段**，且必须配"进度不得超过可用范围"的防线
 
 ---
 
@@ -1103,6 +1113,51 @@ docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_produ
 
 ---
 
+### 3.17 累积快照的三大前提：值级对账抓不到"重复行"
+
+**背景**
+
+`dwd.dwd_order_lifecycle`（累积快照）按 `order_id` UPSERT，**隐含假设事件表里每个 `(order_id, event_type)` 只有一行**。
+2026-10-07 实测：`ods.ods_order_event` 有 **991 行 / 612 去重对** —— 379 组重复，而装载脚本**三条防线全部报绿**。
+
+**为什么三条防线都瞎了**
+
+| 防线 | 它比的是什么 | 为什么绕过重复 |
+|---|---|---|
+| ③ 双向 `EXCEPT` 对账 | **值级**去重后的差异 | 两份**完全相同**的副本，`EXCEPT` 去重后差异 = 0 |
+| ④ `行数 = 唯一订单数` | **快照表** | 快照是投影，重复已被 `MAX` 折叠，主键表不会有重复行 |
+| ① `范围内订单数 = count(DISTINCT order_id)` | **订单个数** | 只数订单，对"行数重复"天然不敏感 |
+
+**实测证据**（两张表只差一份完全相同的副本）：
+
+```
+a 表 1 行 vs b 表 2 行（b 多一份完全相同的副本）
+双向 EXCEPT 差异行数：0        ← 值级对账看不见重复
+```
+
+**必须补的防线**：**"行级"不变式**，而且口径要对：
+
+```bash
+# ✅ 正确：按 (order_id, event_type) 去重对数比
+EVT_ROWS=$(... "SELECT count(*) FROM ods.ods_order_event")
+EVT_PAIRS=$(... "SELECT count(DISTINCT concat(order_id,'-',event_type)) FROM ods.ods_order_event")
+# ❌ 错误：一个订单本来就有多个事件，count(DISTINCT order_id) 永远不相等 → 假红
+```
+
+**更深的教训（三条，都超出"重复"本身）**
+
+1. **防线有"口径"** —— 局部口径的防线**证明不了全表**。本项目那次绿勾的构成是
+   `范围内订单数 123`（局部）/ `实际行数 200`（全表）—— 两个数字本来就不该相等，**却因为都是"看起来合理"的数字而没人追问**。
+   > **自检打印的每个数字，都要问一句"这是哪个口径的"。**
+2. **"重复"有两种，危害等级差一个数量级**：
+   - **完全相同的副本** → 值不可见，只是浪费（本例：`event_time` 等所有列都相同）
+   - **内容有差异的副本** → `MAX(CASE WHEN ...)` 会**静默挑一个**，结果错但不报错
+   （实测：两份副本 `event_time` 不同时，视图取到的是 `2026-09-25`，而不是正确值）
+   > **重复拖得越久，越可能从"无害副本"漂成"有害差异"。**
+3. **局部范围检查 + 全表口径打印 = 假绿的标准配方**。§8 的"先破坏再重建"在这里同样适用：
+   要证明防线有效，**先造一份脏数据，看它报不报红**。（本次修复的验证就是这么做的 —— 修完对着现有的 991 行脏表跑，它从"报绿"变成"报红"，这就是防线生效的铁证。）
+
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写
@@ -1163,6 +1218,117 @@ volumes:
 ```
 
 **挂单个文件是安全的**——不会遮蔽 `/opt/spark/jars` 目录里自带的几百个 jar。**挂整个目录才会。**
+
+---
+
+### 4.3 Spark 的 JDBC `overwrite` 模式在 StarRocks 上**不可用**（实测）
+
+**背景**：ODS 摄入不幂等（§1.3 / §3.17）时，第一个想到的修法是"让 Spark 用 `overwrite` 覆盖"。
+**2026-10-07 实测：这条路在 StarRocks 上走不通，而且失败方式很危险。**
+
+**实测结果（隔离探针，只碰临时表）**
+
+| 写法 | 结果 |
+|---|---|
+| `mode("overwrite")` + `option("truncate","true")` | `java.sql.SQLSyntaxErrorException`：`Getting syntax error at line 1, column 76. Detail message: Unexpected input ',', the most similar input is {'('}` |
+| `mode("overwrite")`（不带 truncate） | **先把已存在的表连结构一起 DROP 掉**，然后 `CREATE TABLE` 报同样的语法错 |
+
+**最危险的细节**：`overwrite` **先把表删了，再建表失败** —— 于是**表直接消失**。探针实测：
+```
+--- 表还在吗（1=在）---
+0
+```
+> 如果这个模式用在 `ods_order_event` 上，一次失败就会**把整张表连同数据删掉**。
+
+**原因**
+
+Spark 的 JDBC 方言生成的是 **MySQL 方言 DDL**（`truncate=true` 那条更是 MySQL 多表 `TRUNCATE TABLE a, b` 的语法），StarRocks 解析不了。
+
+**结论：StarRocks + Spark JDBC 只有 `append` 可用。**
+
+**正确解法**（不要绕 `overwrite`）：
+
+```bash
+# 用 StarRocks 原生语句显式清空，再用 append 全量写入
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "TRUNCATE TABLE ods.ods_order_event"
+docker exec spark /opt/spark/bin/spark-submit ... scripts/ods_order_event_to_starrocks.py
+```
+
+但注意：**"先清再灌"本身又引入了"Kafka 过期 → 清库"的风险**（§1.3）。
+所以它只能当**回补手段**，日常必须走**增量**（维护 offset，不重读历史）。
+
+**通用规律**
+> **换数据库引擎时，"ORM/框架的方言支持"是要单独验证的一项。**
+> 不要假设 `mode("overwrite")` / `truncate=true` 这类参数"只是写法差异" ——
+> 它可能生成目标库根本不认的 SQL，**而且在失败前已经造成了破坏**。
+> 验证方式：**拿一张一次性临时表做探针**，别直接在生产表上试。
+
+---
+
+### 4.4 Spark 写 StarRocks：DataFrame 里**不能有目标表没有的列**（实测）
+
+**现象（2026-10-07，卡了整整一轮排查）**
+
+增量摄入需要把 Kafka 的 `partition` / `offset` 元数据列带出来算消费位点。
+于是代码写成"把元数据列和业务列放在同一张 DataFrame 里"，结果写库直接报：
+
+```
+AnalysisException: Column k_part not found in schema Some(StructType(
+  order_id, user_id, product_id, amount, order_time, event_type, event_time, dt))
+```
+
+**误导之处**：报错说"`k_part` 不在 schema 里"，但 `rows.schema` **明明有它**：
+```
+INSTR-A rows.schema = [order_id, ..., dt, k_part, k_off]     ← 有
+（紧接着 write 就失败）
+```
+看起来像"列在中途丢了"，实际上是**写入校验拒绝多出来的列**，报错把"表的 schema"和"DataFrame 的 schema"说反了。
+
+**隔离实验（三列简单 DataFrame，与 Kafka 无关，一次性定性）**
+
+| 实验 | DataFrame 的列 | 结果 |
+|---|---|---|
+| A | 8 列，与目标表**完全一致** | ✅ 成功 |
+| B | 7 列，目标表列名的**子集** | ✅ 成功 |
+| C | 8 列 **+ `k_part`**（多一列） | ❌ `Column k_part not found in schema` |
+| D | `c1,c2,c3`（完全无关的列名） | ❌ `Column c1 not found in schema` |
+
+**结论：JDBC 写入要求 DataFrame 的列名是目标表列名的子集（不能多、名字要对）。**
+
+**也更省事的定位方式**：既然连 `c1` 都报错，就说明**报错与业务无关**，是写入路径的通用约束 ——
+一测就知道，不用翻源码。
+
+**解法：把"写库的 DataFrame"和"算位点的 DataFrame"分开**
+
+```python
+raw = spark.read.format("kafka")...
+
+# ① 写库用：只保留业务列（并显式声明列序）
+biz = (raw.select(from_json(col("value").cast("string"), schema).alias("j"))
+       .select([col("j." + c) for c in JSON_COLS])      # ← dt 是派生列，不在 JSON 里！
+       .withColumn("order_time", col("order_time").cast("timestamp"))
+       .withColumn("event_time", col("event_time").cast("timestamp"))
+       .withColumn("dt", to_date(col("event_time")))
+       .select(BIZ_COLS))
+biz.write.format("jdbc").option("dbtable", "ods_order_event") \
+   .option("columns", ",".join(BIZ_COLS)) ...          # ← 显式列映射更稳
+
+# ② 算位点用：只保留 partition/offset，绝不写 ODS
+offsets_df = raw.select(col("partition").alias("k_part"), col("offset").alias("k_off"))
+```
+
+**连带踩到的第二个坑**：`dt` 是**派生列**（`to_date(event_time)`），**不在 Kafka 的 JSON 结构体里**。
+把它和 JSON 字段一起 `select(col("j." + c))` 会报：
+
+```
+AnalysisException: [FIELD_NOT_FOUND] No such struct field `dt` in `order_id`, ..., `event_time`
+```
+→ **先 select JSON 字段、withColumn 派生、最后再 select 一次**。
+
+**通用规律**
+> **"报错说列不在 schema 里，但 `df.schema` 明明有它"→ 别怀疑 DataFrame，怀疑写入路径的约束。**
+> 定位手法：**用一个三列表做隔离实验**。如果连无关列名都报同样的错，那就与你的数据无关，
+> 是写入路径的通用规则（本例：不允许额外列）。这比读框架源码快得多。
 
 ---
 
@@ -1259,6 +1425,94 @@ memory=8GB
 `docker_data.vhdx` 存放所有镜像、容器、数据卷，**只涨不缩**。
 
 这套栈跑起来 30~60GB 是常态。Docker Desktop → Settings → **Resources → Advanced → Disk image location** 可以改位置（**不在 WSL Integration 那一页**）。
+
+---
+
+### 6.4 `wsl.exe` 默认用户是 `root` —— 依赖和属主都可能对不上
+
+**现象（2026-10-07，同一个坑一天踩两次）**
+
+```bash
+wsl.exe -e bash -lc "cd /home/l/offline-dw && python3 scripts/gen_mock_orders.py --date 2026-09-22"
+# ModuleNotFoundError: No module named 'kafka'
+```
+
+但**用户在自己终端跑同一条命令是成功的**。
+
+**原因**：`wsl.exe` 进来的用户是 `root`，而 `kafka-python` 装在 **`l` 的 user site-packages**：
+
+```
+root 下 python3 → /usr/bin/python3        → 没有 kafka
+l    下 python3 → /home/l/.local/lib/python3.10/site-packages/kafka  → 有
+```
+
+**排查方法**
+
+```bash
+whoami                                   # → root（大概率）
+sudo -u l bash -lc 'python3 -c "import kafka; print(kafka.__file__)"'
+```
+
+**连带后果：临时文件属主**
+
+以 root 跑脚本会在 `/tmp` 留下 root 属主的文件。**下次脚本降权到 `l` 跑时，重定向写入会失败**：
+
+```
+line 42: /tmp/dry_2026-09-22.txt: Permission denied
+```
+
+而重定向失败会让**整条命令的退出码变成 1**，**被误判成"业务逻辑报错"**（本次就误判成"跳天告警"）。
+
+**解法**
+
+```bash
+# ① 整脚本降权重入（推荐，属主也一起解决）
+if [ "$(whoami)" != "l" ]; then
+    exec sudo -u l bash "$0" "$@"
+fi
+
+# ② 临时目录用 l 可写的位置，别用 /tmp
+WORK=/home/l/replay_work
+
+# ③ 清掉历史遗留的 root 属主文件
+rm -f /tmp/dry_*.txt /tmp/send_*.txt ...
+```
+
+**通用规律**
+> **"我这边能跑"和"agent 那边能跑"不是同一个环境。**
+> 只要命令里有 `python`（或其他对 user site-packages 敏感的解释器），**先确认 `whoami`**。
+> 而 `Permission denied` 出现在**重定向**上时，别去读业务日志 —— 先看文件属主。
+
+---
+
+### 6.5 用 `docker cp` 调试会往项目目录里留文件
+
+**现象**：容器里没有编辑器，调试脚本的常见做法是
+
+```bash
+docker cp /mnt/d/.../probe.py spark:/opt/offline-dw/scripts/_probe.py
+```
+
+但 `/opt/offline-dw/scripts` 是 **bind mount 到宿主项目目录**的 —— 于是这个临时探针文件
+**真的出现在 `/home/l/offline-dw/scripts/` 里，而且属主是 `root`**。
+
+**后果**：`git status` 变脏；如果忘了删，会被误提交。
+
+**解法**
+
+```bash
+# 拷进容器调试完，务必删除（两边都要，因为透传）
+docker exec spark rm -f /opt/offline-dw/scripts/_probe.py
+sudo -u l rm -f /home/l/offline-dw/scripts/_probe.py
+cd /home/l/offline-dw && git status --short      # 必须回到只剩自己的改动
+```
+
+**更好的做法**：临时脚本放**项目外**再挂载/拷入，或者直接用 `spark-submit /mnt/d/...` 路径（
+宿主 `/mnt/d` 在容器里不可见时才需要 `docker cp`）。
+
+**通用规律**
+> **`docker cp` 到 bind mount 的目标 = 往宿主机写文件。**
+> 调试完**一定要 `git status --short` 确认项目目录只剩预期的改动**。
 
 ---
 

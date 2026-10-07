@@ -9,7 +9,11 @@
 | 工作流 | 作用 | 定时 | 执行策略 |
 |---|---|---|---|
 | `offline_dataware` | 订单链路（Kafka → ODS → DWD → DWS → ADS）| 每天 02:00 | **串行丢弃** |
+| `order_event_chain` | **订单事件链路（Kafka → 事件流 ODS → 累积快照）** | **每天 02:30** | **串行丢弃** |
 | `dim_product_chain` | 商品 / 维度链路（CSV → ODS → DIM → DWD）| 每天 03:00 | **串行丢弃** |
+
+> **`order_event_chain` 是 2026-10-07 新增的第三个工作流**，见 `docs/dolphinscheduler-order-event-chain.md`。
+> 它的**失败策略必须是 `STOP`**（不是另外两个用的 `CONTINUE`）—— 因为它的防线是数据完整性检查，重试解决不了。
 
 **`dim_product_chain` 依赖 `offline_dataware`**（因为商品宽表要读订单链路的 `dwd_order_detail`）—— 见文末「工作流二：dim_product_chain」。
 

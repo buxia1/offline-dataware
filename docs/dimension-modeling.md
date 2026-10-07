@@ -35,9 +35,9 @@
 |---|---|---|---|
 | **事务事实表** | 一个**事件**（不可变）| ❌ 只追加 | `dwd_order_detail` |
 | **周期快照事实表** | 一个**时间点**的状态 | ❌ 按周期重算 | `ads_daily_sales`（每天一行）|
-| **累积快照事实表** | 一个**流程的全生命周期** | ✅ **会被更新** | **尚未实现**（见 §七）|
+| **累积快照事实表** | 一个**流程的全生命周期** | ✅ **会被更新** | `dwd_order_lifecycle`（见 §七）|
 
-**累积快照长什么样**（还没做，先看形状）：
+**累积快照长什么样**（本项目已落地，见 §10.6）：
 
 | order_id | 下单日期 | 支付日期 | 发货日期 | 完成日期 | 当前阶段 |
 |---|---|---|---|---|---|
@@ -554,7 +554,7 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 
 ### 10.6 累积快照的定位：**同一实体的另一个视角**
 
-`dwd_order_lifecycle`（待建）与 `dwd_order_detail` 的关系：
+`dwd_order_lifecycle`（**已实现**，见 §10.8）与 `dwd_order_detail` 的关系：
 
 | 项 | `dwd_order_detail` | `dwd_order_lifecycle` |
 |---|---|---|
@@ -613,6 +613,52 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 
 ---
 
+### 10.8 本项目累积快照的落地状态（2026-10-07）
+
+**已实现**（`e3fb6f8` 起）：
+
+| 文件 | 作用 |
+|---|---|
+| `sql/dwd_order_lifecycle.sql` | 表（`PRIMARY KEY(order_id)`，五个里程碑列 + 派生列）+ **期望视图** `dwd.v_order_lifecycle_expected` |
+| `sql/dwd_order_lifecycle_load.sql` | 装载（`INSERT` 即 UPSERT，占位符 `${FROM_DT}`）|
+| `scripts/dwd_order_lifecycle_load.sh` | 外壳 + **五道防线**（① 范围内无订单退出 ② 占位符替换校验 ③ 全表双向 EXCEPT 对账 ④ 不变式 ⑤ **事件表行数 = 去重对数**）|
+
+**两个实现细节和本文最初的设想不同（以代码为准）**：
+
+1. **装载用 `INSERT`，不是 `UPDATE`** —— 主键模型下 `INSERT` 就是 UPSERT：一条语句、天然幂等，且避开 PITFALLS §3.14（`UPDATE` 不接受表别名）。
+   > §10.7 里"核心操作是 `UPDATE ... WHERE order_id = ?`"是**从代价模型角度**说的（都要"按主键快速定位一行"），**写法上实际用 `INSERT`**。
+2. **里程碑列取自事件流的 `event_time`**（`MAX(CASE WHEN event_type='x' THEN event_time END)`），**不是**取自订单快照的 `order_time` 列。
+
+**增量语义**：`${FROM_DT}` = 业务日期 → 只重算"那天及之后有事件"的订单，其余行不动（用 `dt >=` 而非 `=`，所以补数能自愈）。
+
+**⚠️ 该链路的隐含前提（2026-10-07 踩到）**
+
+事件流必须满足 **"每个 `(order_id, event_type)` 在 `ods_order_event` 里只有一行"**。
+
+- 生成器有自检保证（"无重复 `(order_id,event_type)`"）
+- 但**摄入层曾经破坏它** —— 见 PITFALLS §3.17
+- **而三条值级/投影级防线都抓不到这种重复**，所以补了防线⑤（行级不变式）
+
+**当前进度**
+
+| 项 | 状态 |
+|---|---|
+| `ods_order_event` | 612 条（09-20 / 09-21 / 09-22 三天）—— ⚠️ 表内实际 991 行，09-20/09-21 各翻倍（摄入不幂等，见 PITFALLS §1.3）|
+| `dwd_order_lifecycle` | **300 行**（09-22 口径：`pay=192 order=48 ship=40 cancel=20`，与预测一致 ✅）|
+| 逐天回放 | **进行中** —— 09-23 ~ 09-27 待推 |
+| 摄入幂等 | ❌ **待改增量**（`ods_kafka_offset` 消费位点表，DDL 已建，见 PITFALLS §1.3）|
+
+**回放纪律**（生成器读 ODS 判断"该发什么"，且有状态）：
+
+> 只发"到期日 **==** `--date`"的事件，**跳过某天就永远不补发**。
+> 所以逐天回放必须**按顺序**，且每天 `dry-run` 到 `逾期未发 0 / 前置缺失 0`（退出码 0）才算正常。
+
+---
+
+## 十一、和 PITFALLS 的对应关系
+
+---
+
 ## 十一、和 PITFALLS 的对应关系
 
 本文讲"**为什么这么设计**"，踩过的具体坑在 `docs/PITFALLS.md`：
@@ -629,6 +675,10 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 | **CTE 只作用于紧随其后的那一条语句**（多语句不能用同一个 CTE）| §3.15 |
 | **`prev_date IS NULL` 在全量与增量里语义不同**（静默多版本，只有等价性验证能发现）| §3.16 |
 | **模板占位符没被替换 → `> NULL` → 静默 no-op**（做增量外壳脚本时踩到）| §7.2 |
+| **累积快照的前提：值级对账抓不到"重复行"**（三条防线全瞎）| §3.17 |
+| **Spark JDBC 的 `overwrite` 在 StarRocks 上不可用**（会先 DROP 表再建失败）| §4.3 |
+| **`wsl.exe` 默认 root，依赖/属主对不上** | §6.4 |
+| **`docker cp` 到 bind mount = 往项目目录写文件** | §6.5 |
 
 ---
 
@@ -637,6 +687,6 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 | 方向 | 说明 |
 |---|---|
 | ~~SCD2 改增量维护~~ | ✅ **已完成**（`scripts/dim_product_scd2_load.sh`，默认增量、`--full` 恢复全量；与全量重建的指纹已实测一致）|
-| **累积快照事实表** | **进行中**。已定：独立建 `dwd.dwd_order_lifecycle`，`PRIMARY KEY(order_id)`，**先不分区**，DWD 层。**见 §10.6 / §10.7**；数据源需先改造订单生成器产出**里程碑时间戳**（宽消息，跨天，含卡单）|
+| **累积快照事实表** | ✅ **表/装载/防线已完成**（见 §10.8）。**新增待办**：① 逐天回放完 09-23 ~ 09-27（目标：`ods_order_event` 800+ 条、`dwd_order_lifecycle` 800 行）② **摄入层改增量**（`ods_kafka_offset` 消费位点表 —— 现状是 `earliest` 全量重读 + append，不幂等，见 PITFALLS §1.3 / §3.17）③ 链路加入 DS（2 个节点：事件摄入 + 快照装载）|
 | **更多维度** | 用户维度、地区维度（现在只有商品维度）|
 | **一致性维度共享** | 若将来订单事实与商品事实要"按品类"对账，需引入真正的**共享维度**（现在只存 `product_id` 外键，见 §10.4）|
