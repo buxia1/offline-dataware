@@ -1516,6 +1516,88 @@ cd /home/l/offline-dw && git status --short      # 必须回到只剩自己的�
 
 ---
 
+### 6.6 推送 GitHub 失败：先分清"网络错"还是"凭证错"（2026-10-07 实测）
+
+**现象（同一晚四种报错轮流出现，很容易误判成仓库坏了）**
+
+```
+gnutls_handshake() failed: The TLS connection was non-properly terminated
+Error in the HTTP2 framing layer
+GnuTLS recv error (-110): The TLS connection was non-properly terminated
+Failed to connect to github.com port 443 after 134883 ms: Connection timed out
+```
+
+**这些都是网络/协议层错误，和仓库、权限、提交无关** —— 本地提交一个字节都不会丢。
+
+**⚠️ 本项目的网络环境（写在 `.wslconfig` 里的 mirrored 模式 + 代理）**
+
+```
+http_proxy / https_proxy = http://127.0.0.1:7892     ← 代理是间歇性的
+```
+
+实测代理 **第 1 次请求必秒断**（`unexpected eof`，0.1 秒），之后才正常 —— 所以"多试一次"常常就好了。
+
+**诊断方法：用 push 端点直接看**（这一步能一刀切开"网络错"和"凭证错"）
+
+```bash
+# push 端点（不要用首页！首页 200 不代表 push 能过）
+URL=https://github.com/<user>/<repo>.git/info/refs?service=git-receive-pack
+timeout 12 curl -sS -o /dev/null -w "%{http_code}|%{time_total}s\n" "$URL"
+```
+
+| 返回 | 含义 |
+|---|---|
+| **401** | ✅ **网络通、端点可达，只是没认证** —— 问题在凭证，不在网络 |
+| `SSL unexpected eof` / 000 | 代理这一跳断了 → 重试或绕开代理 |
+| 超时 | 网络确实不通 |
+
+同时对照测一次 **绕开代理**：
+
+```bash
+timeout 12 env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  curl -sS -o /dev/null -w "%{http_code}\n" "$URL"
+```
+
+**解法（按有效性排序，2026-10-07 实测）**
+
+| # | 做法 | 结果 |
+|---|---|---|
+| 1 | `git -c http.version=HTTP/1.1 push origin main` | ✅ **本次靠它成功**（HTTP/2 framing 错误的标准解法）|
+| 2 | 绕开代理：`env -u http_proxy -u https_proxy ... git push` | 视当时网络，本次直连一度也超时 |
+| 3 | 纯重试（代理间歇性）| 有时可行 |
+| 4 | 换 SSH：`ssh.github.com:443` | 彻底绕开 HTTP 代理与凭证 |
+
+**⚠️ 两个坑**
+
+1. **`git push --dry-run` 也需要认证** —— 公开仓库的 dry-run 一样会失败：
+   ```
+   fatal: could not read Username for 'https://github.com': terminal prompts disabled
+   ```
+   这是"禁用交互提示"的结果，**不是网络错**，别拿它当网络测试。
+2. **本机凭证助手是 Windows 的 GCM**（`git-credential-manager.exe`），**在 WSL 里可能弹不出窗口而挂住**。
+   挂住的解法：
+   ```bash
+   git config --global credential.helper store   # 换文件存储，输一次 PAT
+   ```
+   （PAT = GitHub Personal Access Token，勾 `repo` 权限；**不是账号密码**）
+
+**永久配置（可选）**
+
+```bash
+# 给 GitHub 单独禁用代理（若直连更稳）
+git config --global http.https://github.com/.proxy ""
+# 固定用 HTTP/1.1
+git config --global http.version HTTP/1.1
+```
+
+**通用规律**
+> **"push 失败"要先分清是网络层还是凭证层。**
+> 判据很简单：**用 `curl` 打 push 端点，401 就说明网络没问题，别再去折腾网络**。
+> 而 `gnutls_handshake` / `HTTP2 framing` / `recv error -110` 全是一个家族：**传输层被打断**，
+> 优先试 **HTTP/1.1** 和**换一条链路**（绕代理 / SSH）。
+
+---
+
 ## 七、shell 引号与模板占位符
 
 ### 7.1 双引号里套双引号会被 bash 吃掉
