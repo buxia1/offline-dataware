@@ -187,16 +187,30 @@ bash /opt/offline-dw/scripts/dwd_order_lifecycle_load.sh
 
 ---
 
-## 四、触发侧：外部 cron（必须配，否则链路不会自己长数据）
+## 四、触发侧：谁把事件发进 Kafka
 
-DS 只负责"Kafka → 数仓"。**事件本身要有人发**：
+DS 只负责"Kafka → 数仓"。**事件本身要有人发**，有三种来源：
+
+| 来源 | 场景 | 要不要配 cron |
+|---|---|---|
+| **手工跑生成器**（本项目当前选择）| 学习/演示阶段，数据按需手动加 | ❌ **不配** |
+| **外源数据集** | 将来换成真实数据（如 Olist），由外部系统或一次性导入脚本灌入 | ❌ 不配（生成器整个退役）|
+| 生成器 + cron | 想让它像真实业务一样每天自动长数据 | ✅ 配 |
+
+> **本项目有意不配 cron**：数据是**手动添加**的，将来直接换**外源数据集**，所以生成器是"临时替身"，不值得为它建定时。
+> 这与商品链路的定位一致 —— `gen_mock_products.py` 也是手工产出 CSV，调度只从 Stream Load 开始。
+
+**如果将来要配（供参考）**：
 
 ```cron
 # 每天 01:30 发"昨天"的事件（与 DS 的 system.biz.date = D-1 对齐）
 30 1 * * * cd /home/l/offline-dw && /usr/bin/python3 scripts/gen_mock_orders.py --date "$(date -d 'yesterday' +\%F)" >> /tmp/gen_event.log 2>&1
 ```
 
-### ⚠️ 日期对齐（这是最容易错的地方）
+**⚠️ 不配 cron 的后果（必须知道）**：DS 工作流会照常按 02:30 跑，但**没有新事件** → 摄入节点打印 `没有新消息，退出`（退出码 0，**不报错**）→ 工作流"成功"但什么都没做。
+**这是设计如此，不是故障。** 判据：看节点日志有没有 `本次从 Kafka 读到 N 行`（N > 0）。
+
+### ⚠️ 日期对齐（配了 cron 才需要关心）
 
 DS 的 `${system.biz.date}` = **调度日期 − 1 天**（PITFALLS §2 实测）。
 
@@ -210,8 +224,22 @@ DS 的 `${system.biz.date}` = **调度日期 − 1 天**（PITFALLS §2 实测�
 
 **验证方法**：看生成器输出里的 `日期 2026-09-XX` 这一行，和 DS 日志里的 `D=202609XX` 应该是**同一天**。
 
-> **`kafka-python` 只装在 `l` 用户下**（PITFALLS §6.4）。如果 cron 以 root 运行，会报 `ModuleNotFoundError: No module named 'kafka'`。
-> **解法**：cron 里用 `sudo -u l`，或确认 cron 用户是 `l`。
+> **`kafka-python` 只装在 `l` 用户下**（PITFALLS §6.4）。以 root 跑生成器会报 `ModuleNotFoundError: No module named 'kafka'`。
+> **解法**：用 `sudo -u l`，或确认执行用户是 `l`。
+
+### 手工加数据的标准动作（本项目日常）
+
+```bash
+# ① 发某天的事件（先 dry-run 确认"逾期/前置"都是 0）
+sudo -u l python3 scripts/gen_mock_orders.py --date 2026-09-29 --dry-run
+sudo -u l python3 scripts/gen_mock_orders.py --date 2026-09-29
+# ② 摄入（增量，只读新消息）
+bash scripts/ods_order_event_ingest.sh
+# ③ 装载累积快照（增量）
+bash scripts/dwd_order_lifecycle_load.sh
+```
+
+**或者直接点 DS 界面的「执行」** —— 摄入/装载都是增量的，手工触发与定时触发行为完全一致。
 
 ---
 
@@ -314,7 +342,7 @@ bash scripts/dwd_order_lifecycle_load.sh --full      # 快照也全量重推
 | 5 | 执行策略 = 串行丢弃 | 工作流定义 → 执行策略 |
 | 6 | 失败策略 = `STOP`（**不是 `CONTINUE`**）| 定时 → 失败策略 |
 | 7 | 告警组已选（和另外两个工作流同组）| 定时 → 告警 |
-| 8 | 外部 cron 已配（生成器）| `crontab -l` |
+| 8 | 外部 cron（**可选**）—— 本项目数据手动加，**不配** | `crontab -l`（空是正常的）|
 | 9 | DS 容器跨容器调 Spark 仍然可用 | `docker exec dolphinscheduler docker exec spark echo SPARK_OK` |
 | 10 | 手工跑一次，观察两节点全绿 | 工作流实例页 |
 

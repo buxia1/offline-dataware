@@ -667,17 +667,19 @@ docker compose restart dolphinscheduler
 8. **Spark 依赖缓存也在容器内**（`/tmp/.ivy2`），容器重建要重新下载 30MB。
 9. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
 10. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
-11. **订单快照 / 事件流两个生成器也不在调度里** —— 它们模拟"上游业务系统"。日常顺序：
+11. **订单快照 / 事件流两个生成器也不在调度里** —— 它们模拟"上游业务系统"。**本项目数据手动添加、将来直接换外源数据集，所以有意不配 cron**。日常顺序：
     ```
-    【手工/cron】gen_mock_orders_snapshot.py --date <业务日期>   → ods_order
-    【手工/cron】gen_mock_orders.py          --date <业务日期>   → ods_order_event
+    【手工】gen_mock_orders_snapshot.py --date <业务日期>   → ods_order
+    【手工】gen_mock_orders.py          --date <业务日期>   → ods_order_event
           ↓
     【DS 02:00】offline_dataware    : ods_spark → dwd_delete → dws_agg → ads_metric → dqc
+    【DS 02:30】order_event_chain   : ods_event_spark → dwd_lifecycle_load
     【DS 03:00】dim_product_chain   : wait_order_chain → … → dwd_sku_reload → dq_check
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
+    ⚠️ **不跑生成器时，DS 工作流仍会"成功"但什么都没做**（摄入节点打印 `没有新消息，退出`，退出码 0）—— 这是设计如此。判据：日志里有没有 `本次从 Kafka 读到 N 行`。
 12. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
-13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这个痛点会反复出现**，修法方向见「后续方向」。
+13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**（`history_partition_num=0`）。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这是动态分区的固有行为、属运维常规动作**；想省掉它可改表达式分区，见「后续方向 → 可选架构改进」。
 14. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
 
 ## 后续方向

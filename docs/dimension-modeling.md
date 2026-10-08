@@ -639,14 +639,16 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 - 但**摄入层曾经破坏它** —— 见 PITFALLS §3.17
 - **而三条值级/投影级防线都抓不到这种重复**，所以补了防线⑤（行级不变式）
 
-**当前进度**
+**当前进度（2026-10-07 收尾实测）**
 
 | 项 | 状态 |
 |---|---|
-| `ods_order_event` | 612 条（09-20 / 09-21 / 09-22 三天）—— ⚠️ 表内实际 991 行，09-20/09-21 各翻倍（摄入不幂等，见 PITFALLS §1.3）|
-| `dwd_order_lifecycle` | **300 行**（09-22 口径：`pay=192 order=48 ship=40 cancel=20`，与预测一致 ✅）|
-| 逐天回放 | **进行中** —— 09-23 ~ 09-27 待推 |
-| 摄入幂等 | ❌ **待改增量**（`ods_kafka_offset` 消费位点表，DDL 已建，见 PITFALLS §1.3）|
+| `ods.ods_order_event` | **2379 条**（09-20 ~ 09-28 共 9 天）—— 行数 == 去重对数 == 位点表之和 ✅ |
+| `dwd.dwd_order_lifecycle` | **900 行**（`pay=279 ship=250 finish=180 order=111 cancel=80`）|
+| 逐天回放 | ✅ **完成** —— 09-20 ~ 09-28，每天五道防线全 `0` + 独立复算通过 |
+| 摄入幂等 | ✅ **已改增量**（`ods.ods_kafka_offset` 位点表）—— 重跑 `读到 0 行`，行数不变 |
+| DS 调度 | ✅ 工作流三 `order_event_chain`（02:30）已上线，失败策略 `END`、告警 `FAILURE` |
+| 数据来源 | **生成器手工跑 / 将来换外源数据集** —— 有意不配 cron（见 `dolphinscheduler-order-event-chain.md` 第四节）|
 
 **回放纪律**（生成器读 ODS 判断"该发什么"，且有状态）：
 
@@ -687,6 +689,6 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 | 方向 | 说明 |
 |---|---|
 | ~~SCD2 改增量维护~~ | ✅ **已完成**（`scripts/dim_product_scd2_load.sh`，默认增量、`--full` 恢复全量；与全量重建的指纹已实测一致）|
-| **累积快照事实表** | ✅ **表/装载/防线已完成**（见 §10.8）。**新增待办**：① 逐天回放完 09-23 ~ 09-27（目标：`ods_order_event` 800+ 条、`dwd_order_lifecycle` 800 行）② **摄入层改增量**（`ods_kafka_offset` 消费位点表 —— 现状是 `earliest` 全量重读 + append，不幂等，见 PITFALLS §1.3 / §3.17）③ 链路加入 DS（2 个节点：事件摄入 + 快照装载）|
+| **累积快照事实表** | ✅ **全部完成**（见 §10.8）：表/视图/装载/五道防线 + 摄入改增量（位点表）+ 逐天回放 09-20 ~ 09-28（**900 行**）+ 接入 DS（工作流三 `order_event_chain`）|
 | **更多维度** | 用户维度、地区维度（现在只有商品维度）|
 | **一致性维度共享** | 若将来订单事实与商品事实要"按品类"对账，需引入真正的**共享维度**（现在只存 `product_id` 外键，见 §10.4）|
