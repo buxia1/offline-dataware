@@ -1574,12 +1574,38 @@ timeout 12 env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_
    fatal: could not read Username for 'https://github.com': terminal prompts disabled
    ```
    这是"禁用交互提示"的结果，**不是网络错**，别拿它当网络测试。
-2. **本机凭证助手是 Windows 的 GCM**（`git-credential-manager.exe`），**在 WSL 里可能弹不出窗口而挂住**。
-   挂住的解法：
-   ```bash
-   git config --global credential.helper store   # 换文件存储，输一次 PAT
+2. **本机凭证助手是 Windows 的 GCM**（`/mnt/d/develop/git/mingw64/bin/git-credential-manager.exe`）——
+   它是个 **Windows PE 程序**，必须靠 **WSL interop** 才能执行。
+
+   **2026-10-07 实测到的真实故障**：
    ```
-   （PAT = GitHub Personal Access Token，勾 `repo` 权限；**不是账号密码**）
+   git-credential-manager.exe: 1: MZ...: not found
+   git-credential-manager.exe: 1: Syntax error: Unterminated quoted string
+   fatal: could not read Username for 'https://github.com': terminal prompts disabled
+   ```
+   `MZ` 是 **PE 文件头的魔数** —— bash 在把 `.exe` **当脚本解释**，说明 interop 没生效。
+
+   **诊断（一条命令）**：
+   ```bash
+   # WSLInterop 不存在 / cmd.exe 跑不了 = interop 关闭
+   ls /proc/sys/fs/binfmt_misc/WSLInterop && cmd.exe /c "echo ok"
+   ```
+
+   **为什么"之前明明能推"**：凭证在 push 成功后会**缓存在内存一段时间**。
+   interop 失效或缓存过期之前，push 一直好使 —— **缓存一过期，故障才暴露**，
+   所以这个坑看起来像"突然坏的"。
+
+   **解法（三选一）**
+   ```bash
+   # A. 换文件凭证（不依赖 interop，最省事）
+   git config --global credential.helper store
+   git push origin main      # 输一次 PAT（GitHub Personal Access Token，勾 repo，不是账号密码）
+   # 之后存在 ~/.git-credentials，永久可用
+
+   # B. 恢复 interop（Windows 侧）：确认 /etc/wsl.conf 里没有 [interop] enabled=false，再 wsl --shutdown
+
+   # C. 换 SSH —— 彻底不依赖 HTTP 凭证（见上面「解法」表第 4 项）
+   ```
 
 **永久配置（可选）**
 
