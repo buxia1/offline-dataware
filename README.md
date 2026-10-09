@@ -45,7 +45,7 @@
 | | 订单链路 | 商品链路 |
 |---|---|---|
 | 数据形态 | **事件流**，一条一条持续产生 | **实体状态**，每天一份全量快照 |
-| 传输方式 | Kafka + Spark | CSV 文件 + Stream Load |
+| 传输方式 | Kafka + Routine Load | CSV 文件 + Stream Load |
 | 同步节奏 | 按天增量 | 按天全量快照 |
 
 真实业务里商品也是整表导出走 DataX，不走消息队列 —— **事件用流、实体用快照**是通用的分层原则。
@@ -53,7 +53,7 @@
 | 组件 | 版本 | 职责 | 端口 |
 |---|---|---|---|
 | Kafka | 3.8.1 | 消息队列，数据入口 | 9092 |
-| Spark | 3.5.1 | 从 Kafka 读数据、解析 JSON、写入 StarRocks | — |
+| Spark | 3.5.1 | ⚠️ **当前不承担摄入**（2026-10-09 起 ODS 改由 Routine Load 常驻消费）；后续「湖仓一体」阶段用于直读文件做清洗 | — |
 | StarRocks | 3.5.0 | 存储 + 计算 + 对外查询（allin1 单容器） | 9030 / 8030 / 8040 |
 | MySQL | 8.0 | DolphinScheduler 的元数据库 | 13306 |
 | DolphinScheduler | 3.2.0 | 工作流调度（standalone 模式） | 12345 |
@@ -785,6 +785,21 @@ docker compose restart dolphinscheduler
 15. ⭐ **常驻 Routine Load 的新运维负担** —— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
 16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`** —— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
 17. **不要用裸的 `docker cp` 往项目里放文件，也不要直接 `chown` 改属主** —— 见 PITFALLS §6.4。
+18. ⚠️ **StarRocks FE 的堆（8G）大于容器上限（3G）** —— `fe.conf` 里 `JAVA_OPTS` 写 `-Xmx8192m`，
+    但 `docker-compose.yml` 是 `mem_limit: 3g`。当前数据小（`ods_order_event` 数据文件 42.4 KB、
+    BE 常驻 RSS 462 MB）所以没事，**但放大数据量前必须修**，否则容易被 OOM kill。
+19. ⚠️ **`apache/spark:3.5.1` 里没有任何湖仓连接器** —— iceberg/paimon/hudi/hadoop-aws/aws-java-sdk
+    全都没有（252 个 jar 里只有 parquet*、Ivy 缓存 0 个）。要用 Iceberg 需自己挂 jar，
+    见「下一阶段：湖仓一体」。
+20. ⚠️ **Spark 容器以 uid 185 运行，而项目目录属主是 1000** —— 挂载虽是 `RW=true`，
+    容器内**仍然写不进去**（`touch` 直接 `Permission denied`）。要让它落文件必须先
+    `chown 185:185 <目录>` 或预建目录并放开权限。**这是"湖仓"落本地文件时的第一道坎。**
+21. ⚠️ **Docker 默认 `bridge` 网络没有 DNS** —— 容器之间用容器名互相解析会失败（`getent hosts` 空）。
+    表现极具迷惑性：S3A/HTTP 客户端会**无限重试**，看起来像"卡死"（实测挂了 15 分钟无任何输出）。
+    需用**用户自定义网络**，或直接写 IP。
+22. **MinIO 已改变分发方式（2026-10-09 实测）** —— `minio/minio` 已从 Docker Hub 下架，
+    `dl.min.io` 上的 server 与 `mc` 二进制均返回 **410 Gone**，`quay.io`/`bitnami`/各加速站全不可用。
+    免费路径只剩 `cgr.dev/chainguard/minio`。**故湖层第一阶段先用本地文件系统。**
 
 ## 后续方向
 
@@ -805,6 +820,9 @@ docker compose restart dolphinscheduler
       —— 两条常驻作业 `ods_order_event_load` / `ods_order_load`，Exactly-Once；
       退役了位点表 + 199 行 Python + 130 行外壳；新增 `check_routine_load.sh` + DS 工作流 `routine_load_health`。
       详见「幂等性 → ODS 摄入」一节。
+- [ ] ⭐ **下一阶段：湖仓一体（方案已定，待实施）** —— 见上方「下一阶段：湖仓一体」一节。
+      Iceberg + 本地文件系统（MinIO-ready）；先 1000 单/天跑通、再上 1 万单/天 × 90 天。
+      **这是上方那条被否决待办的"前提条件"**（原文：改数据落点后才该重新评估）
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
 
 **可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
@@ -904,6 +922,142 @@ DS 里不再有摄入节点会变红，所以必须补 `routine_load_health` 工
 > **注意措辞**：这一步 ≠「把清洗和 join 都搬进 StarRocks」。
 > DWD 层（`dwd_overwrite.sh` / `dwd_sku_load.sh` / `dwd_order_lifecycle_load.sh`）**本来就在 StarRocks 里**，
 > 不在 Spark 里。Routine Load 换掉的只是**摄入**这一跳，DWD 那三层逻辑一行都没改。
+
+---
+
+## 下一阶段：湖仓一体（方案已定，待实施）
+
+> **状态**：方案已与用户确认边界，**尚未实施**。本节的实测数据均为 2026-10-09 在
+> `D:\develop\workspace\deepseek_harness_temp` 用临时探针验证所得，**未改动本项目任何文件**。
+
+### 确认的四项边界
+
+| # | 决策 | 选择 |
+|---|---|---|
+| 1 | 湖表格式 | **Iceberg** |
+| 2 | 文件落点 | **先用本地文件系统**（`MinIO-ready` 设计，将来切对象存储只改 warehouse 路径）|
+| 3 | 数据量目标 | **先 1000 单/天 跑通，再上 1 万单/天 × 90 天**（≈270 万事件）|
+| 4 | 推进方式 | **代码由用户自己写**，agent 只出方案与验收判据 |
+
+### 目标架构
+
+```
+Kafka (ods_order_event / ods_order)
+   │
+   ├─► StarRocks Routine Load ──► StarRocks ODS（现状，保留不动）
+   │                                    │
+   │                                    ▼
+   │                            DWD/DWS/DIM/ADS（服务层，保留）
+   │
+   └─► 【新增】Spark ──► Iceberg on 本地文件系统（湖层）
+                              │
+                              ▼
+                   StarRocks External Catalog（查询湖层）
+```
+
+**要点**：StarRocks **不拆**，继续当服务层；湖仓是**叠加**不是替换。
+**业务内容不变**：不新增指标/维度/ADS 表，现有 4 条链路行为不变。
+
+**这正是上方「为什么不做把 DWD 清洗逻辑搬到 Spark SQL」里预留的那条路。**
+当时结论是：只要数据主存在 StarRocks 里，Spark 想算就得 JDBC 抽出来再写回去，
+82% 开销消不掉；**④ 已明确「改动数据落点后才该重新评估」** —— 本节就是那件事。
+
+### 实测关键结论（本次验证）
+
+**① StarRocks 侧零成本。** allin1 镜像的 BE **自带**湖格式 reader，且在 `be/lib/*-reader-lib`
+下（**`fe/lib` 是空的，别误判为"不支持"**）：
+
+| 格式 | 镜像内自带 | 建 external catalog 实测 |
+|---|---|---|
+| Iceberg | `iceberg-core-1.9.0.jar` 等 | ✅ `Type=Iceberg` |
+| Paimon | `paimon-bundle-1.0.1.jar` | ✅ `Type=Paimon` |
+| Hudi | `hudi-common-0.15.0.jar` | ✅ 语法通（报缺 `hive.metastore.uris`，非缺连接器）|
+
+`iceberg.catalog.type` 的 `hadoop/hive/rest/glue/jdbc/custom` **六种全被接受**。
+指向 `s3a://` 时**真的去连了 S3**（返回 `NoSuchBucket` 而非认证错误）——
+说明 endpoint / 密钥 / `s3a` 方案 / `path-style` 全被接受。
+
+**② Spark 侧是空白的。** `apache/spark:3.5.1` 里 iceberg/paimon/hudi/hadoop-aws/aws-java-sdk
+**一个都没有**（252 个 jar 里只有 parquet*，Ivy 缓存 0 个）。但 Maven Central 可达，
+`iceberg-spark-runtime-3.5_2.12-1.9.0.jar`（44 MB）实测 2.7 秒下完。
+
+**需要新增的产物只有 3 个 jar + 1 个湖目录**：
+
+| jar | 用途 |
+|---|---|
+| `iceberg-spark-runtime-3.5_2.12-1.9.0.jar` | Iceberg 表格式 |
+| `hadoop-aws-3.3.4.jar` | **仅当**落对象存储（S3/MinIO）才需要 |
+| `aws-java-sdk-bundle-1.12.262.jar` | 同上 |
+
+**不需要 Hive Metastore** —— 用 Iceberg `hadoop` catalog（文件系统做 catalog）。
+
+**③ 本地文件系统 + Iceberg 通路已端到端验证通过**（本次实测）：
+
+- Spark（uid 185）写出 `file:///lake/warehouse` 下的 Iceberg 表：
+  `metadata/*.metadata.json` + `metadata/*.avro` + `data/dt=*/**.parquet`（14 个文件，`ICEBERG_ROWS=3`）
+- **StarRocks 容器读到了同一份文件**，`v1/v2.metadata.json` 内容完整（`format-version: 2`）
+- 换成 MinIO **只需改 warehouse 路径 + 加 2 个 S3 jar**，Iceberg 代码一行不改
+
+### ⚠️ 必须提前知道的坑（本次实测踩到）
+
+| # | 坑 | 现象 | 解法 |
+|---|---|---|---|
+| 1 | **Spark 容器 uid 185 ≠ 项目目录属主 1000** | 挂载是 `RW=true` 却 `Permission denied`，Iceberg 报 `Mkdirs failed to create` | 预建湖目录并放开权限（需 `docker exec -u 0`；普通 `docker exec` 也是 uid 185，**改不动**）|
+| 2 | **StarRocks FE 堆 8G vs 容器上限 3G** | `fe.conf` 写 `-Xmx8192m`，`mem_limit: 3g` | 现在数据小（`ods_order_event` 42.4 KB）撑着，**放量前必须修** |
+| 3 | **MinIO 已改变分发方式** | `minio/minio` 从 Docker Hub 下架；`dl.min.io` 的 server/mc 二进制均 **410 Gone**；`quay.io`/`bitnami` 全不可用 | 免费路径只剩 `cgr.dev/chainguard/minio`（实测可拉取）。**故本阶段先用本地文件系统** |
+| 4 | Chainguard MinIO 数据目录属主必须是 **uid 65532** | 否则后台扫描报 `Prefix access is denied: .minio.sys/buckets/.bloomcycle.bin`，表现为**桶建了却读不到** | `chown 65532:65532` |
+| 5 | Chainguard MinIO 的 `GetObject` 返回 `AccessDenied` | `CreateBucket`/`ListBuckets`/`PutObject` 都成功、对象确实落盘（`xl.meta`），**但读不回来** | **未解决**，这也是暂缓对象存储的原因 |
+| 6 | Docker 默认 `bridge` 网络**没有 DNS** | 容器间用容器名互相解析失败，S3A 会**无限重试**（实测挂死 15 分钟无输出） | 用**用户自定义网络**，或直接用 IP |
+| 7 | 磁盘上看到的不是普通文件 | MinIO 把对象存成目录 + `xl.meta` | 别用 `cat` 判断对象是否存在 |
+
+### 分阶段计划与验收判据
+
+> 原则：**每步可回滚、可对账、不推翻既有决定**。
+
+**第 0 步 — 修地基（放量前必须做）**
+
+| 动作 | 验收判据 |
+|---|---|
+| 修 FE 堆与容器上限矛盾 | 重启后 `SHOW BACKENDS` 正常，无 OOM 记录 |
+| 评估是否上调 WSL 上限（现 8 GB，宿主 16 GB）| `free -m` 可用内存 > 目标峰值（当前只剩 **2.9 GiB 可用**）|
+| 挂载 Kafka 数据（现在放容器 `/tmp`）| 容器重建后 offset 仍连续 |
+| 建湖目录并给正确权限 | 容器内 uid 185 可写（见上方坑 1）|
+
+**第 1 步 — 湖层只读旁路（不动生产链路）**
+
+用生成器**重放历史 8 天**灌湖，与现有 ODS/DWD 对账。
+
+| 验收判据 | 期望 |
+|---|---|
+| Iceberg 表可被 StarRocks 发现 | `SHOW DATABASES FROM <iceberg_catalog>` 有库 |
+| 行数对账 | 湖层 `count(*)` == StarRocks 对应表行数 |
+| 逐行对账 | 用 `dwd_equiv.sh`（逐行全列 diff + 逐列指纹）|
+| 现有链路不受影响 | 本 README「运维命令」里各项检查全部仍然通过 |
+
+**第 2 步 — DWD 计算下沉到 Spark**
+
+| 验收判据 | 期望 |
+|---|---|
+| 三张 DWD 表逐行等价 | 763 / 763 / 900，且逐列指纹一致 |
+| 服务层查询不变 | 现有 SQL 结果不变（可用 external catalog 视图过渡）|
+| 性能对比 | 记录「文件直读」相对「JDBC 搬运」的实测耗时差 |
+
+**第 3 步 — 放量（先 1000 单/天，再 1 万单/天 × 90 天）**
+
+| 验收判据 | 期望 |
+|---|---|
+| 生成器可放量且**仍可重放** | 同一天重跑逐字节相同 |
+| 逐天连续推进不漏天 | 生成器自带的 `overdue` / `missing_prev` 两种漏发检查均为 0 |
+| 分区不再浪费 | 现状 `dwd_order_detail` **28 个分区里 20 个是空的**，放量前重定分区与桶数 |
+| 峰值资源不越限 | 尤其 StarRocks 3 GB |
+
+### 待决问题
+
+| # | 问题 | 建议 |
+|---|---|---|
+| 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
+| 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
+| 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ---
 
