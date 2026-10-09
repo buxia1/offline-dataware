@@ -820,9 +820,9 @@ docker compose restart dolphinscheduler
       —— 两条常驻作业 `ods_order_event_load` / `ods_order_load`，Exactly-Once；
       退役了位点表 + 199 行 Python + 130 行外壳；新增 `check_routine_load.sh` + DS 工作流 `routine_load_health`。
       详见「幂等性 → ODS 摄入」一节。
-- [ ] ⭐ **下一阶段：湖仓一体（方案已定，待实施）** —— 见上方「下一阶段：湖仓一体」一节。
-      Iceberg + 本地文件系统（MinIO-ready）；先 1000 单/天跑通、再上 1 万单/天 × 90 天。
-      **这是上方那条被否决待办的"前提条件"**（原文：改数据落点后才该重新评估）
+- [ ] ⭐ **下一阶段：湖仓一体** —— 见下方「下一阶段：湖仓一体」一节（含**分阶段推进清单**：第 0 步修地基 / 第 1 步湖层只读旁路 / 第 2 步 DWD 下沉 Spark / 第 3 步放量）
+      —— 边界已定：**Iceberg + 本地文件系统（MinIO-ready）**；先 1000 单/天跑通、再上 1 万单/天 × 90 天
+      —— **这一条正是上方那条被否决待办的"前提条件"**（原文：改数据落点后才该重新评估）
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
 
 **可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
@@ -1010,46 +1010,58 @@ Kafka (ods_order_event / ods_order)
 | 6 | Docker 默认 `bridge` 网络**没有 DNS** | 容器间用容器名互相解析失败，S3A 会**无限重试**（实测挂死 15 分钟无输出） | 用**用户自定义网络**，或直接用 IP |
 | 7 | 磁盘上看到的不是普通文件 | MinIO 把对象存成目录 + `xl.meta` | 别用 `cat` 判断对象是否存在 |
 
-### 分阶段计划与验收判据
+### 分阶段推进清单
 
-> 原则：**每步可回滚、可对账、不推翻既有决定**。
+> 勾选即代表**验收判据全部满足**。原则：**每步可回滚、可对账、不推翻既有决定**。
+> ⚠️ 湖目录与权限见「必须提前知道的坑」第 1 条 —— 这是第一步就会撞上的坎。
 
-**第 0 步 — 修地基（放量前必须做）**
+**第 0 步 · 修地基**（放量前必须做）
 
-| 动作 | 验收判据 |
-|---|---|
-| 修 FE 堆与容器上限矛盾 | 重启后 `SHOW BACKENDS` 正常，无 OOM 记录 |
-| 评估是否上调 WSL 上限（现 8 GB，宿主 16 GB）| `free -m` 可用内存 > 目标峰值（当前只剩 **2.9 GiB 可用**）|
-| 挂载 Kafka 数据（现在放容器 `/tmp`）| 容器重建后 offset 仍连续 |
-| 建湖目录并给正确权限 | 容器内 uid 185 可写（见上方坑 1）|
+- [ ] **修 `fe.conf` 堆与容器上限的矛盾** —— `-Xmx8192m` vs `mem_limit: 3g`（否则放量后被 OOM kill）
+      —— 判据：重启 StarRocks 后 `SHOW BACKENDS` 正常、无 OOM 记录、`SHOW ROUTINE LOAD` 仍为 `RUNNING`
+- [ ] **建湖目录并配好权限** —— Spark 以 uid 185 运行、项目目录属主是 1000，挂载 `RW=true` 也写不进
+      —— 判据：容器内 `touch <湖目录>/.probe` 成功；StarRocks 容器能读到同一路径
+- [ ] **评估 WSL 内存上限**（现 8 GB，可用只剩 2.9 GiB；宿主物理 16 GB）
+      —— 判据：`free -m` 可用内存 > 目标峰值（留出 Spark driver + 湖层文件缓存）
+- [ ] **挂载 Kafka 数据**（现放容器 `/tmp`，容器重建即丢，`retention=168h`）
+      —— 判据：重建 Kafka 容器后 3 个分区 offset 仍连续
 
-**第 1 步 — 湖层只读旁路（不动生产链路）**
+**第 1 步 · 湖层只读旁路**（不动生产链路）
 
-用生成器**重放历史 8 天**灌湖，与现有 ODS/DWD 对账。
+- [ ] **挂 Iceberg runtime jar** —— `iceberg-spark-runtime-3.5_2.12-1.9.0.jar`（44 MB；本地文件系统**不需要** S3 那两个 jar）
+      —— 判据：`spark.sql("SHOW NAMESPACES IN lake")` 不报 `ClassNotFoundException`
+- [ ] **重放历史 8 天灌湖** —— 用生成器（09-20 ~ 09-27），**只旁路、不碰现有链路**
+      —— 判据：Iceberg 落出 `metadata/*.metadata.json` + `data/dt=*/**.parquet`
+- [ ] **让 StarRocks 发现湖层表** —— 建 external catalog（`iceberg.catalog.type=hadoop`，**无需 Hive Metastore**）
+      —— 判据：`SHOW DATABASES FROM <catalog>` 有库；`SELECT count(*)` 能跑通
+- [ ] **行数与逐行对账** —— 湖层结果 == StarRocks 对应表
+      —— 判据：行数一致；`dwd_equiv.sh` 逐行全列 diff + 逐列指纹一致
+- [ ] **确认现有链路零影响**
+      —— 判据：「运维命令」里各项检查全部仍然通过（800/2379/763/763/900/601/8 + 两条 DQC `EXIT=0`）
 
-| 验收判据 | 期望 |
-|---|---|
-| Iceberg 表可被 StarRocks 发现 | `SHOW DATABASES FROM <iceberg_catalog>` 有库 |
-| 行数对账 | 湖层 `count(*)` == StarRocks 对应表行数 |
-| 逐行对账 | 用 `dwd_equiv.sh`（逐行全列 diff + 逐列指纹）|
-| 现有链路不受影响 | 本 README「运维命令」里各项检查全部仍然通过 |
+**第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运）
 
-**第 2 步 — DWD 计算下沉到 Spark**
+- [ ] **订单明细清洗改写为 Spark SQL** —— 读湖层文件，不读 JDBC
+      —— 判据：与 `dwd_order_detail` 逐行等价（763 行）+ 逐列指纹一致
+- [ ] **SCD2 时点关联改写为 Spark SQL**
+      —— 判据：与 `dwd_order_sku_detail` 逐行等价（763 行）+ 逐列指纹一致
+- [ ] **累积快照推导改写为 Spark SQL**
+      —— 判据：与 `dwd_order_lifecycle` 逐行等价（900 行）+ 阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`
+- [ ] **服务层查询不受影响** —— 必要时用 external catalog 视图过渡
+      —— 判据：现有报表 SQL 结果不变
+- [ ] **记录性能对比** —— 「文件直读」vs「JDBC 搬运」实测耗时
+      —— 判据：给出两个引擎在同一数据量下的耗时表（这是"湖仓是否值得"的最终证据）
 
-| 验收判据 | 期望 |
-|---|---|
-| 三张 DWD 表逐行等价 | 763 / 763 / 900，且逐列指纹一致 |
-| 服务层查询不变 | 现有 SQL 结果不变（可用 external catalog 视图过渡）|
-| 性能对比 | 记录「文件直读」相对「JDBC 搬运」的实测耗时差 |
+**第 3 步 · 放量**（先 1000 单/天跑通，再上 1 万单/天 × 90 天）
 
-**第 3 步 — 放量（先 1000 单/天，再 1 万单/天 × 90 天）**
-
-| 验收判据 | 期望 |
-|---|---|
-| 生成器可放量且**仍可重放** | 同一天重跑逐字节相同 |
-| 逐天连续推进不漏天 | 生成器自带的 `overdue` / `missing_prev` 两种漏发检查均为 0 |
-| 分区不再浪费 | 现状 `dwd_order_detail` **28 个分区里 20 个是空的**，放量前重定分区与桶数 |
-| 峰值资源不越限 | 尤其 StarRocks 3 GB |
+- [ ] **放量到 1000 单/天** —— 改 `NEW_ORDERS_PER_DAY` 与号段
+      —— 判据：链路跑通、对账通过、**仍可重放**（同一天重跑逐字节相同）
+- [ ] **逐天连续推进不漏天** —— 生成器只发"到期日 == `--date`"的事件，跳过某天就永远不补发
+      —— 判据：自带的 `overdue` / `missing_prev` 两种漏发检查均为 0
+- [ ] **重定分区与桶数** —— 现状 `dwd_order_detail` **28 个分区里 20 个是空的**，放量后更浪费
+      —— 判据：无空分区堆积；补数不再需要手工 `ADD PARTITION`
+- [ ] **放量到 1 万单/天 × 90 天**（≈270 万事件）
+      —— 判据：峰值内存不越容器上限（尤其 StarRocks 3 GB）；作业不 OOM
 
 ### 待决问题
 
