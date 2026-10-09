@@ -16,13 +16,14 @@
                                         │
                                         ▼
   订单链路（DS 工作流 offline_dataware）
-  Python 脚本  ──►  Kafka  ──►  Spark  ──►  StarRocks
-  模拟订单        消息队列      批处理       ODS → DWD → DWS → ADS
+  Python 脚本  ──►  Kafka  ──►  StarRocks Routine Load  ──►  StarRocks
+  模拟订单        消息队列      ⭐ StarRocks 原生消费       ODS → DWD → DWS → ADS
+                              （2026-10-09 起替代 Spark 摄入）
 
   订单事件 / 累积快照链路（DUPLICATE 事件流 → 累积快照事实表）
-  Python 脚本  ──►  Kafka  ──►  Spark  ──►  StarRocks
-  模拟事件流       ods_order_event  增量摄入   ODS → DWD(累积快照 dwd_order_lifecycle)
-  ⚠️ 与上面一条独立：不同 topic、不同表、不同 Spark 脚本
+  Python 脚本  ──►  Kafka  ──►  StarRocks Routine Load  ──►  StarRocks
+  模拟事件流       ods_order_event  ⭐ 原生消费（Exactly-Once）  ODS → DWD(累积快照 dwd_order_lifecycle)
+  ⚠️ 与上面一条独立：不同 topic、不同表、不同 Routine Load 作业
 
   商品 / 维度链路（DS 工作流 dim_product_chain）
   Python 脚本  ──►  CSV  ──►  Stream Load  ──►  StarRocks
@@ -71,6 +72,7 @@ offline-dw/
 │   └── dolphinscheduler-workflow.md  DS 工作流的节点配置
 ├── sql/                            各层建表与转换 SQL
 │   ├── ods_order.sql
+│   ├── ods_routine_load.sql                ⭐ 两条 Routine Load 作业（ODS 摄入，2026-10-09）
 │   ├── dwd_order_detail.sql
 │   ├── dwd_add_history_partitions.sql
 │   ├── dws_user_order_day.sql
@@ -92,9 +94,7 @@ offline-dw/
 ├── scripts/
 │   ├── gen_mock_orders_snapshot.py  模拟订单**快照**生成器（--date，可重放，号段 +500）
 │   ├── gen_mock_orders.py           模拟订单**事件流**生成器（--date，可重放，号段 +0）
-│   ├── ods_order_to_starrocks.py    Spark 作业：Kafka ods_order     → ODS
-│   ├── ods_order_event_to_starrocks.py  Spark 作业：Kafka ods_order_event → ODS（增量，维护位点）
-│   ├── ods_order_event_ingest.sh    事件流摄入外壳（防线 + 位点表替换）
+│   ├── check_routine_load.sh        ⭐ Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
 │   ├── dwd_overwrite.sh             DWD 按天覆盖（Shell，给 DS 用）
 │   ├── dwd_order_lifecycle_load.sh  累积快照装载外壳（五道防线，默认增量、--full 全量重建）
 │   ├── dqc_order_chain.sh           订单链路 DQC（可选业务日期参数）
@@ -208,6 +208,34 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --partitions 3 --replication-factor 1
 ```
 
+首次建立 ODS 摄入 —— **两条 Routine Load 作业**（2026-10-09 起，不再用 Spark 摄入）：
+
+```sql
+-- 见 sql/ods_routine_load.sql（含完整注释与运维命令）
+CREATE ROUTINE LOAD ods.ods_order_load ON ods_order
+COLUMNS(order_id, user_id, product_id, amount, order_time, status,
+        dt = to_date(order_time))
+PROPERTIES("format"="json",
+           "jsonpaths"="[\"$.order_id\",\"$.user_id\",\"$.product_id\",\"$.amount\",\"$.order_time\",\"$.status\"]",
+           "max_filter_ratio"="0")
+FROM KAFKA("kafka_broker_list"="kafka:29092",
+           "kafka_topic"="ods_order",
+           "kafka_partitions"="0,1,2",
+           "kafka_offsets"="OFFSET_BEGINNING");   -- ⚠️ 仅【首次空表初始化】才可以这么写
+```
+
+> ⚠️ 上面用 `OFFSET_BEGINNING` 是因为**首次初始化时表是空的**。
+> 一旦表里已有数据，**必须换成精确位点**，否则 DUPLICATE KEY 表会重灌（见「幂等性 → ODS 摄入」）。
+
+建完确认状态：
+
+```bash
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G"
+```
+
+<details>
+<summary>历史做法（已废弃，保留供追溯）</summary>
+
 首次跑 Spark 作业（要下载约 30MB 依赖）：
 
 ```bash
@@ -217,6 +245,9 @@ docker compose exec spark /opt/spark/bin/spark-submit \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.mysql:mysql-connector-j:8.4.0 \
   /opt/offline-dw/scripts/ods_order_to_starrocks.py
 ```
+
+</details>
+
 
 **国内网络建议加镜像**：
 
@@ -430,8 +461,11 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 python3 scripts/gen_mock_orders.py --date 2026-09-21 --dry-run
 python3 scripts/gen_mock_orders.py --date 2026-09-21
 
-# ② 摄入到 ODS
-bash scripts/ods_order_event_ingest.sh
+# ② 摄入到 ODS —— 不需要手工跑！
+#    Routine Load 是【常驻】作业，消息进 Kafka 后会自动落 ODS。
+#    确认摄入是否生效：
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G"
+bash scripts/check_routine_load.sh;  echo "EXIT=$?"
 
 # ③ 装载累积快照（默认增量；--full 是全量重建的恢复手段）
 bash scripts/dwd_order_lifecycle_load.sh
@@ -455,17 +489,17 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 ## 调度
 
-**两个工作流，商品链路依赖订单链路**：
+**四个工作流**（2026-10-09 现状，以数据库为准）：
 
 ```
-┌─ offline_dataware（订单链路，每天 02:00，exec_type=1 串行等待）───────┐
-│  ods_spark → dwd_delete → dws_agg → ads_metric → dqc_order_chain    │
-│    Shell       Shell        SQL        SQL           Shell           │
-│  ⚠️ dwd_delete 名字骗人，真身是 INSERT OVERWRITE ... PARTITION       │
-│  ⚠️ truncate_ods 节点已删除（ODS 改主键模型后不再需要先清空）        │
-└──────────────────────────────────────────────────────────────────────┘
-                              │ 今天成功
-                              ▼
+┌─ offline_dataware（订单快照链路，每天 02:00，exec_type=1 串行等待）────┐
+│  dwd_delete → dws_agg → ads_metric → dqc_order_chain                 │
+│    Shell        SQL        SQL          Shell                         │
+│  ⚠️ dwd_delete 名字骗人，真身是 INSERT OVERWRITE ... PARTITION        │
+│  ⚠️ ods_spark 节点已删除（2026-10-09 ODS 改 Routine Load 后不再需要） │
+└───────────────────────────────────────────────────────────────────────┘
+                               │ 今天成功
+                               ▼
 ┌─ dim_product_chain（商品链路，每天 03:00，exec_type=2 串行丢弃）──────┐
 │  wait_order_chain → truncate_and_load_ods → dim_product_load →       │
 │     DEPENDENT            Shell                   Shell                │
@@ -473,12 +507,23 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 │                 Shell                 Shell          Shell            │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─ （待建）订单事件 / 累积快照链路 ────────────────────────────────────┐
-│  ods_event_spark → dwd_lifecycle_load                                │
-│     Shell(Spark)      Shell(dwd_order_lifecycle_load.sh)             │
-│  建议 02:30（订单链路之后）；触发侧生成器仍在调度外                   │
+┌─ order_event_chain（订单事件 / 累积快照链路，每天 02:30，END 失败策略）┐
+│  dwd_lifecycle_load                                                  │
+│     Shell(dwd_order_lifecycle_load.sh)                               │
+│  ⚠️ ods_event_spark 节点已删除（2026-10-09 同上）                    │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ routine_load_health（摄入健康检查，每 30 分钟，END 失败策略）────────┐
+│  check_routine_load                                                  │
+│     Shell(check_routine_load.sh)                                     │
+│  ⚠️ 为什么必须有：摄入改成常驻作业后，DS 里【再没有节点会变红】      │
+│     作业挂了数据就静静不进来 → 用这个把"常驻作业死了"翻译成告警       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+> **ODS 摄入已不在 DS 的 DAG 里** —— 它由两条常驻 Routine Load 作业承担
+> （`ods.ods_order_event_load` / `ods.ods_order_load`），见「幂等性」。
+
 
 ### 商品链路为什么「定时」和「依赖」两个都要
 
@@ -489,7 +534,7 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 依赖节点配置：类型「工作流」→ `offline_dataware` → 任务「**ALL**」→ 周期「今天」→ 失败策略「**等待**」。
 
-### 两个工作流都必须用「串行丢弃」
+### 工作流都必须用「串行丢弃」
 
 `offline_dataware` 和 `dim_product_chain` 的执行策略都是 **`SERIAL_DISCARD`（串行丢弃）**，不是默认的「并行」。
 
@@ -536,8 +581,9 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 | 层 | 靠什么保证 |
 |---|---|
-| ODS（订单） | **`PRIMARY KEY(order_id)` 表模型** —— 重复消息自动折叠（原来的 `truncate_ods` 节点已因此删除）|
-| ODS（事件）⚠️ | **消费位点表 `ods_kafka_offset` + 只读新消息（增量）** —— **不要用"清表 + 全量重灌"**，Kafka 有 retention，消息过期后清表 = 清库（见「已知限制」）|
+| **ODS 摄入（两条链路）** | ⭐ **StarRocks Routine Load 原生 Exactly-Once** —— 位点由引擎维护、且与数据在同一事务里提交。作业配置见 `sql/ods_routine_load.sql` |
+| ODS（订单） | **`PRIMARY KEY(order_id)` 表模型** —— 即使重复消费也自动折叠 |
+| ODS（事件）⚠️ | **`DUPLICATE KEY` 表模型 —— 重复【不会折叠】**，所以幂等**必须**靠摄入层（现已由 Routine Load 保证） |
 | ODS（商品） | 工作流开头 `TRUNCATE ods_product`，再全量重灌所有快照；Stream Load 标签**每次运行唯一** |
 | DWD（订单） | `INSERT OVERWRITE ... PARTITION (p<日期>)`，原子覆盖当天分区 |
 | DWD（累积快照） | `PRIMARY KEY(order_id)` + **`INSERT` 即 UPSERT**（只回填"那天及之后有事件"的订单）|
@@ -548,10 +594,53 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 **验证方法**：连续执行两次工作流，对比三层的行数和金额，必须完全一致。
 
-> **⚠️ 事件流的幂等是"不能靠表模型"的**：`ods_order_event` 是 `DUPLICATE KEY`（重复原样保留），
-> 所以幂等必须在**摄入层**保证（位点表）。而 `MAX(CASE WHEN event_type='x' ...)` 这类聚合
-> 会**把重复折叠成同一个值 → 值级对账看不见重复**。装载脚本因此专门加了
-> 「事件表行数 = `(order_id,event_type)` 去重对数」这道**行级**防线（见 PITFALLS §3.17）。
+> **⚠️ 事件流的幂等"不能靠表模型"**：`ods_order_event` 是 `DUPLICATE KEY`（重复原样保留）。
+> 而 `MAX(CASE WHEN event_type='x' ...)` 这类聚合会**把重复折叠成同一个值 → 值级对账看不见重复**。
+> 装载脚本因此专门加了「事件表行数 = `(order_id,event_type)` 去重对数」这道**行级**防线
+> （见 PITFALLS §3.17），健康检查脚本也带同一条检查。
+
+### ⭐ ODS 摄入：从「Spark 批 + 手工位点表」改为「Routine Load」（2026-10-09）
+
+**改前**：Spark 批作业消费 Kafka → 写 ODS；因为要用批工具做流式的活，
+不得不自己维护一张**位点表 `ods.ods_kafka_offset`**（记 `next_offset`）、
+一个 199 行的 Python 摄入脚本、一个 130 行的 Shell 外壳（含 4 道防线）。
+
+**为什么换**（都有实测依据）：
+
+| 原因 | 依据 |
+|---|---|
+| 省掉固定开销 | 旧路径**空跑也要 13.7 秒**（读到 0 行照样花 —— 全是 JVM + Ivy + JDBC 开销）|
+| 删掉三样组件 | 位点表 + Python 脚本 + Shell 外壳（含 4 道防线）全部退役 |
+| **消掉重复实现的正确性风险** | 手工位点表 = 重新实现 StarRocks 自带的 Exactly-Once；10-05 静默清库事故就是这套手工逻辑的漏洞 |
+
+**改后**：两条常驻作业（`sql/ods_routine_load.sql`）
+
+| 作业 | topic | 目标表 |
+|---|---|---|
+| `ods.ods_order_event_load` | `ods_order_event` | `ods_order_event` |
+| `ods.ods_order_load` | `ods_order` | `ods_order` |
+
+**⚠️ 三个必须记住的写法**（实测/官方文档核实，写错会静默出错）：
+
+| 点 | 说明 |
+|---|---|
+| `kafka_offsets` 是**逗号分隔**，且与 `kafka_partitions` **按顺序一一对应** | 建作业时用它精确续接，不重灌 |
+| **绝不能写 `OFFSET_BEGINNING`** | 事件表是 `DUPLICATE KEY`，重灌会把 2379 行变成 **4758** 行（不折叠！）|
+| `max_filter_ratio` 默认 `1`（=不生效），**必须显式设 `0`** | 否则坏数据被**静默过滤**；设 0 则一条坏数据就把作业暂停 |
+
+**⚠️ 常驻作业的新风险：挂了没人知道。**
+所以必须有 `scripts/check_routine_load.sh` + DS 工作流 `routine_load_health` 每 30 分钟检查一次，
+异常 `exit 1` 交给告警组。这是「常驻作业」相对「每天跑一次的节点」**唯一新增的运维负担**。
+
+**验证判据**（改造后已全部通过）：
+
+| 项 | 期望 |
+|---|---|
+| 两条作业 `State` | `RUNNING`；`ErrorLogUrls` 空 |
+| `ods_order` / `ods_order_event` / `dwd_order_lifecycle` | **800 / 2379 / 900**（与改造前一致）|
+| 事件表不变式 | 行数 == `(order_id,event_type)` 去重对数 |
+| 两条 DQC | `EXIT=0` |
+
 
 ### 更严格：用指纹验证
 
@@ -588,7 +677,6 @@ SELECT dt, count(*) AS cnt FROM dwd.dwd_order_detail GROUP BY dt ORDER BY dt;"
 # 分区列表
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B -e "
 SHOW PARTITIONS FROM dwd.dwd_order_detail;" | cut -f2 | sort
-
 # SCD2 不变式：ratio 必须 = 1.00
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT count(*) AS rows_, sum(is_current) AS cur,
@@ -614,8 +702,18 @@ docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT dt, count(*) AS rows_, count(DISTINCT concat(order_id,'-',event_type)) AS pairs
 FROM ods.ods_order_event GROUP BY dt ORDER BY dt;"
 
-# 事件流摄入（增量：只读位点之后的新消息；--reset 才是清表重灌）
-bash scripts/ods_order_event_ingest.sh
+# ⭐ Routine Load 状态（ODS 摄入，2026-10-09 起）
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G"
+# 关注：State=RUNNING / Progress / ErrorLogUrls 空
+
+# ⭐ 摄入健康检查（异常 exit 1；--list 只列状态）
+bash scripts/check_routine_load.sh;  echo "EXIT=$?"
+
+# ⭐ Routine Load 运维
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+PAUSE  ROUTINE LOAD FOR ods.ods_order_event_load;"
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
+RESUME ROUTINE LOAD FOR ods.ods_order_event_load;"
 
 # 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_dim_product_selftest.sql
@@ -623,7 +721,7 @@ docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_dim_product_s
 # 【指纹】跑工作流前后各执行一次，输出必须一字不差
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
 
-# 两个工作流的真实状态（权威来源，导出 JSON 不可信，见「重要提醒」）
+# 工作流的真实状态（权威来源，导出 JSON 不可信，见「重要提醒」）
 docker compose exec -T mysql mysql -uroot -proot123 dolphinscheduler -e "
 SELECT p.name, p.version, p.release_state AS def_online,
        p.execution_type AS exec_type, s.crontab, s.release_state AS sched_online
@@ -657,9 +755,10 @@ docker compose restart dolphinscheduler
 
 ## 已知限制
 
-1. **ODS（订单）每次从 Kafka 全量重读**（`startingOffsets=earliest`），靠主键模型折叠重复所以**结果正确**，但数据量大了会变慢。**这是性能债，不是正确性债。**
-2. **ODS（事件）曾经不幂等** —— 全量重读 + `append` 写 `DUPLICATE KEY` 表 → 每次重跑翻倍，且**值级对账看不出来**。**修法：位点表增量**（待实施，见「幂等性」）。
-3. **⚠️ "先 TRUNCATE 再从 Kafka 全量重灌"不是长期方案** —— Kafka `log.retention.hours=168`（7 天），消息过期后清表就等于**清库**；而且 topic 被**部分**裁剪时，"topic 非空"的检查拦不住，会灌进残缺数据。它只能当**回补手段**，且必须配"进度不得超过 Kafka 现存最早 offset"的防线。
+1. ~~**ODS（订单）每次从 Kafka 全量重读**~~ —— ⭐ **已修（2026-10-09）**：改用 Routine Load，位点由引擎维护。
+   历史痕迹：改前 topic `ods_order` 有 **1800 条消息**、表里只有 **800 行**，说明重复读过 2.25 倍，靠 `PRIMARY KEY` 折叠兜住。
+2. ~~**ODS（事件）曾经不幂等**~~ —— ⭐ **已修**：原用位点表 `ods_kafka_offset` 增量，现已改为 Routine Load 的 Exactly-Once。
+3. **⚠️ "先 TRUNCATE 再从 Kafka 全量重灌"不是长期方案** —— Kafka `log.retention.hours=168`（7 天），消息过期后清表就等于**清库**；而且 topic 被**部分**裁剪时，"topic 非空"的检查拦不住，会灌进残缺数据。Routine Load 按位点续接，**不再重读历史，retention 就无关了**。
 4. **装载脚本的防线有"口径"** —— 局部范围的检查**证明不了全表**。事件表重复那次，三条防线（值级 `EXCEPT`、快照表行数、`DISTINCT order_id`）全部报绿，是因为它们都没问过"这张表自己的原始行数对不对"。见 PITFALLS §3.17。
 5. **DWD 去重只在单天内生效** —— 同一 `order_id` 跨天出现会在两个分区各留一份。增量处理的固有边界。
 6. **StarRocks 用的是 allin1 单容器**（FE + BE 合一），仅供开发验证，不能上生产。
@@ -672,15 +771,20 @@ docker compose restart dolphinscheduler
     【手工】gen_mock_orders_snapshot.py --date <业务日期>   → ods_order
     【手工】gen_mock_orders.py          --date <业务日期>   → ods_order_event
           ↓
-    【DS 02:00】offline_dataware    : ods_spark → dwd_delete → dws_agg → ads_metric → dqc
-    【DS 02:30】order_event_chain   : ods_event_spark → dwd_lifecycle_load
-    【DS 03:00】dim_product_chain   : wait_order_chain → … → dwd_sku_reload → dq_check
+    【常驻】Routine Load 自动摄入两条链路的 Kafka 消息 → ODS   ← 2026-10-09 起，不再由 DS 触发
+          ↓
+    【DS 02:00】offline_dataware  : dwd_delete → dws_agg → ads_metric → dqc
+    【DS 02:30】order_event_chain : dwd_lifecycle_load
+    【DS 03:00】dim_product_chain : wait_order_chain → … → dwd_sku_reload → dq_check
+    【每30分钟】routine_load_health: check_routine_load（摄入健康检查）
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
-    ⚠️ **不跑生成器时，DS 工作流仍会"成功"但什么都没做**（摄入节点打印 `没有新消息，退出`，退出码 0）—— 这是设计如此。判据：日志里有没有 `本次从 Kafka 读到 N 行`。
 12. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
 13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**（`history_partition_num=0`）。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这是动态分区的固有行为、属运维常规动作**；想省掉它可改表达式分区，见「后续方向 → 可选架构改进」。
 14. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
+15. ⭐ **常驻 Routine Load 的新运维负担** —— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
+16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`** —— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
+17. **不要用裸的 `docker cp` 往项目里放文件，也不要直接 `chown` 改属主** —— 见 PITFALLS §6.4。
 
 ## 后续方向
 
@@ -688,21 +792,118 @@ docker compose restart dolphinscheduler
 - [x] **把商品/维度链路接进 DolphinScheduler**（含跨工作流依赖 + 定时）
 - [x] 数据质量检查节点（DQC）—— 6 项检查 + 自检
 - [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
-- [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（DWD 从 4 天/416 行 → **8 天/942 行**）
+- [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（`dwd_order_detail` 从 4 天 → **8 天 / 763 行**）
 - [x] **DQC 加一条「重算对账」** —— `⑥ 重物化属性一致`：宽表里的商品属性必须等于 SCD2 对该日期算出的属性。盖住两个盲区：属性值不同、以及 **JOIN 不上的孤儿行**（范围 JOIN 不满足时那行会直接消失，计数纹丝不动）。写 `<=>` 而非 `<>`（NULL 安全），用 `LEFT JOIN` 而非 `NOT EXISTS`（StarRocks 不支持关联子查询里的非等值谓词）
-- [x] 作业失败告警（邮件 / 钉钉）—— DS 里两个工作流都配了 `warning_type=2` + 告警组
+- [x] 作业失败告警（邮件 / 钉钉）—— DS 里四个工作流都配了 `warning_type=2` + 告警组 `2`
 - [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/dim_product_scd2_incremental.sh`，指纹一字不差）
 - [x] **累积快照事实表**（下单 → 支付 → 发货 → 完成）—— 表/视图/装载/五道防线，**09-20 ~ 09-28 共 900 行**，卡单三类可见
-- [x] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表）—— 幂等已实测（重跑 `读到 0 行`）
-- [x] **把订单事件 / 累积快照链路接进 DS**（工作流三 `order_event_chain`：`ods_event_spark` → `dwd_lifecycle_load`，02:30，失败策略 `END`）
+- [x] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表）—— 幂等已实测（重跑 `读到 0 行`）。**（2026-10-09 该方案已被 Routine Load 取代）**
+- [x] **把订单事件 / 累积快照链路接进 DS**（工作流三 `order_event_chain`：`dwd_lifecycle_load`，02:30，失败策略 `END`）
 - [x] **累积快照逐天回放**（09-20 ~ 09-28，`dwd_order_lifecycle` **900 行**，卡单三类可见）
-- [ ] 把 DWD 清洗逻辑搬到 Spark SQL（上规模后）
-- [ ] ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）
+- [ ] ~~把 DWD 清洗逻辑搬到 Spark SQL（上规模后）~~ —— **已实测否决，不打算做**，理由见下方「为什么不做」
+- [x] ⭐ **ODS 改用 StarRocks Routine Load（省掉 Spark 这一跳）**（2026-10-09 完成）
+      —— 两条常驻作业 `ods_order_event_load` / `ods_order_load`，Exactly-Once；
+      退役了位点表 + 199 行 Python + 130 行外壳；新增 `check_routine_load.sh` + DS 工作流 `routine_load_health`。
+      详见「幂等性 → ODS 摄入」一节。
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
 
 **可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
 
 - [ ] `dwd_order_sku_detail` 改**表达式分区** —— 现在是动态分区（`dynamic_partition.history_partition_num=0`：**只建未来、不建历史**），所以补历史某天前需要手工 `ALTER TABLE ... ADD PARTITION`。**这是 StarRocks 动态分区的固有行为，属运维常规动作**（建表时也用 `sql/dwd_add_history_partitions.sql` 补过 `p20260915`~`p20260919`）；改成表达式分区可一劳永逸消掉它（PITFALLS §3.2 推荐过）
+
+### 为什么不做「把 DWD 清洗逻辑搬到 Spark SQL」
+
+结论：**在「数据主存是 StarRocks、不是文件」这个前提下，搬过去一定更慢。已实测，不做。**
+
+**① 三批逻辑都已用 Spark SQL 重写并验证过等价**（订单明细清洗 / SCD2 时点关联 / 累积快照推导），
+结果逐行逐列一致（763 / 763 / 900 行），**也就是说"能做"是已验证的** —— 否决的是"值得做"。
+
+**② 慢的原因不是算不动，是搬运。** batch C（2379 事件）成本拆解：
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| SparkSession 启动 | 1.4 s | 17% |
+| **读 ODS（JDBC 抽取）** | **3.5 s** | **42%** |
+| 计算（聚合 + 派生） | 1.0 s | 12% |
+| **写回 DWD（JDBC 写入）** | **2.5 s** | **30%** |
+
+**真正算数据只占 12%，82% 花在启动和数据搬运上。**
+
+**③ 规模变大也救不了这个架构。** 同一段 SCD2 关联（等值 + 日期区间）两引擎对比
+（用隔离 benchmark 表，以 `ods_order` 为种子放大，未触碰真实表）：
+
+| 规模 | 老逻辑（StarRocks SQL） | 新逻辑（Spark SQL） |
+|---|---|---|
+| 800 行 | 1256 ms | ≈ 11900 ms |
+| 3815 行（5 倍）| 1632 ms | 12994 ms |
+
+注意**斜率**：StarRocks 5 倍数据只多 30%（库内执行、亚线性）；
+Spark 几乎不动（固定开销主导：JVM + 全量 JDBC 搬运）。
+
+**④ 这条待办的前提是"湖仓"，本项目不是。** 「大数据用 Spark」的经验来自
+**数据以 Parquet 存在 HDFS/S3** 的场景 —— 那时 Spark 能直读文件、零搬运。
+而本项目的数据主存在 StarRocks 里，Spark 想算就必须 JDBC 抽出来、再写回去，
+上面那 82% 就是"用 Spark"本身带来的成本。**只要不改数据落点，规模再大也消不掉它。**
+
+> **什么情况下才该重新评估**：改架构 —— ODS 落 Parquet/对象存储，Spark 直读文件清洗、
+> 结果再进 StarRocks 供查询（标准「湖仓 + 数仓」混合）。那时 42% 的读开销才真正消失。
+> 这是另一件工程（要重设计 ODS 落点），不是"把清洗搬个家"。
+
+### 为什么「ODS 改用 Routine Load」值得做（与上一条相反）
+
+**结论：已实施（2026-10-09）。这是"换一种摄入方式"，不是"把清洗搬进 StarRocks"。**
+
+> 具体配置、验收判据、运维与回滚见「幂等性 → ODS 摄入」一节。
+> 下面保留**当初的决策依据**，便于将来追溯为什么这么改。
+
+**① 当初这一跳的真实成本：13.7 秒，而它什么都没读到。**
+
+实测 `bash scripts/ods_order_event_ingest.sh`（位点已在 2379，无新消息）：
+
+```
+退出码=0   墙钟=13670 ms
+本次从 Kafka 读到 0 行，按 (order_id,event_type) 去重后 0 行
+没有新消息，退出（未写入、未改位点）
+```
+
+**空跑也要 13.7 秒** —— 全是 Spark 作业的固定开销（JVM 启动 + Ivy 解析 + Kafka 连接）。
+Routine Load 是 StarRocks 常驻消费，**没有这个固定开销**。
+
+**② 它消掉了三样东西**（都是维护负担 + 故障面）：
+
+| 改前的东西 | 改后 |
+|---|---|
+| `ods_kafka_offset` 位点表 | ✅ 已退役，StarRocks 自己管位点 |
+| `ods_order_event_to_starrocks.py`（199 行）| ✅ 可由 `CREATE ROUTINE LOAD` 取代 |
+| `ods_order_event_ingest.sh`（130 行外壳 + 四道防线）| ✅ 同上，Exactly-Once 由 StarRocks 保证 |
+
+**③ 位点表这套手工幂等，本质是在重新实现 StarRocks 已有的能力。**
+官方文档明确：Routine Load 支持 **Exactly-Once 语义，保证数据不丢不重**
+（[使用 Routine Load 导入数据](https://docs.starrocks.io/zh/docs/loading/kafka/RoutineLoad/)），
+并且每个导入任务是一个独立事务、通过 Stream Load 机制提交。
+
+**④ 能力上够用 —— 当前"清洗"只是解析和类型转换。**
+`ods_order_to_starrocks.py` / `ods_order_event_to_starrocks.py` 实际只做：
+JSON 解析 → 类型转换（`order_time`/`event_time` 转 timestamp）→ 派生 `dt = to_date(event_time)`。
+Routine Load 支持 JSON + **衍生列**（`COLUMNS` 里写函数），
+`dt=to_date(event_time)` 这类派生在导入时就能完成
+（[导入过程中实现数据转换](https://docs.starrocks.io/zh/docs/loading/Etl_in_loading/)）。
+
+**⑤ 实施时踩到的三个点（都已写进 `sql/ods_routine_load.sql` 注释）**
+
+- **`kafka_offsets` 必须显式给、且与 `kafka_partitions` 按顺序对应** ——
+  不给默认是 `OFFSET_END`（会**跳过**未读消息）；给 `OFFSET_BEGINNING` 会**重灌**。
+  `ods_order` 是 `PRIMARY KEY` → 重复折叠无害；`ods_order_event` 是 `DUPLICATE KEY` → **重复会真的多出行**。
+- **`max_filter_ratio` 默认 `1`（不生效），必须显式设 `0`** —— 否则坏数据被静默过滤。
+- **`SHOW ROUTINE LOAD` 的 `State` 在第 8 列**、状态含 `NEED_SCHEDULE` —— 写监控脚本时会踩。
+
+**⑥ 常驻作业的新负担：挂了没人知道。**
+DS 里不再有摄入节点会变红，所以必须补 `routine_load_health` 工作流（每 30 分钟）。
+**这是这次改造唯一"变麻烦"的地方**，也是为什么不只是"删掉旧组件"那么简单。
+
+> **注意措辞**：这一步 ≠「把清洗和 join 都搬进 StarRocks」。
+> DWD 层（`dwd_overwrite.sh` / `dwd_sku_load.sh` / `dwd_order_lifecycle_load.sh`）**本来就在 StarRocks 里**，
+> 不在 Spark 里。Routine Load 换掉的只是**摄入**这一跳，DWD 那三层逻辑一行都没改。
 
 ---
 
