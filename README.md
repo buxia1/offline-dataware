@@ -1009,22 +1009,28 @@ Kafka (ods_order_event / ods_order)
 | 5 | Chainguard MinIO 的 `GetObject` 返回 `AccessDenied` | `CreateBucket`/`ListBuckets`/`PutObject` 都成功、对象确实落盘（`xl.meta`），**但读不回来** | **未解决**，这也是暂缓对象存储的原因 |
 | 6 | Docker 默认 `bridge` 网络**没有 DNS** | 容器间用容器名互相解析失败，S3A 会**无限重试**（实测挂死 15 分钟无输出） | 用**用户自定义网络**，或直接用 IP |
 | 7 | 磁盘上看到的不是普通文件 | MinIO 把对象存成目录 + `xl.meta` | 别用 `cat` 判断对象是否存在 |
+| 8 | **`fe.conf` 挂单文件 + `:ro` 会起不来** | `entrypoint.sh: line 34: .../fe.conf: Read-only file system` → 容器 `Exited (1)` | 挂**整个 `conf` 目录**（读写），不要挂单个文件 |
+| 9 | **StarRocks 官方"自动算堆"会造成重复 `-Xmx`** | 设 `FE_ENABLE_AUTO_JVM_XMX_DETECT=true` 后，命令行变成 `-Xmx8192m -Xmx1075m` 两个（它只是**追加**，不替换 `fe.conf`）| 直接改 `fe.conf` 并挂载，别用这个开关 |
+| 10 | **`wsl --shutdown` 后 StarRocks 容器 bind mount 可能失效** | 容器看不到宿主 `fe/meta`，会在临时层**重新初始化一个空 FE 元数据** → 表现为"数据库全没了"，但宿主数据完好 | 重建容器前先跑「金丝雀」确认挂载能解析（见下方一节） |
+| 11 | **改 `.wslconfig` 后不 `wsl --shutdown` 不生效** | 只改文件，`free -h` 仍是旧值 | 改完必须 `wsl --shutdown` |
+| 12 | **`docker compose down` / `--force-recreate kafka` 会丢光 topic** | Kafka 数据原在容器临时层；现已挂载到 `./kafka/logs`，但仍须遵守"先复制、再重建" | 见「Kafka 数据持久化」一节 |
 
 ### 分阶段推进清单
 
 > 勾选即代表**验收判据全部满足**。原则：**每步可回滚、可对账、不推翻既有决定**。
 > ⚠️ 湖目录与权限见「必须提前知道的坑」第 1 条 —— 这是第一步就会撞上的坎。
 
-**第 0 步 · 修地基**（放量前必须做）
+**第 0 步 · 修地基**（放量前必须做）—— ✅ **2026-10-10 已完成**（commit `4e60bb3`）
 
-- [ ] **修 `fe.conf` 堆与容器上限的矛盾** —— `-Xmx8192m` vs `mem_limit: 3g`（否则放量后被 OOM kill）
-      —— 判据：重启 StarRocks 后 `SHOW BACKENDS` 正常、无 OOM 记录、`SHOW ROUTINE LOAD` 仍为 `RUNNING`
-- [ ] **建湖目录并配好权限** —— Spark 以 uid 185 运行、项目目录属主是 1000，挂载 `RW=true` 也写不进
-      —— 判据：容器内 `touch <湖目录>/.probe` 成功；StarRocks 容器能读到同一路径
-- [ ] **评估 WSL 内存上限**（现 8 GB，可用只剩 2.9 GiB；宿主物理 16 GB）
-      —— 判据：`free -m` 可用内存 > 目标峰值（留出 Spark driver + 湖层文件缓存）
-- [ ] **挂载 Kafka 数据**（现放容器 `/tmp`，容器重建即丢，`retention=168h`）
-      —— 判据：重建 Kafka 容器后 3 个分区 offset 仍连续
+- [x] **修 `fe.conf` 堆与容器上限的矛盾** —— `-Xmx8192m` vs `mem_limit: 3g`（否则放量后被 OOM kill）
+      —— 实测：FE 进程 `-Xmx1024m -Xms1024m`；重启后两条 Routine Load 仍 `RUNNING`、无 OOM
+      —— **改法**：`fe.conf` 由"镜像自带"改为**目录挂载**，配置进项目、不再随容器重建丢失
+- [x] **建湖目录并配好权限** —— Spark 以 uid 185 运行、项目目录属主是 1000，挂载 `RW=true` 也写不进
+      —— 实测：`./lake` + `chmod 1777`，挂给 starrocks 与 spark 同一份；Spark 可写、StarRocks 可读
+- [x] **评估 WSL 内存上限** —— 宿主 16 GB、Windows 已用 13.6 GB 时**不可上调**；清后台后调到 12 GB
+      —— 实测：WSL 由 8 Gi → **11 Gi**，可用由 2.7 Gi → **8.4 Gi**
+- [x] **挂载 Kafka 数据** —— 原放容器 `/tmp` 未挂载，容器重建即丢（实测 `ods_order` 已因 retention 在丢早期消息）
+      —— 实测：先复制到宿主 `./kafka/logs` 再重建，offset `783/825/771`、`606/591/603` **完全保留**
 
 **第 1 步 · 湖层只读旁路**（不动生产链路）
 
@@ -1070,6 +1076,79 @@ Kafka (ods_order_event / ods_order)
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
+
+### 高危操作：重建容器前的「金丝雀」检查
+
+**背景**：2026-10-09 一次 `wsl --shutdown` 之后，StarRocks 容器的 bind mount 失效，
+容器在自己的临时层**重新初始化了一个空 FE 元数据** —— 表现为 `SHOW DATABASES` 只剩 `sys`、
+`ods/dwd/dws/dim/ads` 全部消失，看上去像"数据全丢了"（实际宿主数据完好）。
+
+**结论：重建/重启 StarRocks 之前，先用一次性容器确认挂载能正确解析。**
+
+```bash
+HOST=/home/l/offline-dw/starrocks
+docker rm -f sr_canary >/dev/null 2>&1
+docker run -d --name sr_canary \
+  -v "$HOST/fe/meta:/data/deploy/starrocks/fe/meta" \
+  -v "$HOST/be/storage:/data/deploy/starrocks/be/storage" \
+  starrocks/allin1-ubuntu:3.5.0 tail -f /dev/null >/dev/null 2>&1
+sleep 3
+docker exec sr_canary bash -c '
+  grep clusterId /data/deploy/starrocks/fe/meta/image/VERSION   # 期望 938046516
+  ls /data/deploy/starrocks/fe/meta/image/v2/ | wc -l           # 期望 2
+  ls /data/deploy/starrocks/fe/meta/bdb | wc -l                 # 期望 33
+  cat /data/deploy/starrocks/be/storage/cluster_id              # 期望 938046516-3.5.0'
+docker rm -f sr_canary >/dev/null 2>&1
+```
+
+四项都符合期望 → 可以安全重建。**任何一项不符，先别动。**
+
+### Kafka 数据持久化（2026-10-10 起）
+
+数据目录已挂载到宿主 `./kafka/logs`（容器内仍是 `/tmp/kraft-combined-logs`）。
+**首次挂载时必须"先复制、再重建"**，否则宿主空目录会盖住容器里的数据、重建后即丢失：
+
+```bash
+cd /home/l/offline-dw
+docker compose stop kafka
+mkdir -p kafka/logs
+docker cp kafka:/tmp/kraft-combined-logs/. kafka/logs/   # 先搬家
+docker compose up -d kafka                                # 再重建
+```
+
+**决定性的持久化验证**（重建后 offset 必须一字不差）：
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic ods_order_event > /tmp/before.txt
+cd /home/l/offline-dw && docker compose up -d --force-recreate kafka && sleep 25
+docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic ods_order_event > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt && echo "✅ 持久化成功"
+```
+
+> ⚠️ 宿主 `kafka/logs` 的属主必须是 **uid 1000**（= 容器内 `appuser`，也 = 宿主用户 `l`）。
+> 用 `sudo mkdir` 建成 root 会导致 Kafka 建不出 `.lock` 而**直接退出**。
+
+### 开机后 Routine Load 被暂停（已知现象）
+
+**每次开机，StarRocks 常先于 Kafka 就绪**，BE 连不上 Kafka 会把作业**暂停**：
+
+```
+ReasonOfStateChanged: errCode = 2, msg='... Connect to ipv4#172.18.0.3:29092 failed: Connection refused'
+```
+
+**这不是数据问题，也不是消息过期 —— 是连接失败。** `PAUSED` 不会自愈，需要手工恢复：
+
+```bash
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G" | grep -E "Name:|State:|ReasonOfStateChanged"
+# errCode=2（数据源连不上）→ 安全恢复：
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "RESUME ROUTINE LOAD FOR ods.ods_order_event_load;"
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "RESUME ROUTINE LOAD FOR ods.ods_order_load;"
+```
+
+> ⚠️ **恢复后必须复核事件表不变式**（`DUPLICATE KEY` 表重复会真的多出行）：
+> `SELECT count(*)`, `count(DISTINCT concat(order_id,'-',event_type))` 两者应**始终相等**（当前 2379）。
+> ⚠️ 若暂停原因是 `max_filter_ratio=0` 撞到坏数据（**errCode 不同**），**绝不可自动 RESUME** —— 会无限撞错，这正是"宁停不脏"的设计意图。
+> ⚠️ `RESUME` 后短暂出现 `NEED_SCHEDULE` 是**正常中间态**，几秒后自动转 `RUNNING`；健康检查已单独处理它，不会误报警。
 
 ---
 
