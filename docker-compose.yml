@@ -57,8 +57,13 @@ services:
       # 但容器只给 3g，放量后会被 OOM kill。挂目录而不是单文件——
       # entrypoint.sh 启动时要写 fe.conf，挂单文件（:ro）会报 Read-only file system 起不来。
       - ./starrocks/fe/conf:/data/deploy/starrocks/fe/conf
-      # 湖层（Iceberg warehouse）—— 与 spark 挂到宿主同一份文件
-      - ./lake:/data/deploy/starrocks/lake
+      # 湖层（Iceberg warehouse）—— 与 spark 挂到宿主同一份文件，
+      # 且【容器内绝对路径必须与 spark 完全一致】：
+      # Iceberg 把文件的绝对路径写进 metadata.json，StarRocks 按那个路径去读。
+      # 实测：两容器路径不一致时报
+      #   "File does not exist: file:/opt/offline-dw/lake/warehouse/.../snap-*.avro"
+      # 改到同名路径后读到 2379 行、脏数据统计与库表完全一致。
+      - ./lake:/opt/offline-dw/lake
 
   spark:
     image: apache/spark:3.5.1
