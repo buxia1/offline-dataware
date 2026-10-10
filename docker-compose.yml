@@ -82,6 +82,11 @@ services:
       #    ClassNotFoundException: org.apache.spark.launcher.Main 起不来（已实测踩到）。
       #    挂到独立路径，作业里用 --jars 引用。
       - ./spark/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar:/opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar
+      # Kafka 连接器（2026-10-10）：镜像不含，需 4 个 jar 齐全
+      - ./spark/jars/spark-sql-kafka-0-10_2.12-3.5.1.jar:/opt/offline-dw/jars/spark-sql-kafka-0-10_2.12-3.5.1.jar
+      - ./spark/jars/spark-token-provider-kafka-0-10_2.12-3.5.1.jar:/opt/offline-dw/jars/spark-token-provider-kafka-0-10_2.12-3.5.1.jar
+      - ./spark/jars/kafka-clients-3.4.1.jar:/opt/offline-dw/jars/kafka-clients-3.4.1.jar
+      - ./spark/jars/commons-pool2-2.11.1.jar:/opt/offline-dw/jars/commons-pool2-2.11.1.jar
 
   mysql:
     image: mysql:8.0
