@@ -1014,6 +1014,9 @@ Kafka (ods_order_event / ods_order)
 | 10 | **`wsl --shutdown` 后 StarRocks 容器 bind mount 可能失效** | 容器看不到宿主 `fe/meta`，会在临时层**重新初始化一个空 FE 元数据** → 表现为"数据库全没了"，但宿主数据完好 | 重建容器前先跑「金丝雀」确认挂载能解析（见下方一节） |
 | 11 | **改 `.wslconfig` 后不 `wsl --shutdown` 不生效** | 只改文件，`free -h` 仍是旧值 | 改完必须 `wsl --shutdown` |
 | 12 | **`docker compose down` / `--force-recreate kafka` 会丢光 topic** | Kafka 数据原在容器临时层；现已挂载到 `./kafka/logs`，但仍须遵守"先复制、再重建" | 见「Kafka 数据持久化」一节 |
+| 13 | ⭐ **bind mount 是"替换"不是"合并"——挂目录会盖掉镜像原有内容** | 把 `./spark/jars` 挂到 `/opt/spark/jars` 后，容器里 jar 总数从 **252 变成 1**，Spark 直接 `ClassNotFoundException: org.apache.spark.launcher.Main` 起不来 | **挂单个文件**（`./spark/jars/x.jar:/opt/offline-dw/jars/x.jar`），别挂会与镜像内容重叠的目录 |
+| 14 | **`fe.conf` 要挂目录、单个 jar 要挂文件——方向相反** | 坑 8 与坑 13 看似矛盾 | 判据是**容器启动时会不会写这个路径**：会写（`fe.conf`）就挂目录；只读（jar）就挂文件到**独立路径** |
+| 15 | **国内拉 Maven 大 jar 裸 `curl -O` 会中途断流** | `curl: (35) error:0A000126:SSL routines::unexpected eof while reading`，实测卡在 24 MB / 44 MB 不动 | 加 `--retry 5 --retry-all-errors -C -`（断点续传），或换国内镜像 |
 
 ### 分阶段推进清单
 
@@ -1034,8 +1037,12 @@ Kafka (ods_order_event / ods_order)
 
 **第 1 步 · 湖层只读旁路**（不动生产链路）
 
-- [ ] **挂 Iceberg runtime jar** —— `iceberg-spark-runtime-3.5_2.12-1.9.0.jar`（44 MB；本地文件系统**不需要** S3 那两个 jar）
-      —— 判据：`spark.sql("SHOW NAMESPACES IN lake")` 不报 `ClassNotFoundException`
+- [x] **挂 Iceberg runtime jar** —— `iceberg-spark-runtime-3.5_2.12-1.9.0.jar`（44 MB；本地文件系统**不需要** S3 那两个 jar）
+      —— 实测：jar 就位并校验（大小 `45369860`、SHA1 `811c4f3f...` 与官方一致、zip 结构完整）；
+      Spark 加载成功（`SHOW NAMESPACES IN lake` 返回空列表不报错、`ICEBERG_JAR_OK`）
+      —— **挂法**：`./spark/jars/iceberg-spark-runtime-...jar:/opt/offline-dw/jars/...jar`（**单文件挂到独立路径**），作业里用 `--jars` 引用
+      —— ⚠️ 不能挂 `./spark/jars` 整个目录 —— 会把镜像自带的 252 个 jar 全盖掉（见坑 13）
+      —— ⚠️ jar 不进版本库（`.gitignore` 已有 `spark/jars/*.jar`）；下载要用 `--retry` + `-C -`（见坑 15）
 - [ ] **重放历史 8 天灌湖** —— 用生成器（09-20 ~ 09-27），**只旁路、不碰现有链路**
       —— 判据：Iceberg 落出 `metadata/*.metadata.json` + `data/dt=*/**.parquet`
 - [ ] **让 StarRocks 发现湖层表** —— 建 external catalog（`iceberg.catalog.type=hadoop`，**无需 Hive Metastore**）

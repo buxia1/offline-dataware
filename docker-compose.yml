@@ -75,6 +75,13 @@ services:
       - ./data:/opt/offline-dw/data
       # 湖层（Spark 写入端，容器内 uid=185）—— 与 starrocks 指向宿主同一目录
       - ./lake:/opt/offline-dw/lake
+      # Iceberg runtime（2026-10-10）：apache/spark:3.5.1 不含任何湖仓连接器。
+      # ⚠️ 必须挂【单个文件】，不能挂 ./spark/jars 整个目录——
+      #    bind mount 是"用宿主目录替换容器目录"，不是合并：
+      #    挂目录会把镜像自带的 252 个 jar 全部盖掉，Spark 直接
+      #    ClassNotFoundException: org.apache.spark.launcher.Main 起不来（已实测踩到）。
+      #    挂到独立路径，作业里用 --jars 引用。
+      - ./spark/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar:/opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar
 
   mysql:
     image: mysql:8.0
