@@ -6,6 +6,10 @@ services:
     restart: unless-stopped
     ports:
       - "9092:9092"
+    volumes:
+      # ⚠️ 容器内路径必须与 KAFKA_LOG_DIRS 完全一致
+      #    KRaft 的元数据里记的是绝对路径，改路径会导致集群起不来
+      - ./kafka/logs:/tmp/kraft-combined-logs
     environment:
       # KRaft 单节点身份
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
@@ -24,7 +28,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
-      # 存储留在容器内，不挂载
+      # 数据目录（2026-10-10 起已挂载到宿主 ./kafka/logs，见上方 volumes）
+      # ⚠️ 此路径与 volumes 的容器侧路径必须一致，改一处就得改另一处
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       # 内存压到 512M
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
@@ -48,6 +53,12 @@ services:
       - ./starrocks/fe/log:/data/deploy/starrocks/fe/log
       - ./starrocks/be/storage:/data/deploy/starrocks/be/storage
       - ./starrocks/be/log:/data/deploy/starrocks/be/log
+      # fe.conf 挂进项目（2026-10-10）：镜像自带的 fe.conf 是 -Xmx8192m，
+      # 但容器只给 3g，放量后会被 OOM kill。挂目录而不是单文件——
+      # entrypoint.sh 启动时要写 fe.conf，挂单文件（:ro）会报 Read-only file system 起不来。
+      - ./starrocks/fe/conf:/data/deploy/starrocks/fe/conf
+      # 湖层（Iceberg warehouse）—— 与 spark 挂到宿主同一份文件
+      - ./lake:/data/deploy/starrocks/lake
 
   spark:
     image: apache/spark:3.5.1
@@ -62,6 +73,8 @@ services:
       - ./scripts:/opt/offline-dw/scripts
       - ./sql:/opt/offline-dw/sql
       - ./data:/opt/offline-dw/data
+      # 湖层（Spark 写入端，容器内 uid=185）—— 与 starrocks 指向宿主同一目录
+      - ./lake:/opt/offline-dw/lake
 
   mysql:
     image: mysql:8.0

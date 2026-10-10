@@ -27,3 +27,6 @@ data/
 # ---------- Python 缓存 ----------
 __pycache__/
 *.pyc
+
+# ---------- 湖层数据（Iceberg warehouse，可重建）----------
+lake/
