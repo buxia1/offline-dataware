@@ -35,6 +35,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -55,6 +56,20 @@ CSV_COLS = ["order_id", "dt", "user_id", "product_id", "amount", "order_time",
 COLS_HEADER = ",".join(CSV_COLS)
 
 BATCH_DAYS = 15
+
+# ★★ 每次运行必须换 label（2026-10-14 实测踩到）
+#   StarRocks 的 Stream Load label 一旦用过（无论成功还是失败）就【永久占用】
+#   （得等 label_keep_max_second 才回收，默认 3 天），复用它会被拒：
+#     begin transaction failed, errmsg=Label [xxx] has already been used.
+#   而 BE 处理被拒的请求时会在读完 body 之前就关连接 → 客户端只看到
+#     urllib.error.URLError: <urlopen error [Errno 32] Broken pipe>
+#   （BE 日志里才有真正原因，客户端这个报错完全误导）。
+#   所以 label 一律带一个「本次运行」的时间戳后缀。
+RUN_ID = os.environ.get("SKU_RUN_ID") or time.strftime("%H%M%S")
+
+
+def make_label(first, last):
+    return "dwd_sku_%s_%s_%s" % (first.replace("-", ""), last.replace("-", ""), RUN_ID)
 
 
 def stream_load(day, csv_path, rows_expected, label, dry_run=False):
@@ -83,6 +98,15 @@ def stream_load(day, csv_path, rows_expected, label, dry_run=False):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         print("      HTTP %s: %s" % (e.code, body[:400]))
+        sys.exit(1)
+    except Exception as e:  # BrokenPipeError / URLError 等
+        # ★ BE 在「读完 body 之前」拒绝请求（最典型的就是 label 重复）时，
+        #   客户端只会看到一个完全误导的 Broken pipe。这里把它翻译成人话。
+        print("      ❌ Stream Load 连接异常 %s: %s" % (type(e).__name__, e))
+        print("      label=%s  size=%d bytes" % (label, os.path.getsize(csv_path)))
+        print("      常见原因：label 已被用过（StarRocks 标签永久占用）→ 换 RUN_ID 重跑")
+        print("      真因在 BE 日志：docker exec starrocks grep '%s' "
+              "/data/deploy/starrocks/be/log/be.WARNING | tail -3" % label)
         sys.exit(1)
     try:
         import json
@@ -163,6 +187,13 @@ def main():
     for bi in range(0, len(days), BATCH_DAYS):
         chunk = days[bi:bi + BATCH_DAYS]
         part = (filtered.filter(F.col("dt").isin(*chunk))
+                # ★★ 必须取绝对值（2026-10-14 实测踩到）：
+                #   源表 lake.ods.ods_order 里有 3% 的负金额（生成器的 NEG_AMOUNT_RATE），
+                #   而仓侧口径（sql/dwd_order_sku_detail_load.sql 读的是 dwd_order_detail）
+                #   拿到的是【已经 ABS 过】的明细。少这一步 → 25,534 行金额为负、
+                #   sum(amount) 比 detail 少 8,476,266.40（仓侧当年就是这么错的）。
+                #   行数完全一致、只有金额错 —— 只看行数的对账发现不了。
+                .withColumn("amount", F.abs(F.col("amount")))
                 .select("order_id", "dt", "user_id", "product_id", "amount",
                         "order_time", "status"))
         part.cache()
@@ -193,12 +224,15 @@ def main():
             F.date_format("dt", "yyyy-MM-dd"),
             F.col("user_id").cast("string"),
             F.col("product_id").cast("string"),
-            F.format_number("amount", 2),
+            # ★ 不要用 F.format_number(col,2)：它会加千分位逗号（2,995.00），
+            #   逗号把 CSV 行切断 → BE 报 "too many filtered rows"（同一个坑在
+            #   累积快照那支作业上踩过）。cast("string") 不带千分位。
+            F.col("amount").cast("string"),
             F.date_format("order_time", "yyyy-MM-dd HH:mm:ss"),
             F.col("status"),
             F.col("category"),
             F.col("brand"),
-            F.format_number("sku_price", 2),
+            F.col("sku_price").cast("string"),
             F.date_format("valid_from", "yyyy-MM-dd"),
             F.date_format("valid_to", "yyyy-MM-dd"))
         (joined.select(line.alias("value"))
@@ -213,8 +247,7 @@ def main():
         shutil.move(parts[0], csv_path)
 
         first, last = chunk[0], chunk[-1]
-        d1, d2 = first.replace("-", ""), last.replace("-", "")
-        label = "dwd_sku_%s_%s" % (d1, d2)
+        label = make_label(first, last)
 
         # ★ 幂等：dwd_order_sku_detail 是 DUPLICATE KEY 分区表，写入前必须清掉该分区，
         #   否则重跑翻倍。但【不能在容器里调 docker exec】—— 容器内没有 docker。

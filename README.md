@@ -1290,6 +1290,48 @@ bash scripts/run_lifecycle.sh dry
 > 390 行时收敛到单行失败，读出 `2026110400184 ... 2,995.00`，逗号一目了然。
 > 这类"整批失败、没有错误样本"的导入问题，二分比逐行试快得多。
 
+### ⭐ 第 3 步：DWD / DWS / ADS 下沉到湖侧（2026-10-14）
+
+> 背景：用户（2026-10-14）决定把仓库的 **计算层主存迁到湖侧**，StarRocks 退化为查询/服务层。
+> 实测范围 = `ods` + `dim` + `dwd` + `dws` + `ads` **共 8 张表**。
+
+| 湖侧表 | 行数 | 备注 |
+|---|---|---|
+| `lake.ods.ods_order` | 900,000 | 90 个 dt 分区 |
+| `lake.ods.ods_order_event` | 3,120,421 | 93 个 dt 分区（含迟到 09-17/18/19）|
+| `lake.ods.ods_product` | 4,500 | 90 天 × 50 商品 |
+| `lake.dim.dim_product_scd2` | 4,500 | 50 商品 / `valid_from` 2026-09-20 ~ 2026-12-18 / `is_current` 50 |
+| `lake.dim.dim_product` | 50 | 当前版 |
+| `lake.dwd.dwd_order_detail` | 854,844 | `sum(amount)=140,891,053.50` |
+| `lake.dwd.dwd_order_sku_detail` | 854,844 | `sum(amount)=140,891,053.50`（= detail，**无负值**）|
+| `lake.dwd.dwd_order_lifecycle` | 900,000 | `sum(amount)=144,975,064.50` |
+| `lake.dws.dws_user_order_day` | 18,000 | 90 天 × 200 用户 |
+| `lake.ads.ads_daily_sales` | 90 | 90 天 |
+
+**脚本**（`bash scripts/run_lake_dim.sh ddl|build|dry` / `bash scripts/run_lake_dwd.sh` / `bash scripts/run_lake_dws_ads.sh`）
+- `scripts/lake_dim.sql` + `scripts/lake_dim_build.py`（SCD2 与当前版）
+- `scripts/lake_dwd.sql` + `scripts/lake_dwd_build.py`（明细 / SKU / 累积快照，三张表一次建）
+- `scripts/lake_dws_ads.sql` + `scripts/lake_dws_ads_build.py`（汇总层，口径逐字照搬仓侧 SQL）
+
+**湖↔仓逐项对账（实测全一致）**：`detail` 的行数 / `count(DISTINCT order_id)` / 天数 / `sum(amount)` /
+`order_time` 区间；`lifecycle` 的行数 / `sum(amount)` / 阶段分布 / 三个滞后合计；`dws` / `ads` 的
+`sum(order_cnt)` / `sum(paid_amount)` / `sum(refund_amount)` / `sum(net_amount)` 全部相等。
+
+**这一层要记住的三件事**
+1. **OBS 与 DWD 的「迁湖」语义不同**：`lake.ods.*` 是**从 Kafka 重放的镜像**（原写入方仍是 Routine Load → 仓侧 ODS）；
+   `lake.dwd/dim/dws/ads` 才是**计算迁到湖侧**（Spark 读湖 → 写湖，不再经过仓侧）。
+2. ★ **仓侧 `dwd.dwd_order_sku_detail` 的 `amount` 是脏的（2026-10-14 发现并修复）**：
+   旧表 25,534 行 `amount < 0`、`sum(amount)=132,414,787.10`，比它的源表 `dwd.dwd_order_detail`
+   （`amount = ABS(...)`、`sum=140,891,053.50`）**少 8,476,266.40**。核对口径：
+   `SELECT count(*) FROM ods.ods_order WHERE user_id IS NOT NULL AND amount < 0` = **25,534**
+   → 说明那批数据写进 SKU 表时**没有取 `ABS`**。修法：`scripts/dwd_order_sku_streamload.py` 的 `amount`
+   改用 `F.abs`，并用宿主外壳 `scripts/run_dwd_sku_full.sh 2026-09-20 2026-12-18` 重建
+   （实测 854,844 行 / `sum=140,891,053.50` / 负值 0）。**对账时 SKU 的金额必须以 detail 为基准，不能拿旧仓侧 SKU 比。**
+3. ★ **Stream Load 的 `label` 复用会失败、且报错极难懂**（坑 29）：同一 label 重复提交，BE 返回
+   `Status: Label Already Exists`，客户端侧却表现为 **`curl: (18) end of response with N bytes missing` /
+   `(52) empty reply`**，StarRocks 日志里也未必有；label 默认保留 3 天。修法：label 里带**唯一后缀**
+   （`dwd_sku_<start>_<end>_<i>_r<时间戳>`），并在重跑前显式处理 `Label Already Exists`。
+
 ### 分阶段推进清单
 
 > 勾选即代表**验收判据全部满足**。原则：**每步可回滚、可对账、不推翻既有决定**。
@@ -1330,6 +1372,7 @@ bash scripts/run_lifecycle.sh dry
 - [x] **湖表维护：清历史快照** —— 见上方「湖表快照清理」
       —— 实测：快照 181 / 184 → 各 5 个；**152 MB → 92 MB**；行数不变（安全）
 - [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
+      —— 2026-10-14 补充：湖层已从「只读旁路」扩为 **ODS/DIM/DWD/DWS/ADS 全分层镜像**（见「第 3 步」）
       —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs
          湖侧 2,969,579 行 —— 差的就是 Routine Load 持续吃进的重复/新事件；
          对齐口径永远是**当天去重后的 (dt, order_id, event_type)**
@@ -1350,10 +1393,12 @@ bash scripts/run_lifecycle.sh dry
          Stream Load 写 **854,844 行 = 34 秒**。**慢的是写不是读**
       —— 明细见「⭐ DWD / DWS / ADS 灌回仓侧」一节
 - [x] **汇总层（DWS / ADS）也下沉** —— 不在原计划里，和明细一起做了 ✅ **2026-10-14**
+      —— ✅ **2026-10-14 追加：已进一步沉到湖侧**（`lake.dws.dws_user_order_day` / `lake.ads.ads_daily_sales`），见「⭐ 第 3 步：DWD / DWS / ADS 下沉到湖侧」
       —— 落 `scripts/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
       —— 实测：`dws_user_order_day` **18,000 行** / 90 天（200 用户/天 × 90）、`ads_daily_sales` **90 行**；
          `SUM(order_cnt)` 两侧都 = 854,844 ✅
 - [x] **SCD2 时点关联改写为 Spark SQL** ✅ **2026-10-14**
+      —— ⚠️ 2026-10-14 发现仓侧 SKU 表旧数据 `amount` 未取 `ABS`（25,534 行负值、少 8,476,266.40），已修脚本并重建；见「⭐ 第 3 步」第 2 条
       —— 落 `scripts/dwd_order_sku_streamload.py` + 宿主外壳 `run_dwd_sku_full.sh`
       —— 判据：与 `dwd_order_sku_detail` 逐行等价（原 763 行；放量后 90 天是 854,844 行）
       —— 实测：**854,844 行**；逐日行数 **90/90 天与 `dwd_order_detail` 相等**；
@@ -1391,6 +1436,7 @@ bash scripts/run_lifecycle.sh dry
 |---|---|---|
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
+| 4 | **定时作业口径未统一** | DolphinScheduler 里仍是旧的 StarRocks SQL 作业（用户已于 2026-10-14 全部停掉）；若重启调度，会把湖侧口径覆盖回旧口径——要么把作业换成 Spark 版，要么确认两套口径等价 |
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ### 高危操作：重建容器前的「金丝雀」检查
