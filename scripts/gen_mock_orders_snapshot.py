@@ -12,8 +12,8 @@
     gen_mock_orders.py            事件流：一个订单多个事件 → 累积快照 dwd_order_lifecycle
     gen_mock_orders_snapshot.py   订单快照：一个订单一条   → 订单链路 dwd_order_detail
     两条链路互相独立，【号段也不重叠】：
-        事件流      order_id = int(YYYYMMDD) * 1000 +   0 ~  99
-        订单快照    order_id = int(YYYYMMDD) * 1000 + 500 ~ 599
+        事件流      order_id = int(YYYYMMDD) * 100000 +     0 ~  9999
+        订单快照    order_id = int(YYYYMMDD) * 100000 + 10000 ~ 19999
     （错开号段是为了将来做"一致性维度共享"时一眼能分清来源）
 
 【为什么改成按天产生（老版本的问题）】
@@ -54,11 +54,11 @@ from datetime import datetime, timedelta
 TOPIC = "ods_order"
 KAFKA_SERVERS = "localhost:9092"
 
-NEW_ORDERS_PER_DAY = 100     # 每天新下的单
-ID_OFFSET = 500              # 号段起点：和新链路事件流的 0~99 错开
+NEW_ORDERS_PER_DAY = 10000              # 每天新下的单
+ID_OFFSET = NEW_ORDERS_PER_DAY          # 号段起点：和新链路事件流的 0~9999 错开
 
-NULL_USER_RATE = 0.05        # 5% 的记录 user_id 为 None（脏数据）
-NEG_AMOUNT_RATE = 0.03       # 3% 的记录金额为负数（脏数据）
+NULL_USER_RATE = 0.05                   # 5% 的记录 user_id 为 None（脏数据）
+NEG_AMOUNT_RATE = 0.03                  # 3% 的记录金额为负数（脏数据）
 
 STATUS_WEIGHTS = [("paid", 85), ("refund", 10), ("cancel", 5)]
 
@@ -108,7 +108,7 @@ def generate(day):
 
     不碰 Kafka、不碰库 → 可以脱库单测（见 t_check_snapshot.py）
     """
-    base = int(day.strftime("%Y%m%d")) * 1000 + ID_OFFSET
+    base = int(day.strftime("%Y%m%d")) * 100000 + ID_OFFSET
     orders = [make_order(base + i, day) for i in range(NEW_ORDERS_PER_DAY)]
     orders.sort(key=lambda o: (o["order_time"], o["order_id"]))
     return orders
@@ -130,7 +130,7 @@ def self_check(orders, day):
     lines = []
 
     ids = [o["order_id"] for o in orders]
-    base = int(day.strftime("%Y%m%d")) * 1000 + ID_OFFSET
+    base = int(day.strftime("%Y%m%d")) * 100000 + ID_OFFSET
     lo, hi = base, base + NEW_ORDERS_PER_DAY - 1
 
     dups = [k for k, v in Counter(ids).items() if v > 1]
@@ -145,7 +145,7 @@ def self_check(orders, day):
                   "越界 %d 条" % len(off_day)))
 
     # 和新链路（事件流）的号段不能重叠：事件流是 base 的 0~99
-    ev_lo, ev_hi = base - ID_OFFSET, base - ID_OFFSET + 99
+    ev_lo, ev_hi = base - ID_OFFSET, base - ID_OFFSET + NEW_ORDERS_PER_DAY - 1
     overlap = [i for i in ids if ev_lo <= i <= ev_hi]
     lines.append(("与新链路事件流号段不重叠", not overlap,
                   "重叠 %d 条（事件流占 %d~%d）" % (len(overlap), ev_lo, ev_hi)))
@@ -155,7 +155,7 @@ def self_check(orders, day):
     return lines
 
 def print_summary(orders, day):
-    base = int(day.strftime("%Y%m%d")) * 1000 + ID_OFFSET
+    base = int(day.strftime("%Y%m%d")) * 100000 + ID_OFFSET
     status = Counter(o["status"] for o in orders)
     null_user = sum(1 for o in orders if o["user_id"] is None)
     neg_amount = sum(1 for o in orders if o["amount"] < 0)

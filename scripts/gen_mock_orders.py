@@ -32,9 +32,10 @@
       全量重读），装载侧用 MAX/MIN(event_time) 聚合 → 天然幂等。
 
 【order_id 自描述】
-    order_id = int(YYYYMMDD) * 1000 + i        (i = 0..99)
-    → order_id % 1000 = 当天序号 i（类别也只需这一个数）
-    → order_id % 100  = 类别区间（沿用原设计 order_id % 100 的判定）
+    order_id = int(YYYYMMDD) * 100000 + i      (i = 0..9999)
+    → order_id // 100000 = 业务日期 YYYYMMDD
+    → order_id %  100000 = 当天序号 i
+    → order_id % 100     = 类别区间（沿用原设计 order_id % 100 的判定）
 
 【和旧生成器的区别】
     · 旧：一次发 N 条「订单宽消息」，status 是随机的字符串
@@ -54,11 +55,15 @@ from datetime import datetime, timedelta
 TOPIC = "ods_order_event"
 KAFKA_SERVERS = "localhost:9092"
 
-# 每天固定造 100 个新订单：i 必须覆盖 0..99，6 个类别才会都出现
-NEW_ORDERS_PER_DAY = 100
-
-NULL_USER_RATE = 0.05     # 5% 的记录 user_id 为 None（脏数据）
-NEG_AMOUNT_RATE = 0.03    # 3% 的记录金额为负数（脏数据）
+NEW_ORDERS_PER_DAY = 10000      # 原 100
+NULL_USER_RATE   = 0.05         # 已有
+NEG_AMOUNT_RATE  = 0.03         # 已有
+# ---- 新增 5 类脏数据开关（①A：顶部常量）----
+DUP_EVENT_RATE         = 0.02   # 重复事件：同一 (order_id, event_type) 再发一条
+OOO_EVENT_RATE         = 0.03   # 乱序：后发的事件 event_time 更早
+LATE_EVENT_RATE        = 0.02   # 迟到：event_time 回拨 3 天
+OUT_OF_RANGE_RATE      = 0.01   # 超范围：金额 0 或 10 倍
+STATUS_REGRESS_RATE    = 0.01   # 状态回退：finish 后补发 ship
 
 # 商品单价表：沿用老公式，保证金额口径和 ods_order 对得上
 PRICE_TABLE = {pid: round(9.9 + (pid % 10) * 10, 2) for pid in range(1, 51)}
@@ -117,6 +122,8 @@ def make_attributes(order_id):
         user_id = None
     if rnd.random() < NEG_AMOUNT_RATE:                 # 脏数据 2：金额变负
         amount = -amount
+    if rnd.random() < OUT_OF_RANGE_RATE:               # 脏数据 4：超范围金额
+        amount = 0.0 if rnd.random() < 0.5 else round(amount * 10, 2)
     return {
         "order_id": order_id,
         "user_id": user_id,
@@ -169,6 +176,27 @@ def load_existing():
         existing[int(parts[0])] = {"order_time": parts[1], "emitted": emitted}
     return existing
 
+def _inject_dirty(events, ev_time, order_id, ev_name, payload, category):
+    """按 5 类脏数据开关往事件列表里注入脏事件（原地改 events）"""
+    rnd = random.Random("%d:%s:dirty" % (order_id, ev_name))
+
+    if rnd.random() < DUP_EVENT_RATE:        # 脏数据 3：重复事件
+        events.append((ev_time, order_id, ev_name, dict(payload), category))
+
+    if rnd.random() < OOO_EVENT_RATE:        # 脏数据 4：乱序（更早的时间戳）
+        back = ev_time - timedelta(seconds=rnd.randrange(60, 3600))
+        events.append((back, order_id, ev_name, dict(payload), category))
+
+    if rnd.random() < LATE_EVENT_RATE:       # 脏数据 5：迟到 3 天
+        late = ev_time - timedelta(days=3)
+        p2 = dict(payload); p2["event_time"] = late.strftime(FMT)
+        events.append((late, order_id, ev_name, p2, category))
+
+    if (ev_name == "ship"
+            and rnd.random() < STATUS_REGRESS_RATE):   # 脏数据 6：状态回退
+        reg = ev_time + timedelta(minutes=rnd.randrange(1, 240))
+        events.append((reg, order_id, "ship", dict(payload), category))
+
 def generate(day, existing):
     """纯函数：给定「日期」和「ODS 现状」，返回 (事件列表, 告警列表)
 
@@ -183,7 +211,7 @@ def generate(day, existing):
              for oid, st in existing.items()}
 
     # ---------- 阶段一：这天新下的单 → order 事件 ----------
-    base = int(day.strftime("%Y%m%d")) * 1000
+    base = int(day.strftime("%Y%m%d")) * 100000
     for i in range(NEW_ORDERS_PER_DAY):
         order_id = base + i
         if order_id in state:
@@ -193,7 +221,9 @@ def generate(day, existing):
         payload["order_time"] = order_time.strftime(FMT)
         payload["event_type"] = "order"
         payload["event_time"] = payload["order_time"]
-        events.append((order_time, order_id, "order", payload, category_of(order_id % 100)))
+        category = category_of(order_id % 100)
+        events.append((order_time, order_id, "order", payload, category))
+        _inject_dirty(events, order_time, order_id, "order", payload, category)
         state[order_id] = {"order_time": payload["order_time"],
                            "emitted": {"order": payload["order_time"]}}
 
@@ -239,6 +269,7 @@ def generate(day, existing):
             payload["event_time"] = due.strftime(FMT)
             events.append((due, order_id, ev_name, payload,
                            category_of(order_id % 100)))
+            _inject_dirty(events, due, order_id, ev_name, payload, category)
             done_today.add(ev_name)
 
     # 同一天多个事件时，按「时间 → order_id → 定义顺序」稳定排序

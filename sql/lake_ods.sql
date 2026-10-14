@@ -171,6 +171,13 @@ CREATE TABLE lake.ods.ods_order_event (
 USING iceberg
 PARTITIONED BY (dt);
 
+-- ⚠️ 覆盖范围必须包含「迟到事件可能落到的更早日期」（2026-10-14 实测）：
+--    生成器 LATE_EVENT_RATE 会把 event_time 回拨 3 天，于是 09-20 生成的事件里
+--    有 1,247 条落在 09-17/18/19。放量重建时湖侧实际灌了 09-17 ~ 12-18 共 93 天。
+--    Iceberg + partitionOverwriteMode=dynamic 会自动建出新 dt 分区，
+--    所以【不需要】手工 ADD PARTITION（这点和仓侧 StarRocks 相反）。
+--    首次建表目录是空的、没有旧快照被缓存，建完直接写即可。
+
 
 -- =============================================================================
 -- 验证（建完表立刻核对 —— 全部为实测可用的命令）

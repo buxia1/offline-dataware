@@ -33,6 +33,16 @@ services:
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       # 内存压到 512M
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+      # ── retention（2026-10-13 起）─────────────────────────────
+      # 原为默认 168h(7 天)。2026-10-13 实测：ods_order 三个分区的消息
+      # 已【整段被 retention 删除】（.log 文件 0 字节、earliest==latest
+      # ==606/591/603），湖/仓因此拿不到订单数据。故延长到 30 天。
+      KAFKA_LOG_RETENTION_HOURS: 720
+      # 段文件按 1 小时滚动（默认 7 天）。
+      # 原因：retention 是【按段】判定的，段不滚动就永远删不掉。
+      # ods_order_event 至今未滚动，所以 9 天前的数据"侥幸"还在；
+      # 一旦滚动会被整段删除。调小可让 retention 及时生效、行为可预期。
+      KAFKA_LOG_SEGMENT_MS: 3600000
 
   starrocks:
     image: starrocks/allin1-ubuntu:3.5.0

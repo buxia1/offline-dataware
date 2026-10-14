@@ -14,7 +14,7 @@
 import argparse
 import sys
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField, LongType, DecimalType, StringType,
@@ -101,8 +101,18 @@ def main():
           .withColumn("dt", F.to_date("event_time"))
           .filter(F.col("dt") == F.lit(target).cast("date")))
 
-    # 去重（与仓侧 order_event_chain 的口径一致）
-    ev_dedup = ev.dropDuplicates(["order_id", "event_type"])
+    # 去重口径：按 (dt, order_id, event_type) —— 每天每个 key 只留一行。
+    # 【为什么不是 dropDuplicates(["order_id","event_type"])】
+    #   那是「整表按 key 去重」，在本进程内（已 filter 到 target 一天）看似等价，
+    #   但只要上游把多天数据放进同一个 DataFrame，它就会把
+    #   「同一订单同一事件类型、但发生在不同天」的迟到/乱序事件【跨天吃掉】。
+    #   2026-10-14 实测：湖比仓少 209,772 行（58,091 个 key 落在多天）。
+    #   ods 层是原始落地区，去重不该跨分区 —— 显式带上 dt 才不会被改动带偏。
+    w = Window.partitionBy("dt", "order_id", "event_type").orderBy(
+        F.col("event_time").asc(), F.col("order_time").asc())
+    ev_dedup = (ev.withColumn("_rn", F.row_number().over(w))
+                  .filter(F.col("_rn") == 1)
+                  .drop("_rn"))
 
     n_ord = order.count()
     n_ev_raw = ev.count()
