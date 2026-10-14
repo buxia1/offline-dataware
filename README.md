@@ -1066,6 +1066,102 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 > 两条判据：**「快照数下降」**且**「行数不变」**，缺一不可。
 > `remove_orphan_files`（清无主文件）本次**没做** —— 先证明快照清理安全，再单独评估。
 
+### ⭐ DWD / DWS / ADS 灌回仓侧（2026-10-14，第 2 步主体）
+
+湖层 ODS 就位后，**计算下沉到 Spark**：Spark 直读 Iceberg 清洗/聚合，再把结果
+**Stream Load 回仓侧的 `dwd` / `dws` / `ads`**。仓侧表结构、下游查询、DolphinScheduler
+作业名一律不动。
+
+**为什么不是 Spark JDBC 直写仓侧**（实测踩过，别再走）：
+
+| 写法 | 数据量 | 耗时 | 折算 |
+|---|---|---|---|
+| Spark JDBC（`df.write.jdbc`）| 9,475 行（09-20 单天）| **467 秒**（≈20 行/秒）| 90 万行要 **≈13 小时** |
+| Stream Load（CSV → BE HTTP）| **854,844 行**（90 天全量）| **34 秒**（其中写入 18.9 秒）| **约 25,000 行/秒** |
+
+慢的是**写**不是读：JDBC 默认逐行 INSERT，每条一个 round-trip；Stream Load 把文件
+一次推给 BE，BE 直接消费。**这也是当初"湖仓是否值得"的最终证据 —— 省下的正是那趟 JDBC 搬运。**
+
+#### 明细链路：`scripts/dwd_order_detail_streamload.py`
+
+```bash
+docker run --rm --network offline-dw_default --memory 5g \
+  -v /home/l/offline-dw/lake:/opt/offline-dw/lake \
+  -v /home/l/offline-dw/spark/jars:/opt/offline-dw/jars:ro \
+  -v /home/l/offline-dw/scripts:/opt/offline-dw/app:ro \
+  -v /home/l/offline-dw/spark/jars/mysql-connector-java-8.0.30.jar:/opt/spark/jars/mysql-connector-java-8.0.30.jar:ro \
+  --entrypoint /opt/spark/bin/spark-submit apache/spark:3.5.1 \
+  --master 'local[2]' --driver-memory 3g \
+  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
+  /opt/offline-dw/app/dwd_order_detail_streamload.py --start 2026-09-20 --end 2026-12-18
+```
+
+（`--dates 2026-09-20,2026-09-21` 指定散天；`--dry-run` 只算不写。）
+
+**口径逐字照搬仓侧老作业 `scripts/dwd_overwrite.sh`**：`user_id IS NOT NULL` /
+`ABS(amount)` / 按订单取 `ABS(amount)` 最大行 / 按 `dt` 分区。**唯一刻意差异**是数据来源
+由仓侧 `ods.ods_order` 换成湖侧 `lake.ods.ods_order`（同一批 Kafka 消息的双写副本，
+逐 key 零差异）。多天批跑时 `ROW_NUMBER` 的 `PARTITION BY` 必须带 `dt`
+（`PARTITION BY dt, order_id`），否则跨天数据会混在一起排序。
+
+**实测（90 天 2026-09-20 ~ 2026-12-18）**：
+
+| 指标 | 数值 |
+|---|---|
+| 湖层 `ods_order` 行数 | 900,000 |
+| 清洗后（`user_id` 非空）| **854,844**（少的 45,156 = 5.02%，与 `NULL_USER_RATE=0.05` 吻合）|
+| 仓侧 `dwd.dwd_order_detail` | **854,844**（15 批写入，逐批回读核对）|
+| 逐日「行数 + `sum(amount)`」对账 | **90/90 天一致** ✅ |
+| `(dt, order_id)` 重复 | **0** ✅ |
+| 分区 | 95 个（p20260915~p20261218），90 个有数据 |
+| 耗时 | **34.0 秒**（读湖 3.5 s + 清洗 12.0 s + 15 批写入 18.9 s）|
+
+#### 汇总链路：`scripts/dws_ads_streamload.py`
+
+DWS / ADS 没有单独成步，和明细一起灌（同一支 Spark 作业内两级聚合）：
+DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
+`sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`：
+派生指标一律「先各自 SUM 再相除」（`SUM(paid_amount)/SUM(paid_cnt)`），
+除零用 `when(denominator != 0, ...).otherwise(null)` 对齐 `NULLIF`。
+
+**实测结果（2026-10-14，90 天全量）**：
+
+| 指标 | DWS `dws_user_order_day` | ADS `ads_daily_sales` |
+|---|---|---|
+| 行数 | **18,000**（90 天 × 200 用户/天）| **90**（一天一行）|
+| `dt` 覆盖 | 2026-09-20 ~ 2026-12-18，90 天 | 同上 |
+| 总和对账 | `SUM(order_cnt) = 854,844` = DWD 明细行数 ✅ | `SUM(order_cnt) = 854,844` ✅ |
+| `SUM(paid_amount)` | 119,749,476.90 | 与 DWS 逐日一致 ✅ |
+
+耗时：清洗 11.8 s + 9 批写入 40.8 s = **67.1 s**（两支作业可合并成一次 Spark 提交）。
+
+> 这两张表都是 **PRIMARY KEY 模型**，Stream Load 是 **upsert** 语义 —— 重跑天然幂等，
+> 不需要像 DWD（DUPLICATE KEY 表）那样先 `DELETE` 区间。
+> DWS/ADS 走**制表符数据 + 逗号 `columns` 头**，DWD 明细那支走 `\|` 分隔的 CSV ——
+> 两支作业的格式细节**不通用**，别互相抄。
+
+#### 这两支作业共同的坑（都已实测踩过并写进脚本注释）
+
+| # | 坑 | 现象 | 解法 |
+|---|---|---|---|
+| 19 | **必须直连 BE 的 8040，不能打 FE 的 8030** | FE 回 307，`location: http://127.0.0.1:8040/...`，在容器里那个 `127.0.0.1` 是 FE 自己，必然连不上 | URL 直接写 `starrocks:8040` |
+| 20 | **Stream Load 强制要求 `Expect: 100-continue`** | 写 `-H "Expect:"` 反被拒：`There is no 100-continue header` | `curl -H "Expect: 100-continue"` |
+| 21 | **Spark CSV 的 `compression` 已经压过一层** | 再用 `gzip.open` 包一层 → `gzip(gzip(csv))`，StarRocks 报 `Target column count: 7 doesn't match source value column count: 1`（二进制按 `\n` 切，`NumberTotalRows=380`）| 写纯文本，`compression=none` |
+| 22 | **CSV 分隔符必须和表头声明一致** | 默认逗号、表头写 `\|` → 同样报列数不匹配 | `.option("sep","\|")` + `column_separator: \|` |
+| 23 | **时间要显式格式化成 `yyyy-MM-dd HH:mm:ss`** | 默认 ISO8601 带 `T` 和 `+08:00`，StarRocks DATETIME 不认 | `date_format(col, 'yyyy-MM-dd HH:mm:ss')` |
+| 24 | **`max_filter_ratio` 默认 1 会静默吃掉坏行** | 导入"成功"但少行，还很可能是你有 bug | 显式 `max_filter_ratio: 0`（实测 `filtered=0`）|
+| 25 | **`columns` 头用逗号分隔，不是制表符** | 数据用 `column_separator: \t` 时，容易顺手把 `columns` 也写成制表符分隔 → BE 报 `plan streaming load failed. errmsg=Getting syntax error at line 1, column 17. Detail message: No viable statement for input 'user_id<TAB>dt'` | `columns: user_id,dt,...`（逗号）+ `column_separator: \t`（数据用制表符）；或干脆省略 `columns` 头，靠落盘字段顺序 |
+| 26 | **Spark 没有一种顺手的"写多列纯文本行"方式** | 依次试过 `df.write.text()`（只吃单列 string，报 `UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE`）、`df.toJSON().write`（toJSON 返回 RDD，没有 `.write`）、`createDataFrame(toJSON(), "value string")` / `StructType` / `rdd.toDF(schema)`（全部报 `CANNOT_ACCEPT_OBJECT_IN_TYPE StructType can not accept object '{"user_id":7,...}' in type str`）| 用 `F.concat_ws(TAB, *[col(c).cast("string")])` 在 **Spark SQL 内部**拼成单列，再 `write.text()`；`text()` 写出来是**目录**（`IsADirectoryError`），要自己合并 part-* |
+
+> 坑 25 的"别回头改"记录：`probe_cols3.py`（容器内直发 PUT）实测四种写法 ——
+> `columns` 制表符分隔 = `Fail`；逗号分隔 / 逗号+空格 / 不写 `columns` = **都是 `Success`**。
+> 另外注意 **BE 的 HTTP 接口要带 Basic 认证**，不带会回 `Status=Fail`、
+> `Message: no valid Basic authorization`（文档里没写，白花一轮排查）。
+
+> ⚠️ 驱动 jar 必须**挂进 `/opt/spark/jars/` 这个目录下**（挂单个文件到 `/opt/spark/jars/xxx.jar`），
+> 只写 `--jars` 的话驱动进不了 AppClassLoader，会报 `No suitable driver found`。
+> 项目里已有 `ds/libs/mysql-connector-java-8.0.30.jar`，直接用它。
+
 ### 分阶段推进清单
 
 > 勾选即代表**验收判据全部满足**。原则：**每步可回滚、可对账、不推翻既有决定**。
@@ -1116,16 +1212,29 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 
 **第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运）
 
-- [ ] **订单明细清洗改写为 Spark SQL** —— 读湖层文件，不读 JDBC
-      —— 判据：与 `dwd_order_detail` 逐行等价（763 行）+ 逐列指纹一致
+- [x] **订单明细清洗改写为 Spark SQL** —— 读湖层文件，不读 JDBC ✅ **2026-10-14**
+      —— 落 `scripts/dwd_order_detail_streamload.py`（Spark 读 Iceberg → 清洗 → Stream Load 回仓侧）
+      —— 实测：湖层 900,000 行 → `user_id` 非空 **854,844** 行 → 仓侧 854,844 行；
+         **逐日「行数 + `sum(amount)`」90/90 天一致**；`(dt, order_id)` 重复 = 0；耗时 **34.0 秒**
+- [x] **记录性能对比** —— 「文件直读」vs「JDBC 搬运」实测耗时 ✅ **2026-10-14**
+      —— 判据：给出两个引擎在同一数据量下的耗时表（这是"湖仓是否值得"的最终证据）
+      —— **实测**：JDBC 写 9,475 行 = **467 秒**（≈20 行/秒，90 万行要 ≈13 小时）；
+         Stream Load 写 **854,844 行 = 34 秒**。**慢的是写不是读**
+      —— 明细见「⭐ DWD / DWS / ADS 灌回仓侧」一节
+- [x] **汇总层（DWS / ADS）也下沉** —— 不在原计划里，和明细一起做了 ✅ **2026-10-14**
+      —— 落 `scripts/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
+      —— 实测：`dws_user_order_day` **18,000 行** / 90 天（200 用户/天 × 90）、`ads_daily_sales` **90 行**；
+         `SUM(order_cnt)` 两侧都 = 854,844 ✅
 - [ ] **SCD2 时点关联改写为 Spark SQL**
-      —— 判据：与 `dwd_order_sku_detail` 逐行等价（763 行）+ 逐列指纹一致
+      —— 判据：与 `dwd_order_sku_detail` 逐行等价（原 763 行；放量后 90 天应是 854,844 行 × 命中率）+ 逐列指纹一致
+      —— ⚠️ **前置阻塞**：`dim_product_scd2` 只到 2026-10-02（`max(valid_from)=2026-10-02`，
+         该行 `valid_to=9999-12-31`）→ 10-03 之后的订单会 JOIN 到"最后一版"，
+         **不是当时口径**。要跑真 90 天链路，得先把商品链路放到 90 天
 - [ ] **累积快照推导改写为 Spark SQL**
-      —— 判据：与 `dwd_order_lifecycle` 逐行等价（900 行）+ 阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`
+      —— 判据：与 `dwd_order_lifecycle` 逐行等价（原 900 行；放量后 90 天应是 900,000 行）+ 阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`（放量后比例应保持）
+      —— 注：用户 2026-10-14 的决定是**暂时不动 `dwd_order_lifecycle`**（见「确认的四项边界」）
 - [ ] **服务层查询不受影响** —— 必要时用 external catalog 视图过渡
       —— 判据：现有报表 SQL 结果不变
-- [ ] **记录性能对比** —— 「文件直读」vs「JDBC 搬运」实测耗时
-      —— 判据：给出两个引擎在同一数据量下的耗时表（这是"湖仓是否值得"的最终证据）
 
 **第 3 步 · 放量**（先 1000 单/天跑通，再上 1 万单/天 × 90 天）
 
