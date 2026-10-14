@@ -637,8 +637,8 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 | 项 | 期望 |
 |---|---|
 | 两条作业 `State` | `RUNNING`；`ErrorLogUrls` 空 |
-| `ods_order` / `ods_order_event` / `dwd_order_lifecycle` | **800 / 2379 / 900**（与改造前一致）|
-| 事件表不变式 | 行数 == `(order_id,event_type)` 去重对数 |
+| `ods_order` / `ods_order_event` / `dwd_order_lifecycle` | **900,000 / 3,120,421 / 900,000**（⚠️ 这是 2026-10-14 放量后的现状；改造当时的数字是 800 / 2379 / 900）|
+| 事件表不变式 | 行数 **3,120,421** ≠ `(order_id,event_type)` 去重对数 **2,914,488** —— 放量前两者相等（2379）纯属小数据巧合：ODS 是 append-only，同一对 key 的迟到/乱序事件各占一行 |
 | 两条 DQC | `EXIT=0` |
 
 
@@ -828,6 +828,10 @@ docker compose restart dolphinscheduler
 **可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
 
 - [ ] `dwd_order_sku_detail` 改**表达式分区** —— 现在是动态分区（`dynamic_partition.history_partition_num=0`：**只建未来、不建历史**），所以补历史某天前需要手工 `ALTER TABLE ... ADD PARTITION`。**这是 StarRocks 动态分区的固有行为，属运维常规动作**（建表时也用 `sql/dwd_add_history_partitions.sql` 补过 `p20260915`~`p20260919`）；改成表达式分区可一劳永逸消掉它（PITFALLS §3.2 推荐过）
+      —— **2026-10-14 更新**：90 天的分区已用 `sql/step5_1_add_partitions.sql`（126 条 `ALTER`，detail 62 + sku 64）补齐
+      （`dwd_order_detail` 95 个、`dwd_order_sku_detail` 90 个），并把两表的 `dynamic_partition.enable` 置为 `false`
+      —— **本项目**在放量后不再依赖动态分区（既不会自动建、也不会自动删）。**「改表达式分区」仍建议做**，
+      否则每次新增日期范围都要重跑一遍"关开关 → 逐条 ALTER → 开开关"，而且漏跑就是 `Insert has filtered data` 类硬失败
 
 ### 为什么不做「把 DWD 清洗逻辑搬到 Spark SQL」
 
@@ -835,6 +839,7 @@ docker compose restart dolphinscheduler
 
 **① 三批逻辑都已用 Spark SQL 重写并验证过等价**（订单明细清洗 / SCD2 时点关联 / 累积快照推导），
 结果逐行逐列一致（763 / 763 / 900 行），**也就是说"能做"是已验证的** —— 否决的是"值得做"。
+（⚠️ 当时的重写是**走 JDBC 抽数**的版本；本节的否决结论已于 2026-10-14 被推翻，见下方 §④ 之后的说明。）
 
 **② 慢的原因不是算不动，是搬运。** batch C（2379 事件）成本拆解：
 
