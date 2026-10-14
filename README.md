@@ -1205,7 +1205,7 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 > DWS/ADS 走**制表符数据 + 逗号 `columns` 头**，DWD 明细那支走 `\|` 分隔的 CSV ——
 > 两支作业的格式细节**不通用**，别互相抄。
 
-#### 这两支作业共同的坑（都已实测踩过并写进脚本注释）
+#### 这几支作业共同的坑（都已实测踩过并写进脚本注释）
 
 | # | 坑 | 现象 | 解法 |
 |---|---|---|---|
@@ -1217,8 +1217,6 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 | 24 | **`max_filter_ratio` 默认 1 会静默吃掉坏行** | 导入"成功"但少行，还很可能是你有 bug | 显式 `max_filter_ratio: 0`（实测 `filtered=0`）|
 | 25 | **`columns` 头用逗号分隔，不是制表符** | 数据用 `column_separator: \t` 时，容易顺手把 `columns` 也写成制表符分隔 → BE 报 `plan streaming load failed. errmsg=Getting syntax error at line 1, column 17. Detail message: No viable statement for input 'user_id<TAB>dt'` | `columns: user_id,dt,...`（逗号）+ `column_separator: \t`（数据用制表符）；或干脆省略 `columns` 头，靠落盘字段顺序 |
 | 26 | **Spark 没有一种顺手的"写多列纯文本行"方式** | 依次试过 `df.write.text()`（只吃单列 string，报 `UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE`）、`df.toJSON().write`（toJSON 返回 RDD，没有 `.write`）、`createDataFrame(toJSON(), "value string")` / `StructType` / `rdd.toDF(schema)`（全部报 `CANNOT_ACCEPT_OBJECT_IN_TYPE StructType can not accept object '{"user_id":7,...}' in type str`）| 用 `F.concat_ws(TAB, *[col(c).cast("string")])` 在 **Spark SQL 内部**拼成单列，再 `write.text()`；`text()` 写出来是**目录**（`IsADirectoryError`），要自己合并 part-* |
-| 27 | **`F.format_number()` 会输出千分位逗号，把整行切错** | `F.format_number(amount, 2)` 走 `java.text.DecimalFormat`，`2995.00` 被写成 `2,995.00`；BE 按逗号切分 → 该行字段数不对 → **整批**报 `too many filtered rows`（`NumberLoadedRows` 只差几千，看着像"脏数据"而不是格式 bug）| 用 `F.col(c).cast("string")`（DECIMAL→字符串不带千分位）；或 `F.regexp_replace(format_number(c,2), ",", "")` |
-| 28 | **`concat_ws` 会跳过 NULL，导致整列错位** | 可空字段为 `NULL` 时 `concat_ws` 直接少输出一段，15 列变 14 列，后续列全部左移 | 每个可空列先 `F.coalesce(col, F.lit("\\N"))`（StarRocks 认的 NULL 字面量）；落盘后自检"每行 TAB 数 = 列数-1"再推给 BE |
 
 > 坑 25 的"别回头改"记录：`probe_cols3.py`（容器内直发 PUT）实测四种写法 ——
 > `columns` 制表符分隔 = `Fail`；逗号分隔 / 逗号+空格 / 不写 `columns` = **都是 `Success`**。
@@ -1274,6 +1272,18 @@ bash scripts/run_lifecycle.sh dry
 **幂等性**：`dwd_order_lifecycle` 是 `PRIMARY KEY(order_id)` 表，Stream Load 是 **upsert**；
 但全量重建的语义是"表里不该有已消失的订单"，upsert 做不到删除，所以外壳先 `TRUNCATE`
 再一次性灌全量。分片写多批时 label 带批次号，重复执行会返回 `Label Already Exists`。
+
+**这一支独有的两个坑**（其余坑与上面三支共用）：
+
+| # | 坑 | 现象 | 解法 |
+|---|---|---|---|
+| 27 | **`F.format_number()` 会输出千分位逗号，把整行切错** | `F.format_number(amount, 2)` 走 `java.text.DecimalFormat`，`2995.00` 被写成 `2,995.00`；BE 按逗号切分 → 该行字段数不对 → **整批**报 `too many filtered rows`（`NumberLoadedRows` 只差 1,314 行，看着像"脏数据"而不是格式 bug）| 改用 `F.col(c).cast("string")`（DECIMAL→字符串**不带**千分位）；或 `F.regexp_replace(format_number(c,2), ",", "")` |
+| 28 | **`concat_ws` 会跳过 `NULL`，导致整列错位** | 可空字段为 `NULL` 时 `concat_ws` 直接少输出一段，15 列变 14 列，后续列全部左移 | 每个可空列先 `F.coalesce(col, F.lit("\\N"))`（StarRocks 认的 NULL 字面量）；落盘后**自检"每行 TAB 数 = 列数-1"再推给 BE** |
+
+> ★ 坑 27 的定位手法值得记住：`too many filtered rows` 不会给错误 URL，
+> 于是写了 `scripts/probe_lifecycle_bisect.py` —— 按**行数二分**推给 BE，
+> 390 行时收敛到单行失败，读出 `2026110400184 ... 2,995.00`，逗号一目了然。
+> 这类"整批失败、没有错误样本"的导入问题，二分比逐行试快得多。
 
 ### 分阶段推进清单
 
