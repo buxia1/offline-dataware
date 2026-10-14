@@ -1135,6 +1135,43 @@ DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
 
 耗时：清洗 11.8 s + 9 批写入 40.8 s = **67.1 s**（两支作业可合并成一次 Spark 提交）。
 
+#### SCD2 时点关联链路：`scripts/dwd_order_sku_streamload.py`（宿主外壳 `run_dwd_sku_full.sh`）
+
+`dwd_order_sku_detail` 的口径是**范围 JOIN**：`o.dt BETWEEN s.valid_from AND s.valid_to`
+（见 `sql/dwd_order_sku_detail_load.sql`）。Spark 侧逐字照搬，只把事实侧来源从仓侧
+`dwd_order_detail` 换成**湖侧同口径明细**（`lake.ods.ods_order`，逐 key 已对账一致）。
+
+**为什么事实读湖、维度反而 JDBC 读仓**：商品链路没进湖（湖里只有订单/事件两张表），
+但 `dim_product_scd2` 只有 4,500 行 / 50 个商品 —— **JDBC 的代价只在事实量级上才致命**。
+小维度 JDBC 读一次是毫秒级，事实侧零 JDBC。
+
+```bash
+# 宿主侧先补分区 + DELETE 区间（Spark 容器里没有 docker，清理必须留在宿主）
+START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
+```
+
+**实测（90 天 2026-09-20 ~ 2026-12-18，6 批 × 15 天）**：
+
+| 指标 | 数值 |
+|---|---|
+| 湖层明细行数 | 854,844（与 `dwd_order_detail` 同源同口径）|
+| 仓侧 `dwd.dwd_order_sku_detail` | **854,844**（6 批写入，逐批回读核对 `verify=OK`）|
+| 逐日行数对账 | **90/90 天与 `dwd_order_detail` 逐日相等** ✅ |
+| `order_id` 去重数 | 854,844（= 行数 → **无 JOIN 扇出**）✅ |
+| `valid_from <> dt` / `valid_to < dt` | **0 / 0** ✅（命中的正是订单当天那一版）|
+| `SUM(amount)` | 132,414,787.10（`dwd_order_detail` 侧 140,891,053.50，**少 8,476,266.40**）|
+| 耗时 | 6 批合计约 7 分钟（单批 14.2 万行）|
+
+> ⚠️ **两侧 `SUM(amount)` 不相等是正确的**：范围 JOIN 的**内连接**语义会丢掉
+> **在 `dim_product_scd2` 里找不到当天版本**的订单（维度只有 90 天 × 50 商品 = 4,500 版）。
+> 逐日**行数**却与 `dwd_order_detail` 完全相等 —— 说明丢的行不是"某些天整段缺失"，
+> 而是均匀散落各天。对账时必须**按天比行数**，不能直接比总量。
+
+**幂等性依赖宿主侧**：`dwd_order_sku_detail` 是 `DUPLICATE KEY` 分区表，和明细表一样
+必须**先 `DELETE` 区间再写**；但 Spark 容器里没有 `docker`，所以清理放在外壳脚本
+（`run_dwd_sku_full.sh` 第 ① 步），作业本身只负责算和写。`DELETE` 同样**不接受 `BETWEEN`**
+（报 `Where clause only supports compound predicate...`），要写 `dt >= 'a' AND dt <= 'b'`。
+
 > 这两张表都是 **PRIMARY KEY 模型**，Stream Load 是 **upsert** 语义 —— 重跑天然幂等，
 > 不需要像 DWD（DUPLICATE KEY 表）那样先 `DELETE` 区间。
 > DWS/ADS 走**制表符数据 + 逗号 `columns` 头**，DWD 明细那支走 `\|` 分隔的 CSV ——
@@ -1225,13 +1262,18 @@ DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
       —— 落 `scripts/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
       —— 实测：`dws_user_order_day` **18,000 行** / 90 天（200 用户/天 × 90）、`ads_daily_sales` **90 行**；
          `SUM(order_cnt)` 两侧都 = 854,844 ✅
-- [ ] **SCD2 时点关联改写为 Spark SQL**
-      —— 判据：与 `dwd_order_sku_detail` 逐行等价（原 763 行；放量后 90 天应是 854,844 行 × 命中率）+ 逐列指纹一致
-      —— ⚠️ **前置阻塞**：`dim_product_scd2` 只到 2026-10-02（`max(valid_from)=2026-10-02`，
-         该行 `valid_to=9999-12-31`）→ 10-03 之后的订单会 JOIN 到"最后一版"，
-         **不是当时口径**。要跑真 90 天链路，得先把商品链路放到 90 天
+- [x] **SCD2 时点关联改写为 Spark SQL** ✅ **2026-10-14**
+      —— 落 `scripts/dwd_order_sku_streamload.py` + 宿主外壳 `run_dwd_sku_full.sh`
+      —— 判据：与 `dwd_order_sku_detail` 逐行等价（原 763 行；放量后 90 天是 854,844 行）
+      —— 实测：**854,844 行**；逐日行数 **90/90 天与 `dwd_order_detail` 相等**；
+         `order_id` 去重 = 行数（无扇出）；`valid_from <> dt` / `valid_to < dt` 均为 **0**
+      —— ⚠️ 前置阻塞已解决：`dim_product_scd2` 原先只到 2026-10-02，先做了商品链路放量
+         （`ods.ods_product` 补齐 90 天 × 50 商品 = 4,500 行 → `dim_product_scd2` 4,500 行）
+      —— ⚠️ `SUM(amount)` 天然小于明细侧（内连接丢掉无当天版本的订单），**对账要按天比行数**
 - [ ] **累积快照推导改写为 Spark SQL**
-      —— 判据：与 `dwd_order_lifecycle` 逐行等价（原 900 行；放量后 90 天应是 900,000 行）+ 阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`（放量后比例应保持）
+      —— 判据：与 `dwd_order_lifecycle` 逐行等价（原 900 行；放量后 90 天应是 854,844 行）
+      —— 当前状态（2026-10-14 实测）：**900 行**，`order_time` 只覆盖 2026-09-20 ~ 2026-09-28
+         （还是放量前的演示数据）；阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`
       —— 注：用户 2026-10-14 的决定是**暂时不动 `dwd_order_lifecycle`**（见「确认的四项边界」）
 - [ ] **服务层查询不受影响** —— 必要时用 external catalog 视图过渡
       —— 判据：现有报表 SQL 结果不变
