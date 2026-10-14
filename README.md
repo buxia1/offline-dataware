@@ -451,8 +451,8 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 |---|---|---|
 | `ods.ods_order_event` | `DUPLICATE KEY` | 事件流落地（事件：`order`/`pay`/`ship`/`finish`/`cancel`）。行数 == `(order_id,event_type)` 去重对数（有防线⑤ 守着）|
 | `ods.ods_kafka_offset` | `PRIMARY KEY(topic, partition_id)` | **消费位点表** —— 记住"读到哪了"，增量摄入靠它 |
-| `dwd.dwd_order_lifecycle` | `PRIMARY KEY(order_id)` | **累积快照**：五个里程碑列 + 派生列。当前 **900 行**（09-20 ~ 09-28）|
-| `dwd.v_order_lifecycle_expected` | 视图 | 由事件流推导"期望快照"，装载与对账的**单一真相源** |
+| `dwd.dwd_order_lifecycle` | `PRIMARY KEY(order_id)` | **累积快照**：五个里程碑列 + 派生列。当前 **900,000 行**（`order_time` 2026-09-20 ~ 2026-12-18，湖仓第 2 步已下沉 Spark 重建）|
+| `dwd.v_order_lifecycle_expected` | 视图 | 由事件流推导"期望快照"。**曾是**装载与对账的单一真相源；2026-10-14 起装载改走 `scripts/dwd_order_lifecycle_streamload.py`（湖侧事件流），视图保留作参考口径 |
 
 **怎么跑**（逐天，三步）
 
@@ -867,6 +867,24 @@ Spark 几乎不动（固定开销主导：JVM + 全量 JDBC 搬运）。
 > 结果再进 StarRocks 供查询（标准「湖仓 + 数仓」混合）。那时 42% 的读开销才真正消失。
 > 这是另一件工程（要重设计 ODS 落点），不是"把清洗搬个家"。
 
+> ### ⚠️ 这条结论已于 2026-10-14 被推翻 —— 前提条件真的变了
+>
+> 上面说的"什么情况下才该重新评估"，在「下一阶段：湖仓一体」里**已经发生**：
+> 90 天 ODS 已落到 Iceberg（`lake.ods.ods_order` / `ods_order_event`），
+> Spark **直读 parquet，不再 JDBC 抽取**，那 42% 的读开销真的消失了。
+> 于是四条链路（订单明细 / SCD2 时点关联 / 累积快照 / DWS+ADS）全部改走
+> 「Spark 读湖 → 计算结果 → Stream Load 回仓」：
+>
+> | 环节 | 旧（StarRocks 内 SQL 或 JDBC 写入）| 新（Spark + Stream Load）|
+> |---|---|---|
+> | 订单明细 854,844 行写入 | JDBC **467 秒/9,475 行**（折算 ≈13 小时）| **34.0 秒**（≈25,000 行/秒）|
+> | 累积快照 900,000 行 | 仓内 `INSERT ... SELECT` + 视图 | **25.0 秒** |
+> | DWS 18,000 行 + ADS 90 行 | 仓内 SQL | 9 批合计 **67.1 秒** |
+>
+> **关键区别：新方案里没有 JDBC。** 写用 Stream Load（文件一次推给 BE），
+> 读用 Iceberg 直读。原结论没错，只是它自己写明了前提 —— 前提变了，结论就该变。
+> 详见「⭐ DWD / DWS / ADS / 累积快照 灌回仓侧」一节。
+
 ### 为什么「ODS 改用 Routine Load」值得做（与上一条相反）
 
 **结论：已实施（2026-10-09）。这是"换一种摄入方式"，不是"把清洗搬进 StarRocks"。**
@@ -1022,6 +1040,16 @@ Kafka (ods_order_event / ods_order)
 | 16 | **Spark SQL 解析器不接受中文列别名** | `[PARSE_SYNTAX_ERROR] Syntax error at or near '快'`（`SELECT count(*) AS 快照数 …`）| 元数据表自检一律用 ASCII 别名（`AS snapshots`）|
 | 17 | **Iceberg `manifests` 元数据表没有 `file_size_in_bytes` 列** | `[UNRESOLVED_COLUMN.WITH_SUGGESTION] … cannot be resolved. Did you mean [`length`, `content`, …]` | 清单大小用 `sum(length)`；只有 `files` / `all_data_files` 才叫 `file_size_in_bytes` |
 | 18 | **`expire_snapshots` 的 `older_than` 若晚于快照时间会静默不删** | 命令**执行成功、无报错**，但快照数一个没少（实测错填了快照之后的时间戳，白等一轮）| `older_than` 取 `now() - INTERVAL 1 HOUR`，再配 `retain_last => 5` |
+| 19 | **湖侧去重不能跨天** | 湖侧整表 `dropDuplicates(["order_id","event_type"])` 会把"同一订单同一事件类型但发生在不同天"的迟到/乱序事件跨天吃掉，湖比仓少 **209,772 行**（58,091 个 key 落在多天）| 去重窗口加 `dt`：`partitionBy("dt","order_id","event_type")` → 逐日 93/93 天一致、逐 key 双差集为 0 |
+| 20 | **Routine Load 追平延迟其实≈0** | 早先按"每天等 240 秒"推进，其实是判据坏了在空等（`information_schema` 没有 `LatestSourcePosition`/`OffsetLag` 列，只有 `Progress`）| 用 `Progress` 与 Kafka 末尾 offset 比；实测投递完成即追平，90 天总耗时≈生成时间 |
+| 21 | **`F.format_number()` 输出千分位逗号** | `2,995.00` 里的逗号让 BE 切错列 → **整批** `too many filtered rows`，`NumberLoadedRows` 只少几千，看着像脏数据 | 用 `col.cast("string")`；落盘后自检每行 TAB 数 |
+| 22 | **`concat_ws` 会跳过 NULL** | 可空字段为 NULL 时少输出一段，列全部左移 | 每个可空列 `coalesce(col, lit("\\N"))` |
+| 23 | **Stream Load 必须直连 BE 8040** | 打 FE 8030 回 307 到 `http://127.0.0.1:8040/...`，容器里那是 FE 自己 | URL 写 `starrocks:8040`，并带 Basic 认证 |
+| 24 | **Stream Load 必须 `Expect: 100-continue`** | 写 `-H "Expect:"` 反被拒：`There is no 100-continue header` | 显式带上，配 `--expect100-timeout` |
+| 25 | **`max_filter_ratio` 默认 1 会静默吃坏行** | 导入"成功"但少行 | 显式设 `0`，让坏行立刻暴露 |
+| 26 | **`columns` 头用逗号分隔** | 数据用 `column_separator: \t` 时顺手把 `columns` 也写成制表符 → `No viable statement for input 'user_id<TAB>dt'` | `columns` 用逗号，`column_separator` 才是数据分隔符 |
+| 27 | **JDBC 驱动必须挂进 `/opt/spark/jars/`** | 只写 `--jars` 进不了 AppClassLoader → `No suitable driver found`；挂整个目录又会顶掉 launcher | 把单文件挂到 `/opt/spark/jars/xxx.jar` |
+| 28 | **别用 JDBC 写仓** | 实测 9,475 行耗 **467 秒**（≈20 行/秒），90 万行要 ≈13 小时 | 用 Stream Load：854,844 行 **34 秒** |
 
 ### 湖层已落地的组件
 
@@ -1066,7 +1094,7 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 > 两条判据：**「快照数下降」**且**「行数不变」**，缺一不可。
 > `remove_orphan_files`（清无主文件）本次**没做** —— 先证明快照清理安全，再单独评估。
 
-### ⭐ DWD / DWS / ADS 灌回仓侧（2026-10-14，第 2 步主体）
+### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
 
 湖层 ODS 就位后，**计算下沉到 Spark**：Spark 直读 Iceberg 清洗/聚合，再把结果
 **Stream Load 回仓侧的 `dwd` / `dws` / `ads`**。仓侧表结构、下游查询、DolphinScheduler
@@ -1189,6 +1217,8 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 | 24 | **`max_filter_ratio` 默认 1 会静默吃掉坏行** | 导入"成功"但少行，还很可能是你有 bug | 显式 `max_filter_ratio: 0`（实测 `filtered=0`）|
 | 25 | **`columns` 头用逗号分隔，不是制表符** | 数据用 `column_separator: \t` 时，容易顺手把 `columns` 也写成制表符分隔 → BE 报 `plan streaming load failed. errmsg=Getting syntax error at line 1, column 17. Detail message: No viable statement for input 'user_id<TAB>dt'` | `columns: user_id,dt,...`（逗号）+ `column_separator: \t`（数据用制表符）；或干脆省略 `columns` 头，靠落盘字段顺序 |
 | 26 | **Spark 没有一种顺手的"写多列纯文本行"方式** | 依次试过 `df.write.text()`（只吃单列 string，报 `UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE`）、`df.toJSON().write`（toJSON 返回 RDD，没有 `.write`）、`createDataFrame(toJSON(), "value string")` / `StructType` / `rdd.toDF(schema)`（全部报 `CANNOT_ACCEPT_OBJECT_IN_TYPE StructType can not accept object '{"user_id":7,...}' in type str`）| 用 `F.concat_ws(TAB, *[col(c).cast("string")])` 在 **Spark SQL 内部**拼成单列，再 `write.text()`；`text()` 写出来是**目录**（`IsADirectoryError`），要自己合并 part-* |
+| 27 | **`F.format_number()` 会输出千分位逗号，把整行切错** | `F.format_number(amount, 2)` 走 `java.text.DecimalFormat`，`2995.00` 被写成 `2,995.00`；BE 按逗号切分 → 该行字段数不对 → **整批**报 `too many filtered rows`（`NumberLoadedRows` 只差几千，看着像"脏数据"而不是格式 bug）| 用 `F.col(c).cast("string")`（DECIMAL→字符串不带千分位）；或 `F.regexp_replace(format_number(c,2), ",", "")` |
+| 28 | **`concat_ws` 会跳过 NULL，导致整列错位** | 可空字段为 `NULL` 时 `concat_ws` 直接少输出一段，15 列变 14 列，后续列全部左移 | 每个可空列先 `F.coalesce(col, F.lit("\\N"))`（StarRocks 认的 NULL 字面量）；落盘后自检"每行 TAB 数 = 列数-1"再推给 BE |
 
 > 坑 25 的"别回头改"记录：`probe_cols3.py`（容器内直发 PUT）实测四种写法 ——
 > `columns` 制表符分隔 = `Fail`；逗号分隔 / 逗号+空格 / 不写 `columns` = **都是 `Success`**。
@@ -1198,6 +1228,52 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 > ⚠️ 驱动 jar 必须**挂进 `/opt/spark/jars/` 这个目录下**（挂单个文件到 `/opt/spark/jars/xxx.jar`），
 > 只写 `--jars` 的话驱动进不了 AppClassLoader，会报 `No suitable driver found`。
 > 项目里已有 `ds/libs/mysql-connector-java-8.0.30.jar`，直接用它。
+
+#### 累积快照链路：`scripts/dwd_order_lifecycle_streamload.py`（宿主外壳 `run_lifecycle.sh`）
+
+`dwd.dwd_order_lifecycle` 的口径原本是仓内视图 `dwd.v_order_lifecycle_expected`：
+按 `order_id` 聚五个里程碑（`MAX(CASE WHEN event_type='...' THEN event_time END)`）
++ `MAX(user_id/product_id/amount)`，再派生 `current_stage` / `pay_lag_hours` /
+`ship_lag_days` / `finish_lag_days`。Spark 侧**逐字照搬**，只把事实侧来源从仓侧
+`ods.ods_order_event`（3,120,421 行、含 150,842 行同日重复）换成**湖侧
+`lake.ods.ods_order_event`（2,969,579 行、按 `(dt, order_id, event_type)` 去重）**。
+
+**为什么换源不改变结果**：里程碑取的是 `MAX(event_time)`，同一事件类型的重复副本
+**不会改变 MAX**，所以按天去重与不去重的聚合结果相同 —— 实测已验证（见下表）。
+
+```bash
+# 全量重建（外壳会先 TRUNCATE，因为 upsert 删不掉"已不在快照里"的订单）
+bash scripts/run_lifecycle.sh full
+# 只算不写：验证行数 + 落盘自检（列数 / 千分位逗号）
+bash scripts/run_lifecycle.sh dry
+```
+
+**实测（2026-10-14）**：
+
+| 指标 | 数值 |
+|---|---|
+| 湖层事件行数 | 2,969,579 → 聚合 **900,000** 个订单 |
+| 仓侧 `dwd.dwd_order_lifecycle` | **900,000 行**（6 个 part 全部写入，`loaded=900000`）|
+| 耗时 | **25.0 秒**（旧仓内链路放量前 900 行都要几十秒）|
+| `order_time` 覆盖 | 2026-09-20 00:00:29 ~ 2026-12-18 23:59:37 |
+| 阶段分布 | `finish=504000 ship=106000 pay=109488 order=91512 cancel=89000` |
+
+**与旧视图的逐项对账（同一份湖数据上，Spark 结果 vs 仓内 SQL 重算）** —— 全部相等：
+
+| 摘要项 | Spark 落库 | 仓内 SQL 重算 |
+|---|---|---|
+| 行数 / `order_id` 去重 | 900000 / 900000 | 900000 / 900000 |
+| `sum(amount)` | 144,975,064.50 | 144,975,064.50 |
+| `sum(pay_lag_hours)` / `ship_lag_days` / `finish_lag_days` | 3143093 / 1736000 / 3000000 | 同 |
+| 五个 `current_stage` 计数 | 504000 / 106000 / 109488 / 91512 / 89000 | 同 |
+| `min(order_time)` / `max(order_time)` | 2026-09-20 00:00:29 / 2026-12-18 23:59:37 | 同 |
+
+> ✅ **口径等价性已被这条对账证明**，因此 `dwd.v_order_lifecycle_expected` 视图
+> 可以继续留着当"单一真相源"参考，但装载动作已不再走它。
+
+**幂等性**：`dwd_order_lifecycle` 是 `PRIMARY KEY(order_id)` 表，Stream Load 是 **upsert**；
+但全量重建的语义是"表里不该有已消失的订单"，upsert 做不到删除，所以外壳先 `TRUNCATE`
+再一次性灌全量。分片写多批时 label 带批次号，重复执行会返回 `Label Already Exists`。
 
 ### 分阶段推进清单
 
@@ -1270,11 +1346,16 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
       —— ⚠️ 前置阻塞已解决：`dim_product_scd2` 原先只到 2026-10-02，先做了商品链路放量
          （`ods.ods_product` 补齐 90 天 × 50 商品 = 4,500 行 → `dim_product_scd2` 4,500 行）
       —— ⚠️ `SUM(amount)` 天然小于明细侧（内连接丢掉无当天版本的订单），**对账要按天比行数**
-- [ ] **累积快照推导改写为 Spark SQL**
-      —— 判据：与 `dwd_order_lifecycle` 逐行等价（原 900 行；放量后 90 天应是 854,844 行）
-      —— 当前状态（2026-10-14 实测）：**900 行**，`order_time` 只覆盖 2026-09-20 ~ 2026-09-28
-         （还是放量前的演示数据）；阶段分布 `pay=279 ship=250 finish=180 order=111 cancel=80`
-      —— 注：用户 2026-10-14 的决定是**暂时不动 `dwd_order_lifecycle`**（见「确认的四项边界」）
+- [x] **累积快照推导改写为 Spark SQL** ✅ **2026-10-14**
+      —— 落 `scripts/dwd_order_lifecycle_streamload.py` + 宿主外壳 `run_lifecycle.sh`
+      —— 判据：与旧视图 `dwd.v_order_lifecycle_expected` 口径等价
+      —— 实测：湖侧 2,969,579 事件行 → **900,000 个订单**（`order_time` 覆盖
+         2026-09-20 ~ 2026-12-18），**25.0 秒**灌完；与仓内 SQL 重算的
+         行数 / `sum(amount)` / 三个 lag 求和 / 五个 stage 计数 / `min|max(order_time)`
+         **逐项相等**（见「累积快照链路」一节）
+      —— ⚠️ 期望行数 **不是 854,844**：`dwd_order_detail` 少了 `user_id IS NULL` 的
+         45,156 单，而累积快照按 `order_id` 聚合事件、**包含**这些单（占位 `user_id=NULL`）
+      —— ℹ️ 用户 2026-10-14 曾决定"暂时不动"，本步是**用户改主意后**才做的（m04729）
 - [ ] **服务层查询不受影响** —— 必要时用 external catalog 视图过渡
       —— 判据：现有报表 SQL 结果不变
 
