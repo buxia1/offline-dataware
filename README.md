@@ -820,7 +820,7 @@ docker compose restart dolphinscheduler
       —— 两条常驻作业 `ods_order_event_load` / `ods_order_load`，Exactly-Once；
       退役了位点表 + 199 行 Python + 130 行外壳；新增 `check_routine_load.sh` + DS 工作流 `routine_load_health`。
       详见「幂等性 → ODS 摄入」一节。
-- [ ] ⭐ **下一阶段：湖仓一体** —— 见下方「下一阶段：湖仓一体」一节（含**分阶段推进清单**：第 0 步修地基 / 第 1 步湖层只读旁路 / 第 2 步 DWD 下沉 Spark / 第 3 步放量）
+- [x] ⭐ **下一阶段：湖仓一体** —— 第 0 步（修地基）+ 第 1 步（湖层只读旁路）**已完成**；第 2 步 / 第 3 步未开始。见下方「下一阶段：湖仓一体」一节
       —— 边界已定：**Iceberg + 本地文件系统（MinIO-ready）**；先 1000 单/天跑通、再上 1 万单/天 × 90 天
       —— **这一条正是上方那条被否决待办的"前提条件"**（原文：改数据落点后才该重新评估）
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
@@ -925,10 +925,12 @@ DS 里不再有摄入节点会变红，所以必须补 `routine_load_health` 工
 
 ---
 
-## 下一阶段：湖仓一体（方案已定，待实施）
+## 下一阶段：湖仓一体（第 1 步已落地）
 
-> **状态**：方案已与用户确认边界，**尚未实施**。本节的实测数据均为 2026-10-09 在
-> `D:\develop\workspace\deepseek_harness_temp` 用临时探针验证所得，**未改动本项目任何文件**。
+> **状态**：**第 0 步（修地基）+ 第 1 步（湖层只读旁路）已完成** —— 2026-10-14 跑通
+> 90 天（2026-09-20 ~ 2026-12-18）灌湖，湖↔仓逐 key 对账**零差异**。
+> 第 2 步（DWD 计算下沉 Spark）、第 3 步（放量）**未开始**。
+> 本节其余实测数据为 2026-10-09 探针所得（那部分确实未改动项目文件）。
 
 ### 确认的四项边界
 
@@ -1017,6 +1019,49 @@ Kafka (ods_order_event / ods_order)
 | 13 | ⭐ **bind mount 是"替换"不是"合并"——挂目录会盖掉镜像原有内容** | 把 `./spark/jars` 挂到 `/opt/spark/jars` 后，容器里 jar 总数从 **252 变成 1**，Spark 直接 `ClassNotFoundException: org.apache.spark.launcher.Main` 起不来 | **挂单个文件**（`./spark/jars/x.jar:/opt/offline-dw/jars/x.jar`），别挂会与镜像内容重叠的目录 |
 | 14 | **`fe.conf` 要挂目录、单个 jar 要挂文件——方向相反** | 坑 8 与坑 13 看似矛盾 | 判据是**容器启动时会不会写这个路径**：会写（`fe.conf`）就挂目录；只读（jar）就挂文件到**独立路径** |
 | 15 | **国内拉 Maven 大 jar 裸 `curl -O` 会中途断流** | `curl: (35) error:0A000126:SSL routines::unexpected eof while reading`，实测卡在 24 MB / 44 MB 不动 | 加 `--retry 5 --retry-all-errors -C -`（断点续传），或换国内镜像 |
+| 16 | **Spark SQL 解析器不接受中文列别名** | `[PARSE_SYNTAX_ERROR] Syntax error at or near '快'`（`SELECT count(*) AS 快照数 …`）| 元数据表自检一律用 ASCII 别名（`AS snapshots`）|
+| 17 | **Iceberg `manifests` 元数据表没有 `file_size_in_bytes` 列** | `[UNRESOLVED_COLUMN.WITH_SUGGESTION] … cannot be resolved. Did you mean [`length`, `content`, …]` | 清单大小用 `sum(length)`；只有 `files` / `all_data_files` 才叫 `file_size_in_bytes` |
+| 18 | **`expire_snapshots` 的 `older_than` 若晚于快照时间会静默不删** | 命令**执行成功、无报错**，但快照数一个没少（实测错填了快照之后的时间戳，白等一轮）| `older_than` 取 `now() - INTERVAL 1 HOUR`，再配 `retain_last => 5` |
+
+### 湖层已落地的组件
+
+| 组件 | 路径 | 作用 |
+|---|---|---|
+| 湖层 DDL | `sql/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
+| 灌数脚本 | `scripts/lake_ods_replay.sh` + `.py` | `bash scripts/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
+| 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
+| 维护脚本 | `scripts/lake_maintain.py` | 只读盘点 + `--expire --keep N` 清历史快照 |
+
+**实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
+`ods_order_event` 2,969,579 行。湖↔仓逐 key 差集**双向为 0**（见下方推进清单第 1 步）。
+
+> ⚠️ `--dry-run` 必须放在 `.py` **之后**（应用参数区）。`spark-submit` 只认自己前面的选项，
+> 放前面会报 `Error: Unrecognized option: --dry-run`（脚本里已注释说明）。
+
+### ⭐ 湖表快照清理（Iceberg 元数据会无限堆积）
+
+**为什么必须做**：Iceberg 每次写入都留一个新快照，历史快照各自带一份 manifest。
+90 天全量灌完后实测：`ods_order` **181 个快照**、`ods_order_event` **184 个**，
+而真正的数据只有 90 / 93 个 parquet（8.3 MB / 41.8 MB）——**152 MB 里约 60 MB 是元数据**。
+
+```bash
+# 只盘点，不删任何东西
+docker exec spark /opt/spark/bin/spark-submit --master local[2] --driver-memory 1g \
+  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
+  /opt/offline-dw/scripts/lake_maintain.py
+
+# 真清理：保留最近 5 个快照
+docker exec spark /opt/spark/bin/spark-submit --master local[2] --driver-memory 1g \
+  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
+  /opt/offline-dw/scripts/lake_maintain.py --expire --keep 5
+```
+
+**实测效果（2026-10-14）**：快照 181 / 184 → **各 5 个**；表目录 **152 MB → 92 MB**（回收 60 MB）；
+耗时 9.3 s + 14.6 s；清理后 `lake.ods.ods_order_event` 仍 **2,969,579 行**、`ods_order` 仍 **900,000 行**，
+一条不少（快照存活不影响当前数据，只影响「时间旅行」能回看多久）。
+
+> 两条判据：**「快照数下降」**且**「行数不变」**，缺一不可。
+> `remove_orphan_files`（清无主文件）本次**没做** —— 先证明快照清理安全，再单独评估。
 
 ### 分阶段推进清单
 
@@ -1043,14 +1088,28 @@ Kafka (ods_order_event / ods_order)
       —— **挂法**：`./spark/jars/iceberg-spark-runtime-...jar:/opt/offline-dw/jars/...jar`（**单文件挂到独立路径**），作业里用 `--jars` 引用
       —— ⚠️ 不能挂 `./spark/jars` 整个目录 —— 会把镜像自带的 252 个 jar 全盖掉（见坑 13）
       —— ⚠️ jar 不进版本库（`.gitignore` 已有 `spark/jars/*.jar`）；下载要用 `--retry` + `-C -`（见坑 15）
-- [ ] **重放历史 8 天灌湖** —— 用生成器（09-20 ~ 09-27），**只旁路、不碰现有链路**
-      —— 判据：Iceberg 落出 `metadata/*.metadata.json` + `data/dt=*/**.parquet`
-- [ ] **让 StarRocks 发现湖层表** —— 建 external catalog（`iceberg.catalog.type=hadoop`，**无需 Hive Metastore**）
-      —— 判据：`SHOW DATABASES FROM <catalog>` 有库；`SELECT count(*)` 能跑通
-- [ ] **行数与逐行对账** —— 湖层结果 == StarRocks 对应表
-      —— 判据：行数一致；`dwd_equiv.sh` 逐行全列 diff + 逐列指纹一致
-- [ ] **确认现有链路零影响**
+- [x] **重放历史灌湖** —— 从 8 天先跑通，再放到 **90 天（2026-09-20 ~ 2026-12-18）**；**只旁路、不碰现有链路**
+      —— 实测：`data/dt=*/**.parquet` 90 个分区；两表各 90 / 93 个数据文件
+- [x] **让 StarRocks 发现湖层表** —— 建 external catalog（`iceberg.catalog.type=hadoop`，**无需 Hive Metastore**）
+      —— 实测：`lake.ods.ods_order` / `lake.ods.ods_order_event` 可 `SELECT count(*)`
+- [x] **行数与逐行对账** —— 湖层结果 == StarRocks 对应表（**按天 + `(dt,order_id,event_type)` 去重口径**）
+      —— 实测：仓侧 raw 3,120,421 → 去重 **2,969,579** == 湖侧 **2,969,579**；
+         双向差集 `wh_only = 0` / `lake_only = 0`；`ods_order` 两侧均 900,000
+      —— ⚠️ **口径不对齐时 90 天没有一天对得上**（湖区每天比仓区少 398~658 行）——
+         根因是**先按 dt 过滤、再去重**，会把 dt 恰好落在窗口外的历史事件整行丢掉；
+         已改为**按天去重**（`sql/lake_ods.sql` + `scripts/lake_ods_replay.py`，commit `7ba26ff`）
+- [x] **确认现有链路零影响**
       —— 判据：「运维命令」里各项检查全部仍然通过（800/2379/763/763/900/601/8 + 两条 DQC `EXIT=0`）
+- [x] **湖表维护：清历史快照** —— 见上方「湖表快照清理」
+      —— 实测：快照 181 / 184 → 各 5 个；**152 MB → 92 MB**；行数不变（安全）
+- [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
+      —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs
+         湖侧 2,969,579 行 —— 差的就是 Routine Load 持续吃进的重复/新事件；
+         对齐口径永远是**当天去重后的 (dt, order_id, event_type)**
+
+> ✅ **第 1 步完成（2026-10-14）**。与计划的一处偏差：分区已从 90 天 = 90 个空分区的隐患
+> 变成 Iceberg **隐藏分区**（`PARTITIONED BY (dt)`），没有空分区堆积问题，
+> 下方第 3 步的重定分区与桶数针对的是**仓侧 StarRocks 表**，仍然要做。
 
 **第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运）
 
