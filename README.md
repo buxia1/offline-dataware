@@ -1045,16 +1045,19 @@ Kafka (ods_order_event / ods_order)
 而真正的数据只有 90 / 93 个 parquet（8.3 MB / 41.8 MB）——**152 MB 里约 60 MB 是元数据**。
 
 ```bash
-# 只盘点，不删任何东西
-docker exec spark /opt/spark/bin/spark-submit --master local[2] --driver-memory 1g \
+# 只盘点，不删任何东西（实测：零写入、可随时跑）
+docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake_maintain.py
 
 # 真清理：保留最近 5 个快照
-docker exec spark /opt/spark/bin/spark-submit --master local[2] --driver-memory 1g \
+docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake_maintain.py --expire --keep 5
 ```
+
+> `spark` 容器已把 `./scripts` 和 `./lake` 都挂进去了（`/opt/offline-dw/scripts`、`/opt/offline-dw/lake`），
+> **不需要临时容器**；只要 `iceberg-spark-runtime` 那个 jar 用 `--jars` 指到 `/opt/offline-dw/jars/` 下即可。
 
 **实测效果（2026-10-14）**：快照 181 / 184 → **各 5 个**；表目录 **152 MB → 92 MB**（回收 60 MB）；
 耗时 9.3 s + 14.6 s；清理后 `lake.ods.ods_order_event` 仍 **2,969,579 行**、`ods_order` 仍 **900,000 行**，
