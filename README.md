@@ -72,7 +72,8 @@ offline-dw/
 │   ├── dimension-modeling.md       商品维度建模（SCD1/SCD2）
 │   ├── dolphinscheduler-workflow.md  DS 工作流的节点配置
 │   ├── dolphinscheduler-order-event-chain.md  订单事件链路（累积快照）
-│   └── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 已修 5 处缺陷的验收判据 / 交接步骤）
+│   ├── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 已修 5 处缺陷的验收判据 / 交接步骤）
+│   └── ds-wiring-spec.md           ⭐ DS 调度接线规格（每天跑什么 / 节点怎么串 / 接线前的坑）
 ├── sql/                            各层建表与转换 SQL
 │   │   ── ODS（贴源）──
 │   ├── ods/ods_order.sql                   订单落地（按天去重）
@@ -1594,7 +1595,13 @@ dolphin/
 
 #### 📘 湖侧链路操作手册（交接给你执行）
 
-`docs/lake-tier-runbook.md` —— 湖侧 DWD/DWS/ADS 的**操作手册 + 已知缺陷清单 + 下一步 4 步 + 终局验收清单**。
-其中 5 处已知缺陷（`run_lake_dwd.sh` 用 `append` 会重复追加、三个 runner 写死 `/mnt/d/...` 路径、
-SKU 关联用 `inner` 会静默丢单、lifecycle 增量语义不完整、湖侧写入无自检）**尚未修复**，
-动手前先按手册第 1 节改掉。
+`docs/lake-tier-runbook.md` —— 湖侧 DWD/DWS/ADS 的**操作手册 + 缺陷修复验收判据 + 下一步 + 终局验收清单**。
+其中 5 处缺陷（旧 `run_lake_dwd.sh` 用 `append` 重复追加、runner 写死 `/mnt/d/...` 路径、
+SKU 关联用 `inner` 静默丢单、lifecycle 增量语义不完整、湖侧写入无自检）**已于 2026-10-14 全部修复**
+（见手册附录 A 的逐条验收判据）。
+
+#### 📘 DS 调度接线规格（交接给你在 DS 里建）
+
+`docs/ds-wiring-spec.md` —— 湖仓新架构下**每天要跑的 4 条命令**、`offline_dataware` 等流程的
+**节点顺序 / 命令 / 依赖 / 重试策略**、旧节点处置清单，以及接线前必须解决的两个坑
+（`scripts/lake/run_dwd.sh` 的 `docker run -v` 源路径由宿主 daemon 解析、`scripts/lake/run_dim.sh` 依赖 Windows 临时目录）。

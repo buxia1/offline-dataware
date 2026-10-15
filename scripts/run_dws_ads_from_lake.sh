@@ -17,7 +17,7 @@
 #     （不带参数）     【默认】自动增量：区间由水位算出来，见下方「区间怎么来」
 #     --auto          同默认（显式写法，便于调度里自解释）
 #     --range D1 D2    手工指定区间（YYYY-MM-DD）；只给 D1 时 D2 取同一天
-#     --lookback N     自动增量时往前多算 N 天（默认 2，用于迟到事件回捞）
+#     --lookback N     自动增量时往前多算 N 天（默认 3，用于迟到事件回捞）
 #     --truncate       全量重灌：先 TRUNCATE 两张仓表，再把 lake.dwd 全区间灌一遍
 #     --dry-run, -n    只做【只读】校验：湖侧区间行数/天数/金额、仓侧 dws/ads 现状；
 #                      不 TRUNCATE、不 DELETE、不 INSERT，不写库
@@ -132,7 +132,7 @@ usage() {
   （不带参数）    【默认】自动增量：D1 = 仓侧 dws.MAX(dt) - (lookback-1)，D2 = 湖侧 dwd.MAX(dt)
   --auto          同默认（显式写法）
   --range D1 D2   手工指定区间（YYYY-MM-DD）
-  --lookback N    自动增量时往前多算 N 天（默认 2，迟到事件回捞窗口）
+  --lookback N    自动增量时往前多算 N 天（默认 3，迟到事件回捞窗口）
   --truncate      全量重灌（先 TRUNCATE 两张仓表，再灌全区间）
   --dry-run, -n   只读校验，不写库
 示例：
