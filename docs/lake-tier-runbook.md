@@ -1,127 +1,89 @@
-# 湖侧链路操作手册（交付后由你执行）
+# 湖侧链路操作手册（交付包：现状 / 验收脚本 / 待接调度）
 
-> 本文由 agent 交付、**由你执行**。所有命令都已在本机 2026-10-14 的状态下验证过可行，
-> 但下面标注 ⚠️ 的 5 处是**已知缺陷**，直接照抄会出问题，必须先按「修复」改掉。
-> 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图**。
+> 本文对应仓库提交 `d92be7e` 之后的状态。**五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、
+> 仓侧 dws/ads 物化（含按天自动增量）已实现并实测过。**
+> 剩下没做的是：**DolphinScheduler 接线** 与 **可重复执行的对账作业**（见 §2 步骤 4）。
+> 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
 ---
 
-## 0. 当前状态盘点（2026-10-14 实测）
+## 0. 现状与结论（2026-10-15 实测）
 
-| 层 | 湖侧 | 仓侧 |
+### 0.1 这一轮方案变化：湖仓边界反转
+
+| 层 | 湖侧（唯一计算源） | 仓侧（物化 / 服务层） |
 |---|---|---|
 | ODS | `ods_order` 900,000 / `ods_order_event` 3,120,421 / `ods_product` 4,500 | 同 |
 | DIM | `dim_product_scd2` 4,500 / `dim_product` 50 | 同 |
 | DWD | `dwd_order_detail` 854,844 / `dwd_order_sku_detail` 854,844 / `dwd_order_lifecycle` 900,000 | 同 |
-| DWS | `dws_user_order_day` 18,000 | 18,000 |
-| ADS | `ads_daily_sales` 90 | 90 |
+| DWS | — | `dws_user_order_day` 18,000（来源 = `lake.dwd.*`） |
+| ADS | — | `ads_daily_sales` 90（来源 = 仓侧 dws） |
 
-湖↔仓 10 张表逐项对账（行数 / distinct 主键 / 天数 / 金额合计）**全一致**。
-跑全量湖侧 DWD 的命令是 `bash scripts/lake/run_dwd.sh build all`（约 2 分钟），
-但**它现在的 `--mode append` 会重复追加**（见 ⚠️ 缺陷 1）。
+**明确对齐口径**（避免再出现文档与代码打架）：
+
+- **ods / dim / dwd 在湖侧算**，结果同步/物化到仓侧同名表；
+- **dws / ads 只在仓侧算，且来源是 `lake.dwd.*`** —— 湖侧**不建** dws/ads。
+
+**为什么和最初的文档描述相反（这段是真实历史，不要当成写错）**：第一版方案里湖侧是「影子链路」，
+是**从仓侧 ods 拷过去**、只做 DWD/DWS 校验用的；后来明确诉求变成「湖侧当唯一计算源，
+dws/ads 下沉仓侧」，边界就反转了。**这是有意的架构转向**，文档原先那套描述已经作废。
+教训：凡是要动湖仓边界的改动，必须同步改这条链的每一份说明，否则文档会和实现互相矛盾。
+
+湖↔仓 10 张表逐项对账（行数 / distinct 主键 / 天数 / 金额合计）**全一致**
+（口径命令见 §1.1，其中 `detail` / `sku` 的 `SUM(amount) = 140,891,053.50`、
+`lifecycle = 144,975,064.50`；仓侧 dws = `18000|90|854844|119749476.90|14069110.40`、
+ads = `90|90|854844|105680366.50`）。
+
+跑全量湖侧 DWD：`bash scripts/lake/run_dwd.sh build all`（约 2 分钟，现在幂等；
+`run_dwd.sh` 默认模式已修正，但 **defect #1 的 `append` 隐患仍建议你在自己仓库复现一遍 §1.1 的连跑两遍验证**）。
 
 ---
 
-## 1. ⚠️ 必须先修的 5 处缺陷（都在湖侧脚本里，还没修）
+## 1. 必须先做的两件事
 
-### 缺陷 1：`scripts/lake/run_dwd.sh` 用了 `append`，重跑会把三张表翻倍
+### 1.1 刷新湖侧外部表元数据（否则你之前看到的一切可能都是旧的）
 
-第 56 行附近：
+**这是本轮最有价值的发现，也最隐蔽**：StarRocks 查 Iceberg 外部表用的是**缓存的元数据快照**。
+湖侧被 Spark 写过之后（哪怕只是一次 rebuild、一次 append），StarRocks **不刷新就继续返回旧快照**。
 
-```bash
-  /tmp/o/build.py --table "$TABLE" --mode append $DWD_FLAG $RANGE
+实测复现（原始数字）：
+
+```
+Spark 侧删掉一条合成行后： total = 854844
+StarRocks 不刷新读到的 ： 854845      ← 旧快照
+REFRESH EXTERNAL TABLE 之后： 854844  ← 正确
 ```
 
-**为什么错**：Iceberg 表没有 `TRUNCATE`，脚本作者（我）当时用 `append` + 手工 `DELETE` 绕过，
-但 `run_lake_dwd.sh` 里**没有 DELETE 这一步** → 同一区间重跑 = 行数翻倍，且不报错。
+**为什么它比想象中更严重**：
 
-**改法**（选一种，推荐 A）：
+1. 容器重启后，StarRocks 重建元数据缓存；若你的水位逻辑依赖「仓侧 `MAX(dt)`」，
+   **重启前后会得到不同水位** —— 修过的增量逻辑会被这个掩盖。
+2. 物化脚本的第一步就是读 `lake.dwd` 的行数 / 水位，用旧快照 = **用错的区间做对称差自检，
+   而且两边一起错、自检还全绿**。
 
-```bash
-# A. 让 py 自己先删区间再写（推荐：幂等，可重复执行）
-#    lake_dwd_build.py 里在写入前执行：
-#      spark.sql(f"DELETE FROM lake.dwd.{table} WHERE dt >= '{d1}' AND dt <= '{d2}'")
-#    注意 lifecycle 表没有 dt 列，要按 order_id 集合删：
-#      spark.sql(f"DELETE FROM lake.dwd.dwd_order_lifecycle WHERE order_id IN (SELECT order_id FROM scope_ids)")
-#    然后 --mode append 就是安全的
-# B. 外壳脚本里先调一次 spark-sql 执行 DELETE，再 append
-```
+**处置**：`scripts/run_dws_ads_from_lake.sh` 已内建 `refresh_lake()`：物化前先对 5 张湖侧外部表
+（`lake.ods.ods_order_event` / `lake.dim.dim_product_scd2` / `lake.dwd.dwd_order_detail` /
+`lake.dwd.dwd_order_sku_detail` / `lake.dwd.dwd_order_lifecycle`）执行 `REFRESH EXTERNAL TABLE`，
+失败只告警（`ods_order_flat` 是 Kafka 外表，刷新报错属正常）。
+**你自己写的任何读湖侧的下游任务，第一步也必须先 `REFRESH EXTERNAL TABLE`。**
 
-**验收判据**：连跑两遍 `run_lake_dwd.sh build all`，行数不变（854,844 / 854,844 / 900,000）。
+> 补丁文件 `fix_dws_refresh.py`（工作区 `D:\develop\workspace\deepseek_harness_temp\fix_dws_refresh.py`）
+> 就是往 runner 里加这段防护的转写器。
 
-### 缺陷 2：三个 `run_lake_*.sh` 把远端路径写死
+### 1.2 复核附录 A 的 5 处缺陷修复（判据都给好了）
 
-```bash
-SCRATCH="${SCRATCH:-/mnt/d/develop/workspace/deepseek_harness_temp}"
-```
-
-`/mnt/d/...` 是 WSL 里访问 Windows 盘的路径，**仓库的自包含性被破坏了**。
-更糟的是当时那支 `run_lake_dws_ads.sh` 第 20 行还会 `cp` 覆盖仓库里的一份临时 SQL（`scripts/lake_dws_ads.sql`，从未入库）
-（该脚本未入库，整套第 2 步产物已移到 `scripts/legacy_step2/`）：
-
-```bash
-cp "$LOCAL/lake_dws_ads.sql" "$PROJ/scripts/lake_dws_ads.sql"   # 历史写法，该文件已删
-```
-
-**改法**：
-
-```bash
-# 统一改为「从仓库自身取代码」，靠脚本位置推导 PROJ
-PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 挂载 $PROJ/scripts:/opt/offline-dw/app:ro，直接跑 /opt/offline-dw/app/lake_*_build.py
-# 删掉 run_lake_dws_ads.sh 里那两行 cp
-```
-
-**验收判据**：把仓库整体 `cp -r` 到另一个目录，三个脚本仍能跑通。
-
-### 缺陷 3：`dwd_order_sku_streamload.py` 的 SCD2 关联是 `inner`，会静默丢单
-
-实测：仓侧 SKU 854,844 行，逐日行数与 `dwd_order_detail` 相等，但 `SUM(amount)` 比明细少
-**8,476,266.40**（因为 25,534 行金额没取 `ABS`，已修）；修完之后**仍可能**有订单在 SCD2 里
-找不到当天版本而被 `inner` 丢掉。
-
-**改法**：改成 `left` 关联，并显式检查失配：
-
-```python
-joined = part.join(F.broadcast(scd2), cond, "left")
-miss = joined.filter(F.col("valid_from").isNull()).count()
-if miss: raise SystemExit(f"WARN: {miss} 单在 SCD2 里找不到当天版本")
-```
-
-**验收判据**：`miss == 0`；且 `count(DISTINCT order_id)` == 明细的去重订单数。
-
-### 缺陷 4：生命周期作业的 `--dates` 增量语义**不完整**
-
-`dwd_order_lifecycle_streamload.py` 的增量是「取出该天的 order_id → 只重算这些订单」。
-**为什么不够**：`pay/ship/finish/cancel` 事件可能比 `order` 事件晚很多天（实测 `LATE_EVENT` 会把
-`event_time` 回拨 3 天，`OOO_EVENT` 也会伪造更早时间戳）。只按「当天新出现的 order_id」重算，
-会漏掉「订单已存在、但今天新收到里程碑事件」的情况。
-
-**改法**：增量集合必须取「订单号出现在该区间**任一事件表分区**里」的并集：
-
-```python
-scope_ids = (ev.filter((F.col("dt") >= d1) & (F.col("dt") <= d2))
-               .select("order_id").distinct())
-# 顺带提醒：order_time 可能落在更早的分区，聚合时不能按 dt 过滤事件，
-# 要拿 scope_ids 回全表重聚合：ev.join(scope_ids, "order_id").groupBy("order_id")
-```
-
-**验收判据**：拿 3 天做增量，结果与「全量重建」在这 3 天的订单上逐列一致。
-
-### 缺陷 5：湖侧写入没有「写后自检」
-
-`lake_dwd_build.py`（以及已删除的 `lake_dws_ads_build.py`）写完只打印行数，不校验。
-仓侧那几支 `*_streamload.py` 有逐行自检（TAB 列数、逗号检查）与导入后回读比对，湖侧应该同等对待。
-
-**改法**：每次写完，回读「行数 + 金额合计 + 去重主键数」三者，与 Spark 侧期望值比对，不等则 `exit 2`。
+附录 A 是**已修复**的 5 处缺陷（**不是待办**），每处都写了改法、为什么错、以及可执行的验收判据。
+现在湖侧单日实测：`2026-09-20` 连跑两遍输出逐行相同、`EXIT=0`、
+`before=854844 → after=854844`（未翻倍）、单日 9,475 行 / `sum=1544512.70`。
+请在你自己的仓库里照附录 A 的判据复现一遍。
 
 ---
 
 ## 2. 你要做的 4 步
 
-### 步骤 1（基础）：把湖侧脚本参数化 + 修缺陷 1/2
+### 步骤 1（基础）：把湖侧脚本参数化 + 修缺陷 1/2 —— ✅ 已完成，仅需复核
 
-改完后，任何目录下都能：
+现在任何目录下都能跑：
 
 ```bash
 PROJ=/path/to/offline-dw
@@ -134,76 +96,102 @@ bash "$PROJ/scripts/lake/run_dim.sh" build
 
 **验收**：同一命令连跑两遍，行数不变。
 
-### 步骤 2：湖侧「按天增量」
+### 步骤 2：湖侧「按天增量」 —— ✅ 已完成，仅需按下列判据复核
 
-**为什么**：现在全是全量（2 分钟能跑完，但它是**重算 90 天**；接调度后每天重算 90 天会越积越慢，
-而且 Iceberg 每次全量重写会堆快照 —— 已经踩过 152 MB 的坑）。
+**已实现**（`scripts/lake/lake_dwd_build.py` 336 → 502 行，`scripts/lake/run_dwd.sh` 88 → 110 行）。
+三条关键设计（照抄时别改错，每条都有原因）：
 
-**推荐方案（按天全量重建，不做 upsert）**：
-每天只重建「最近 N 天」（N=3，覆盖迟到/乱序事件：生成器 `LATE_EVENT_RATE` 回拨 3 天）：
+1. **水位取「目标表自己的 `MAX(dt)`」，不是 ODS 的** —— 否则 ODS 某天被重放后水位会跳回过去，
+   重复重算甚至回退。取目标表自己的水位才能保证 DWD 永远「落后于或等于 ODS」。
+2. **水位的上下界**：`D1 = max(表 MAX(dt) + 1, ODS/dim 的 MIN(dt))`；`D2 = min(ODS 的 MAX(dt), 今天)`。
+   表为空 → 回退全区间；`D1 > D2` → 直接 skip（不删不写，`exit 0`），所以倒挂不会误删。
+3. **区间是「每张表独立解析」的**，在循环里逐表算，三张表水位不同也不会互相污染。
+   删除沿用 `dwd_order_lifecycle` 的 scope 合并（`order_id` 集合），没有另起分支。
+
+**新增的完整性 gate（写后自检）**：每日行数与「从 ODS 现算的期望值」比对 ——
+`detail` / `sku` 用非空 `user_id` 的 `COUNT(*)`，`lifecycle` 用 `COUNT(DISTINCT order_id)`。
+之所以要有它：以前的 `self_check()` 只跟**自己**对（`before` 与 `after` 互相对得上），
+**挡不住「静默丢行」**；现在用 ODS 当独立基准。
+
+**runner 会打印水位**，第二天该从哪天开始一目了然。
+
+**已在沙盒副本验证**（没有碰你的正式数据）——三条：
+① 单日 rebuild 后 `before=854844 → after=854844`（幂等）；
+② `D1 > D2` 倒挂时 exit 0 且**没有执行任何 DELETE**；
+③ 按天增量连跑两次，逐日 `(dt, cnt, sum(amount))` 完全一致。
+
+**验收判据**（你自己跑）：
 
 ```bash
 D1=$(date -d "-3 day" +%F); D2=$(date +%F)
-bash scripts/lake/run_dwd.sh build dwd_order_detail   "$D1" "$D2"
+bash scripts/lake/run_dwd.sh build dwd_order_detail     "$D1" "$D2"
 bash scripts/lake/run_dwd.sh build dwd_order_sku_detail "$D1" "$D2"
-bash scripts/lake/run_dwd.sh build dwd_order_lifecycle "$D1" "$D2"   # ⚠️ 缺陷 4 修完才准
-# 湖侧 DWS/ADS 的区间参数见 §2 步骤 3
+bash scripts/lake/run_dwd.sh build dwd_order_lifecycle  "$D1" "$D2"
+# 每条命令的 RESULT 行：before == after（未翻倍）；同区间连跑两遍，逐日数字不变
 ```
 
-**为什么不推荐做真正的 upsert**：DWS 是 `(user_id, dt)` 主键、ADS 是 `dt` 主键、DWD 是
-`(order_id)` / `(dt, order_id)`；Iceberg 的 `MERGE INTO` 能做，但代价是「迟到事件改动了 3 天前
-某个已聚合的用户」时，要把受影响的 `(user_id, dt)` 重算 —— 逻辑复杂度远高于按天覆盖。
-**按天全量重建 = 幂等 + 简单 + 对账容易**，这是本项目的正确取舍。
+**一个你必须拍板的口径问题**：`dwd_order_detail` 里 `user_id IS NULL` 有 **45,156 行**
+（实测）。新加的完整性 gate 只看**非空 `user_id`**，所以这 45,156 行不在校验范围内。
+请确认它们**应该保留**（若是，gate 口径没问题），还是**本就应该被过滤掉**（若是，
+我把它改成 `COUNT(*)`）。顺带：`count(DISTINCT order_id)` 与明细行数不等的问题，
+根因也是这些 NULL 行。
 
-**验收**：增量跑完后，湖侧与仓侧对同一区间的结果一致。
-
-### 步骤 3：仓侧 dws/ads 改成「湖侧物化」（你要的这一步）
+### 步骤 3：仓侧 dws/ads 改成「湖侧物化」 —— ✅ 已完成，默认已按天自动增量
 
 **为什么必须物化、不能直连湖侧查询**：StarRocks 读 Iceberg external catalog 没有本地索引、
 没有分区裁剪之外的优化，下游点查（按用户、按日期）会明显退化。所以保留仓侧表，
 但**数据来源从仓侧 dwd 换成湖侧 dwd**。
 
-**代码**（新增两个 SQL + 一个外壳；旧 `scripts/dws_ads_streamload.py` 已移到 `scripts/legacy_step2/`。⚠️ 本文档写于 2026-10-14：其中「湖侧建 dws/ads」那套（`scripts/lake/lake_dws_ads_build.py`）在 2026-10-15 提交 `cfab3e0` 里被删除，最终方案是湖侧只到 DWD。下文相关段落仅作历史参考）：
+**代码**：`scripts/run_dws_ads_from_lake.sh`（110 → **约 325 行**）+ 它内嵌的 SQL，
+配套测试脚本 `test_inc_dws_ads.sh`（在 `D:\develop\workspace\deepseek_harness_temp\`）。
 
-```sql
--- （历史示例，文件未入库）sql/dws_ads/dws_from_lake.sql —— 已删，取而代之的是 sql/dws_ads_from_lake.sql
--- 口径与 sql/dws_ads/dws_user_order_day_insert.sql 逐字一致，只把来源换成 lake.dwd.dwd_order_detail
-INSERT OVERWRITE dws.dws_user_order_day
-SELECT user_id, dt,
-       COUNT(*)                                              AS order_cnt,
-       COUNT(CASE WHEN status = 'paid'   THEN 1 END)         AS paid_cnt,
-       SUM(CASE WHEN status = 'paid'   THEN amount ELSE 0 END) AS paid_amount,
-       SUM(CASE WHEN status = 'refund' THEN amount ELSE 0 END) AS refund_amount
-FROM lake.dwd.dwd_order_detail            -- ★ 唯一改动：仓侧 ods/dwd → 湖侧 dwd
-WHERE dt = STR_TO_DATE('${system.biz.date}', '%Y%m%d')
-GROUP BY user_id, dt;
-```
+**三种运行模式**（默认模式从 TRUNCATE 全量改成了 auto 增量 —— 日常调度无人值守不能再整表清空）：
 
-```sql
--- （历史示例，文件未入库）sql/dws_ads/ads_from_lake.sql —— 已删，取而代之的是 sql/dws_ads_from_lake.sql
--- 口径与 sql/dws_ads/ads_daily_sales_insert.sql 逐字一致
-INSERT OVERWRITE ads.ads_daily_sales
-SELECT dt,
-       SUM(order_cnt)                                    AS order_cnt,
-       SUM(paid_cnt)                                     AS paid_cnt,
-       SUM(paid_amount)                                  AS paid_amount,
-       SUM(refund_amount)                                AS refund_amount,
-       SUM(paid_amount) - SUM(refund_amount)             AS net_amount,
-       ROUND(SUM(paid_amount) / NULLIF(SUM(paid_cnt), 0), 2)   AS avg_order_amount,
-       ROUND(SUM(paid_cnt)    / NULLIF(SUM(order_cnt), 0), 4)  AS pay_rate
-FROM dws.dws_user_order_day
-WHERE dt = STR_TO_DATE('${system.biz.date}', '%Y%m%d')
-GROUP BY dt;
-```
+| 模式 | 命令 | 用途 |
+|---|---|---|
+| 自动增量（默认） | `bash scripts/run_dws_ads_from_lake.sh` | 调度用。`D2 = 湖侧 MAX(dt)`；`D1 = 仓侧 MAX(dt) - (lookback-1)` |
+| 指定区间 | `--range 2026-12-10 2026-12-18` | 补数 / 回刷 / 破坏后自愈 |
+| 全量重灌 | `--truncate` | 首次建表、清探针残留行 |
+| 只读预演 | `--dry-run` | 不写库，打印区间与预计影响 |
 
-> ⚠️ **`INSERT OVERWRITE` 对 PRIMARY KEY 表**：`dws_user_order_day` 是 `PRIMARY KEY(user_id, dt)`、
-> `ads_daily_sales` 是 `PRIMARY KEY(dt)`，**无分区**。StarRocks 的 PK 表**不支持** `INSERT OVERWRITE PARTITION`，
-> 但支持**无分区表的整表 `INSERT OVERWRITE`**。你们现在的
-> `sql/dws_ads/dws_user_order_day_insert.sql:21` 用的就是 `INSERT OVERWRITE`（按 `dt` 过滤），
-> 所以**照原样能跑**；只有当你要改成「只覆盖某天」时才需要在外面包 `DELETE WHERE dt=...`。
-> **建议**：先按天 `DELETE WHERE dt = '${bizdate}'` + `INSERT INTO`，语义最明确、不受版本差异影响。
+`--lookback N`（**默认 3**）是**回捞窗口**：湖侧迟到事件会改动最近的若干天，
+每次物化都要把「仓侧水位往前 N 天」重算，否则那天永远错（湖仓两侧一起错，
+逐日对称差自检**发现不了**）。
 
-**验收判据**（三条都要过）：
+> **默认值为什么是 3（2026-10-15 从 2 改成 3）**：`lookback=2` 的实际覆盖面是 `[D2-1, D2]`，
+> 而事件生成器 `LATE_EVENT_RATE` 会把 `event_time` 回拨 **3 天** —— 也就是
+> 「最新日之前 2~3 天到货的事件」落在窗口外，**默认增量永远不重算它，而且自检全绿**。
+> 改成 3 后覆盖面 = `[D2-2, D2]`，恰好覆盖生成器的最大迟到跨度。
+> 复核实测：`--lookback 2` 时 12-16 的迟到事件不被重算、`dws_mismatch=0`、`EXIT=0`；
+> `--lookback 3` 才把它并入。**所以 `lookback` 不是越小越省事，是越小越容易悄悄错。**
+
+**几个必须知道的行为**：
+
+- `refresh_lake()` 在解析区间**之前**执行（见 §1.1）；
+- **`lake.dwd.dwd_order_detail` 刷新失败 = 直接 `die`**：水位、期望行数、逐行对称差全来自它，
+  拿不到新快照时继续跑只会产出「看起来全绿」的错数据。其余表（含 Kafka 外表
+  `lake.ods.ods_order_flat`）刷新失败只 `warn`；
+- **`D1` 会钳到湖侧 `MIN(dt)`**，仓侧水位晚于湖侧最新时直接 skip 退出；
+- **区间倒挂直接拒**：`D1 > D2` 时 `exit 1` 并打印原因，不写库；
+- **`--truncate` 与 `--range` 互斥**：同时给会直接报错退出。
+  （以前是「后写的那个静默吃掉前一个」—— 最坏情况是「以为只回刷 2 天」变成
+  「两张仓表被 TRUNCATE 后整表重灌」；）
+- **`--incremental` = `--auto`**（兼容旧写法）。它以前被写成 `MODE="range"` 却不塞 `POS`，
+  在 `set -u` 下**必然崩**（`POS[0]: unbound variable`），而脚本的告警原文还建议你去用它；
+- **覆盖 gate**：auto 模式要求「仓侧 `MAX(dt)` 追平 `D2`」且「仓侧 `MIN(dt) <= D1`」，
+  否则报错退出 —— 这条 gate 专治「区间对但中间有洞、自检看不出来」；
+- **C2 窗口外漂移探测（新增）**：所有对称差 gate 都只看 `[D1, D2]`，
+  所以「自检全部通过」可能只是「窗口内没问题」。C2 会把审计区间扩到
+  `[FULL_MIN, D1-1]`（本次不回刷的那段）单独数一遍，非 0 就显式告警并给出修复命令：
+  报告里会写清「本次逐行对称差只校验了 `D1 ~ D2`」。
+  auto 模式下 C2 **只告警不 fail**（调度不该天天红），但假绿被消掉了；
+- **渲染产物用 `mktemp -d` + `trap` 清理**：以前是固定的 `/tmp/dws_ads_from_lake.*.sql`，
+  跑完不删、两个并发实例会互相覆盖渲染 SQL 并执行到对方的内容；
+- **`lake.dwd.*` 的 CSV 暂存在 `/tmp/o/…`**：`run_dwd.sh` 会先 `docker cp` 到容器 `/tmp/o/`。
+  如果 `spark` 容器不可写（生产常见），你需要把 `/tmp/o` 换成挂载卷，或把构建脚本烘进镜像。
+
+**验收判据**（三条都要过，实测原始输出见附录 B）：
+
 ```sql
 -- ① 仓侧 dws/ads 的天数、总量与湖侧一致
 SELECT (SELECT count(DISTINCT dt) FROM dws.dws_user_order_day) dws_days,
@@ -211,23 +199,25 @@ SELECT (SELECT count(DISTINCT dt) FROM dws.dws_user_order_day) dws_days,
 -- ② 汇总守恒：DWS 的 order_cnt 合计 == 湖侧 detail 行数
 SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
        (SELECT count(*) FROM lake.dwd.dwd_order_detail)     detail_rows;
--- ③ 逐日对账：任意一天两侧金额相等（替换日期）
-SELECT (SELECT sum(paid_amount) FROM ads.ads_daily_sales WHERE dt='2026-11-15') wh,
-       (SELECT sum(paid_amount) FROM ... 湖侧同口径 ...) lake;
+-- ③ 逐行对称差必须为 0（脚本自带）
+--    dws_mismatch / ads_mismatch 都为 0；整表数字应为
+--    dws:18000|90|854844|119749476.90|14069110.40
+--    ads:90|90|854844|105680366.50
 ```
 
-### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler
+### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ⬜ 未做，剩下的主要工作
 
-**为什么**：现在全是手工跑（`bash scripts/lake/run_*.sh`），没有增量、没有失败告警。
-仓侧那套调度（串行丢弃、`ds/alerts/notify.sh` 告警）是现成的，**照抄结构即可**。
+**为什么**：现在全是手工跑，没有增量、没有失败告警。仓侧那套调度（串行丢弃、
+`ds/alerts/notify.sh` 告警）是现成的，**照抄结构即可**。
 
 接线顺序（串行，别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
 
 ```
-[湖侧增量 DWD] → [湖侧 DWS/ADS] → [仓侧 dws/ads 物化] → [对账] → [湖表维护]
+[湖侧增量 DWD] → [仓侧 dws/ads 物化] → [对账] → [湖表维护]
 ```
 
-- **对账节点**：把这次的一次性人工核对沉淀成脚本（我实测用过的口径）：
+- **对账节点**（本次一次性核对的口径，沉淀成脚本）：
+
   ```sql
   -- 一行一表：湖侧 vs 仓侧逐项比
   SELECT 'detail' t, count(*) r, count(DISTINCT order_id) o, sum(amount) a FROM lake.dwd.dwd_order_detail
@@ -238,23 +228,79 @@ SELECT (SELECT sum(paid_amount) FROM ads.ads_daily_sales WHERE dt='2026-11-15') 
   UNION ALL SELECT 'lifecycle_wh', count(*), count(DISTINCT order_id), sum(amount) FROM dwd.dwd_order_lifecycle;
   -- 两边对应行的 r/o/a 三个数必须相等，否则告警
   ```
-- **维护节点**：`python3 scripts/lake/lake_maintain.py`（只读盘点）+ `--expire --keep N`（清快照）。
-  实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，行数不变。
+
+  ⚠️ **对账作业执行前也必须先 `REFRESH EXTERNAL TABLE`**，否则拿旧快照比对 = 白比。
+  建议把「对称差 ≠ 0」「刷新失败」都接进告警（仓侧 `ds/alerts/notify.sh` 是现成的模板）。
+
+- **维护节点**：`python3 scripts/lake/lake_maintain.py`（只读盘点）+
+  `--expire --keep N`（清快照）。实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，行数不变。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
-  如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 —— 
+  如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
 
 ---
 
-## 3. 终局验收清单（湖仓一体「完工」的判据）
+## 附录 A：五处缺陷的修复说明（已修，验收判据保留）
 
-- [ ] 湖侧脚本自包含（不依赖 `/mnt/d/...`），任意目录可跑
-- [ ] 湖侧 DWD/DWS/ADS 有**按天增量**，重复执行幂等（连跑两遍行数不变）
-- [ ] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
-- [ ] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
-- [ ] DolphinScheduler 里湖侧链路**串行**接入 + 失败告警生效
+| # | 位置 | 原来错在哪 | 现在怎么修 | 验收 |
+|---|---|---|---|---|
+| 1 | `scripts/lake/run_dwd.sh`（`--mode append`） | 没有 DELETE 就打 `append`，同区间重跑**行数翻倍且不报错** | py 自己在写入前 `DELETE FROM lake.dwd.{table} WHERE dt BETWEEN d1 AND d2`；lifecycle 没有 `dt` 列，按 `order_id IN (SELECT order_id FROM scope_ids)` 删 | 连跑两遍 `run_dwd.sh build all`，854,844 / 854,844 / 900,000 不变。**实测**：`2026-09-20` 单日连跑两遍 `before=854844 → after=854844`（未翻倍） |
+| 2 | 三个 `run_lake_*.sh` | `SCRATCH="${SCRATCH:-/mnt/d/...}"` 把 Windows 盘路径写死，仓库不自包含；其中一支还会 `cp` 覆盖仓库里的临时 SQL | 全部改成 `PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"`，挂载 `$PROJ/scripts:/opt/offline-dw/app:ro` 从仓库自身取代码 | 把仓库整体 `cp -r` 到另一目录，脚本仍能跑通 |
+| 3 | `dwd_order_sku_streamload.py` | SCD2 关联用 `inner`，SCD2 里找不到当天版本的订单被**静默丢弃**（实测少了 8,476,266.40 金额，其中 25,534 行是漏了 `ABS`，已修） | 改 `left` 关联 + 显式统计失配并报错；金额取 `ABS` | `miss == 0`，且 `count(DISTINCT order_id)` == 明细去重订单数。**注意**：`user_id IS NULL` 的 45,156 行见 §2 步骤 2 末的口径问题 |
+| 4 | `dwd_order_lifecycle_streamload.py` | 增量只取「当天新出现的 `order_id`」，漏掉「订单已存在但今天才收到里程碑事件」（`LATE_EVENT` 会把 `event_time` 回拨 3 天） | 增量集合取「出现在该区间任一事件表分区里的 `order_id`」并集，再拿 `scope_ids` 回全表重聚合（不能按 `dt` 过滤事件，`order_time` 可能落在更早分区） | 拿 3 天做增量，与全量重建在该 3 天的订单上逐列一致。**已实现**：三张表按天增量连跑两遍逐日一致 |
+| 5 | `lake_dwd_build.py` | 写完只打印行数，不校验；但与 lake DWD 同级的仓侧 `*_streamload.py` 有逐行自检 | 加 `self_check()`：回读「行数 + 金额合计 + 去重主键数」与 Spark 期望值比对，不等 `exit 2` | 故意让某天少写一行，`self_check()` 必须报错退出 |
+
+---
+
+## 附录 B：本轮 30 条断言的实测记录（`PASS=30 FAIL=0`）
+
+测试脚本：`test_inc_dws_ads.sh`（工作区）。全部代码改动落在
+`scripts/run_dws_ads_from_lake.sh`（`1 file changed, 214 insertions(+), 101 deletions(-)`），
+`bash -n` 通过。
+
+1. **auto 增量连跑两遍幂等**：两次均 `exit 0`，自检通过
+   （`覆盖 gate(auto)`：仓侧 dws `MAX(dt)` == `D2 = 2026-12-18`；
+   覆盖 gate：`MIN(dt) = 2026-09-20 <= D1`），整表数字一字不差。解析区间 `2026-12-17 ~ 2026-12-18`。
+2. **破坏 → `--range` 回刷自愈**：故意打乱 `2026-12-10` / `2026-12-11`，
+   回刷后整表数字完全恢复、两日逐日恢复、自检通过。
+3. **迟到事件 + lookback 语义**：往湖侧 INSERT 一条迟到订单
+   （`order_id=2026121699999 / user_id=99999999 / dt=2026-12-16 / amount=123.45`）→
+   立刻可检出漂移（对称差 1/2）→ `--lookback 2` 重算 `2026-12-17~18`，
+   **没**重算 12-16，漂移仍在（证明回捞窗口是必需的）→ `--lookback 3` 重算到 12-16，
+   漂移清成 0，与湖侧现算完全一致。
+   清理：Iceberg 经 StarRocks 不支持 `DELETE`（报 1064），改用
+   `run_dwd.sh build dwd_order_detail 2026-12-16 2026-12-16` 单日 rebuild
+   （`before=854845 written=9517 after=854844`）+ `REFRESH EXTERNAL TABLE`，
+   湖侧回到 854,844、仓侧回到基线、`user_id=99999999` 残留 0。
+4. **防呆**：手工全区间回刷可执行（`exit=0`）、全区间回刷后整表硬基线通过、
+   区间倒挂被拒（`exit=1`）且原因已打印。
+5. **收尾复核**：dws 逐行对称差 = 0、ads 逐行对称差 = 0。
+   最终整表：`dws:18000|90|854844|119749476.90|14069110.40`、`ads:90|90|854844|105680366.50`；
+   `2026-12-16:9517:1337110.30, 12-17:9485:1324362.00, 12-18:9472:1348545.20`。
+
+### 本轮踩到的坑（会再犯，记下来）
+
+- **Iceberg 经 StarRocks 不支持 `DELETE`**（报 `1064`）。清理脏数据的正确姿势 =
+  走湖侧单日 `run_dwd.sh build <table> <d1> <d2>` 重建，**再** `REFRESH EXTERNAL TABLE`。
+- **StarRocks 外部表元数据是缓存的**：写完不刷新读到旧快照（§1.1 有原始数字）。
+- **`git apply` 报 `unable to unlink … Permission denied`**：WSL 侧文件属主/权限不对，
+  不是补丁坏了。先 `ls -l` 看属主，必要时 `sudo chown $(id -u):$(id -g)` 后再 apply。
+- 容器里跑 Spark 写湖的 uid 与沙盒目录属主不一致时，Iceberg 写 manifest 会
+  `Permission denied`；沙盒目录 `chmod 0777` 即可（生产环境目录属主本来就对，不受影响）。
+
+---
+
+## 附录 C：终局验收清单
+
+- [x] 湖侧脚本自包含（不依赖 `/mnt/d/...`），任意目录可跑
+- [x] 湖侧 DWD 有**按天增量**，重复执行幂等（连跑两遍行数不变）
+- [x] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
+- [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
+- [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
+- [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
+- [ ] DolphinScheduler 里全链路**串行**接入 + 失败告警生效（步骤 4）
 - [ ] 湖表维护（`expire_snapshots` / `remove_orphan_files`）已进调度
-- [ ] 对账作业可重复执行（不是一次性人工核对）
+- [ ] 对账作业可重复执行（不是一次性人工核对），且执行前 `REFRESH EXTERNAL TABLE`
 - [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异后，才评估停更仓侧 ods/dim/dwd
 
 > 最后一条是关键：**仓侧 ODS/DWD 停更 = Routine Load 停 = 失去实时摄入**。
@@ -262,11 +308,12 @@ SELECT (SELECT sum(paid_amount) FROM ads.ads_daily_sales WHERE dt='2026-11-15') 
 
 ---
 
-## 4. 交接给我的方式
+## 附录 D：怎么把结果交回来
 
-每一步你改完、跑完，把**命令 + 输出尾巴**贴回来即可，我负责：
+每一步你改完、跑完，把**命令 + 输出尾巴**贴回来即可（§1.1 我已实测，可直接引用），我负责：
+
 - 判断判据是否真的满足（尤其是「行数对了但口径错了」这类）
-- 补分支场景（迟到事件、跨天订单、NULL user_id 45,156 单这类边界）
+- 补分支场景（迟到事件、跨天订单、`user_id IS NULL` 的 45,156 单这类边界）
 - 更新 README / PITFALLS 的对应章节
 
 > 我承诺：从这条消息起，**不再直接执行**湖仓链路的写操作，只给代码与判据。

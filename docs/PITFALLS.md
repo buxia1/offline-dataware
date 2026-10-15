@@ -1158,6 +1158,50 @@ EVT_PAIRS=$(... "SELECT count(DISTINCT concat(order_id,'-',event_type)) FROM ods
    要证明防线有效，**先造一份脏数据，看它报不报红**。（本次修复的验证就是这么做的 —— 修完对着现有的 991 行脏表跑，它从"报绿"变成"报红"，这就是防线生效的铁证。）
 
 
+### 3.18 StarRocks 读 Iceberg 外部表用的是**缓存元数据** —— 写完不刷新，读到的还是旧快照
+
+**现象（2026-10-15 实测）**
+
+湖侧由 Spark 写完（新增/删除行都算），StarRocks 查同一张外部表，**数字不变**：
+
+```
+Spark 侧删掉一条合成行后： total = 854844
+StarRocks 不刷新读到的 ： 854845      ← 旧快照
+REFRESH EXTERNAL TABLE 之后： 854844  ← 正确
+```
+
+**为什么会要命**
+
+1. **它会把「水位」类逻辑整个带偏**。凡是以「湖侧 `MAX(dt)`」为水位的增量作业，
+   湖侧有新分区而 StarRocks 没刷新时，增量**永不推进**（水位停在上次刷新的那一刻），
+   而且**不报错**。容器重启后 StarRocks 重建元数据缓存 —— 于是**重启前后水位不同**，
+   看起来像"脚本时好时坏"。
+2. **它会让自检变成假绿**。对账/对称差自检如果两边都基于同一份旧快照，
+   **两边一起错**，差值依然是 0。实测就是这样：物化脚本第一步读 `lake.dwd` 的行数和水位，
+   不刷新 = 用错的区间去算，然后"逐行对称差 = 0"漂漂亮亮地通过。
+
+**正确姿势**
+
+```sql
+-- 读湖侧外部表之前，先刷新。按表刷新，一条一张。
+REFRESH EXTERNAL TABLE lake.dwd.dwd_order_detail;
+REFRESH EXTERNAL TABLE lake.dwd.dwd_order_sku_detail;
+REFRESH EXTERNAL TABLE lake.dwd.dwd_order_lifecycle;
+REFRESH EXTERNAL TABLE lake.dim.dim_product_scd2;
+REFRESH EXTERNAL TABLE lake.ods.ods_order_event;
+```
+
+- 仓侧 `scripts/run_dws_ads_from_lake.sh` 已内建 `refresh_lake()`：
+  **在解析区间之前**执行（顺序很重要 —— 刷新完再算水位），失败只告警。
+- **`lake.ods.ods_order_flat` 是 Kafka 外表，不是 Iceberg，`REFRESH` 会报错**，
+  所以那一步用 `--force` / 忽略错误，别把它当成刷新的失败。
+- ⚠️ **只靠湖侧写入端"记得刷新"是不够的**：这是**读侧**的坑，
+  任何新写的、读湖侧的下游任务（对账、报表、临时排查）第一步都要先刷新，
+  否则你看到的是上一次刷新时刻的世界。
+
+**排查口诀**：Spark 里数出来的和 StarRocks 里数出来的不一致 → **先 `REFRESH EXTERNAL TABLE` 再重数**，
+不要先去怀疑数据。
+
 ## 四、Spark 与依赖
 
 ### 4.1 Ivy 缓存目录不可写

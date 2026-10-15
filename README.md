@@ -72,7 +72,7 @@ offline-dw/
 │   ├── dimension-modeling.md       商品维度建模（SCD1/SCD2）
 │   ├── dolphinscheduler-workflow.md  DS 工作流的节点配置
 │   ├── dolphinscheduler-order-event-chain.md  订单事件链路（累积快照）
-│   └── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 5 处已知缺陷 / 交接 4 步）
+│   └── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 已修 5 处缺陷的验收判据 / 交接步骤）
 ├── sql/                            各层建表与转换 SQL
 │   │   ── ODS（贴源）──
 │   ├── ods/ods_order.sql                   订单落地（按天去重）
@@ -121,7 +121,7 @@ offline-dw/
 │   ├── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
 │   ├── dwd_sku_load.sh             商品宽表逐天物化
 │   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
-│   ├── run_dws_ads_from_lake.sh    ⭐ 仓侧 DWS/ADS 从湖侧物化（默认 TRUNCATE 重灌）
+│   ├── run_dws_ads_from_lake.sh    ⭐ 仓侧 DWS/ADS 从湖侧物化（默认按天自动增量；--truncate 才全量）
 │   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
 │   ├── dqc_dim_product.sh          商品维度 DQC
 │   ├── dqc_order_chain.sh          订单链路 DQC（可选业务日期参数）
@@ -1323,10 +1323,20 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 > 390 行时收敛到单行失败，读出 `2026110400184 ... 2,995.00`，逗号一目了然。
 > 这类"整批失败、没有错误样本"的导入问题，二分比逐行试快得多。
 
-### ⭐ 第 3 步：DWD / DWS / ADS 下沉到湖侧（2026-10-14）
+### ⭐ 第 3 步：DWD 下沉到湖侧 + 仓侧物化 DWS / ADS（2026-10-14 起，10-15 定稿）
 
 > 背景：用户（2026-10-14）决定把仓库的 **计算层主存迁到湖侧**，StarRocks 退化为查询/服务层。
 > 实测范围 = `ods` + `dim` + `dwd` + `dws` + `ads` **共 8 张表**。
+>
+> **10-15 定稿的边界**：湖侧只到 **DWD**（`lake.dws` / `lake.ads` 已删除，commit `cfab3e0`），
+> 仓侧 `dws` / `ads` 由 `scripts/run_dws_ads_from_lake.sh` **从 `lake.dwd` 物化**。
+> 物化脚本**默认按天自动增量**（水位 = 湖侧 `MAX(dt)`；回捞窗口 `--lookback` **默认 3 天**，
+> 覆盖事件生成器 3 天的迟到回拨跨度），`--range` 补数、`--truncate` 首次全量
+> （`--truncate` 与 `--range` **互斥**，同时给会报错退出）；物化前会先 `REFRESH EXTERNAL TABLE`
+> 刷新湖侧 5 张外部表（StarRocks 读 Iceberg 走缓存元数据，不刷新会读到写入前的旧快照 —— 详见
+> `docs/lake-tier-runbook.md` §1.1）。
+> 逐行对称差只覆盖本次回刷区间，**窗口外的漂移由 C2 探测段单独告警**，所以「自检全部通过」
+> 不等于全表一致 —— 看到 C2 报漂移就按它给的 `--range` / `--lookback` 命令回刷。
 
 | 湖侧表 | 行数 | 备注 |
 |---|---|---|
@@ -1338,8 +1348,13 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 | `lake.dwd.dwd_order_detail` | 854,844 | `sum(amount)=140,891,053.50` |
 | `lake.dwd.dwd_order_sku_detail` | 854,844 | `sum(amount)=140,891,053.50`（= detail，**无负值**）|
 | `lake.dwd.dwd_order_lifecycle` | 900,000 | `sum(amount)=144,975,064.50` |
-| `lake.dws.dws_user_order_day` | 18,000 | 90 天 × 200 用户 |
-| `lake.ads.ads_daily_sales` | 90 | 90 天 |
+| ~~`lake.dws.dws_user_order_day`~~ | ~~18,000~~ | **2026-10-15 已从湖侧删除**（commit `cfab3e0`）。现在物化在**仓侧**：`scripts/run_dws_ads_from_lake.sh` 从 `lake.dwd` 读出并写 `dws.dws_user_order_day` |
+| ~~`lake.ads.ads_daily_sales`~~ | ~~90~~ | **同上已删除**。仓侧 `ads.ads_daily_sales` 由仓侧 dws 汇总而来 |
+
+> ⚠️ **真实边界（2026-10-15 起，这是与最初文档相反的地方，不是写错）**：
+> 湖侧只算 **ods / dim / dwd**；**dws / ads 下沉到仓侧**，来源是 `lake.dwd.*`。
+> 上表里 `lake.dws` / `lake.ads` 的两行是 2026-10-14 的历史记录，**那两张湖侧表已经被删掉了**；
+> 保留它们是为了让「湖↔仓对账」的旧记录可追溯，不要按它们去查湖侧表。
 
 **脚本**（`bash scripts/lake/run_dim.sh ddl|build|dry` / `bash scripts/lake/run_dwd.sh`）
 - `sql/lake/lake_dim.sql` + `scripts/lake/lake_dim_build.py`（SCD2 与当前版）
