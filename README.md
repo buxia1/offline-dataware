@@ -69,48 +69,69 @@ offline-dw/
 ├── data/dim/                        商品快照 CSV（生成物，不进版本库）
 ├── docs/
 │   ├── PITFALLS.md                 踩坑记录（最有价值的部分）
+│   ├── dimension-modeling.md       商品维度建模（SCD1/SCD2）
 │   ├── dolphinscheduler-workflow.md  DS 工作流的节点配置
+│   ├── dolphinscheduler-order-event-chain.md  订单事件链路（累积快照）
 │   └── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 5 处已知缺陷 / 交接 4 步）
 ├── sql/                            各层建表与转换 SQL
-│   ├── ods_order.sql
-│   ├── ods_routine_load.sql                ⭐ 两条 Routine Load 作业（ODS 摄入，2026-10-09）
-│   ├── dwd_order_detail.sql
-│   ├── dwd_add_history_partitions.sql
-│   ├── dws_user_order_day.sql
-│   ├── ads_daily_sales.sql
-│   │   ── 订单事件 / 累积快照链路 ──
-│   ├── ods_order_event.sql                事件流落地层（DUPLICATE KEY，不分区）
-│   ├── dwd_order_lifecycle.sql            累积快照事实表 + 期望视图
-│   ├── dwd_order_lifecycle_load.sql       累积快照装载（${FROM_DT}，INSERT 即 UPSERT）
-│   ├── dqc_order_chain.sql                订单链路 DQC（含 ⑤a/⑤b 防空上游假绿）
-│   │   ── 商品 / 维度链路 ──
-│   ├── ods_product.sql                    商品快照落地层（保留全部历史）
-│   ├── dim_product.sql                    商品维度 SCD1（只有当前状态）
-│   ├── dim_product_load.sql               SCD1 装载
-│   ├── dim_product_scd2.sql               商品维度 SCD2 拉链表
-│   ├── dim_product_scd2_load.sql          SCD2 装载（TRUNCATE + INSERT 合一）
-│   ├── dwd_order_sku_detail.sql           订单 + 商品属性宽表
-│   ├── dwd_order_sku_detail_add_partitions.sql  补历史分区
-│   ├── dwd_order_sku_detail_load.sql      物化装载（Shell 模板）
+│   │   ── ODS（贴源）──
+│   ├── ods/ods_order.sql                   订单落地（按天去重）
+│   ├── ods/ods_order_event.sql             事件流落地层（DUPLICATE KEY，不分区）
+│   ├── ods/ods_product.sql                 商品快照落地层（保留全部历史）
+│   ├── ods/ods_routine_load.sql            ⭐ 两条 Routine Load 作业（ODS 摄入，2026-10-09）
+│   │   ── DIM（商品维度）──
+│   ├── dim/dim_product.sql                 SCD1（只有当前状态）
+│   ├── dim/dim_product_load.sql            SCD1 装载
+│   ├── dim/dim_product_scd2.sql            SCD2 拉链表
+│   ├── dim/dim_product_scd2_load.sql       SCD2 全量装载（TRUNCATE + INSERT 合一）
+│   ├── dim/dim_product_scd2_incremental.sql  SCD2 增量装载
+│   │   ── DWD（明细 / 累积快照）──
+│   ├── dwd/dwd_order_detail.sql            订单明细层
+│   ├── dwd/dwd_add_history_partitions.sql   补历史分区
+│   ├── dwd/dwd_order_sku_detail.sql         订单 + 商品属性宽表
+│   ├── dwd/dwd_order_sku_detail_add_partitions.sql  补历史分区
+│   ├── dwd/dwd_order_sku_detail_load.sql    物化装载（Shell 模板）
+│   ├── dwd/dwd_order_lifecycle.sql          累积快照事实表 + 期望视图
+│   ├── dwd/dwd_order_lifecycle_load.sql     累积快照装载（${FROM_DT}，INSERT 即 UPSERT）
+│   │   ── DWS / ADS（仓侧物化）──
+│   ├── dws_ads/dws_user_order_day.sql
+│   ├── dws_ads/dws_user_order_day_insert.sql
+│   ├── dws_ads/ads_daily_sales.sql
+│   ├── dws_ads/ads_daily_sales_insert.sql
+│   ├── dws_ads_from_lake.sql        ⭐ 现在的主链路：从 lake.dwd 物化出仓侧 DWS/ADS
+│   │   ── 数据质量 ──
+│   ├── dqc/dqc_order_chain.sql             订单链路 DQC（含 ⑤a/⑤b 防空上游假绿）
+│   ├── dqc/dqc_order_chain_selftest.sql    DQC 自检（内存假数据 18 个用例）
+│   ├── dqc/dqc_dim_product.sql             商品维度 DQC
+│   ├── dqc/dqc_dim_product_selftest.sql    DQC 自检（13 个用例）
+│   ├── fingerprint_product_chain.sql       产物指纹（链路完整性）
+│   ├── dolphinscheduler_mysql.sql          DS 元数据库初始化脚本（不是数仓 SQL）
 │   │   ── 湖侧（Iceberg）──
 │   └── lake/                       lake_ods.sql / lake_dim.sql / lake_dwd.sql
-│                                    （lake_dws_ads.sql 保留，已不在主链路上）
 ├── scripts/
 │   │   ── 湖侧链路（当前主线：Spark 读湖写湖）──
-│   ├── lake/                       ⭐ lake_ods_replay.sh / run_dim.sh / run_dwd.sh
+│   ├── lake/                       run_ods_replay.sh / run_dim.sh / run_dwd.sh
 │   │                                + lake_*_build.py + lake_maintain.py（见 scripts/lake/README.md）
-│   │   ── ⚠️ 已废弃：第 2 步「写回仓侧」那一套 ──
-│   ├── legacy_step2/               dwd_*_streamload.py / dws_ads_streamload.py / run_*.sh
-│   │                                （保留原因与坑见 scripts/legacy_step2/README.md）
-│   ├── gen_mock_orders_snapshot.py  模拟订单**快照**生成器（--date，可重放，号段 = 事件流号段 +10000）
-│   ├── gen_mock_orders.py           模拟订单**事件流**生成器（--date，可重放，号段 +0）
-│   ├── check_routine_load.sh        ⭐ Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
-│   ├── dwd_overwrite.sh             DWD 按天覆盖（Shell，给 DS 用）
-│   ├── dwd_order_lifecycle_load.sh  累积快照装载外壳（五道防线，默认增量、--full 全量重建）
-│   ├── dqc_order_chain.sh           订单链路 DQC（可选业务日期参数）
-│   ├── gen_mock_products.py         模拟商品快照生成器（支持 --date 造历史）
-│   ├── load_product_to_ods.sh       商品 CSV → ODS（Stream Load）
-│   └── dwd_sku_load.sh              商品宽表逐天物化
+│   │   ── 模拟数据（手工造数，不进调度）──
+│   ├── gen/                        gen_mock_orders*.py / gen_mock_products.py
+│   │   ── 仓侧链路（DS 调度的入口）──
+│   ├── dim_product_scd2_load.sh    SCD2 装载外壳（含多道防线）
+│   ├── dim_product_scd2_incremental.sh  SCD2 增量装载
+│   ├── dwd_order_lifecycle_load.sh 累积快照装载外壳（默认增量、--full 全量重建）
+│   ├── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
+│   ├── dwd_sku_load.sh             商品宽表逐天物化
+│   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
+│   ├── run_dws_ads_from_lake.sh    ⭐ 仓侧 DWS/ADS 从湖侧物化（默认 TRUNCATE 重灌）
+│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
+│   ├── dqc_dim_product.sh          商品维度 DQC
+│   ├── dqc_order_chain.sh          订单链路 DQC（可选业务日期参数）
+│   │   ── ⚠️ 已退役：Routine Load 取代了这套 Spark 增量摄入 ──
+│   ├── ods_legacy/                 ods_order_event_ingest.sh / ods_order_*_to_starrocks.py
+│   │                                （退役原因见 README「ODS 摄入」一节）
+│   │   ── ⚠️ 已退役：第 2 步「写回仓侧」那一套 ──
+│   └── legacy_step2/               dwd_*_streamload.py / dws_ads_streamload.py / run_*.sh
+│                                    （保留原因与坑见 scripts/legacy_step2/README.md）
+├── dolphin/                        DS 工作流导出（4 个 JSON，可重新导入覆盖）
 ├── kafka/                          空目录（Kafka 数据不挂载）
 ├── starrocks/
 │   ├── fe/{conf,log,meta}          meta 挂载用于持久化
@@ -119,6 +140,8 @@ offline-dw/
 ├── spark/{conf,jars}
 └── ds/{bin,libs,logs}
 ```
+
+**没有进版本库的**（见 `.gitignore`）：运行时数据（meta/storage/data/logs）和下载的二进制依赖（jar）。
 
 **没有进版本库的**（见 `.gitignore`）：运行时数据（meta/storage/data/logs）和下载的二进制依赖（jar）。
 
@@ -199,11 +222,11 @@ docker compose up -d dolphinscheduler spark
 ### 4. 建表
 
 ```bash
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_order.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_detail.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_add_history_partitions.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dws_user_order_day.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ads_daily_sales.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods/ods_order.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_detail.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_add_history_partitions.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dws_ads/dws_user_order_day.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dws_ads/ads_daily_sales.sql
 ```
 
 ### 5. 生成数据并跑通链路
@@ -211,7 +234,7 @@ docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ads_daily
 ```bash
 pip3 install --user kafka-python
 
-python3 scripts/gen_mock_orders.py 1000
+python3 scripts/gen/gen_mock_orders.py 1000
 
 docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --create --topic ods_order \
@@ -221,7 +244,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
 首次建立 ODS 摄入 —— **两条 Routine Load 作业**（2026-10-09 起，不再用 Spark 摄入）：
 
 ```sql
--- 见 sql/ods_routine_load.sql（含完整注释与运维命令）
+-- 见 sql/ods/ods_routine_load.sql（含完整注释与运维命令）
 CREATE ROUTINE LOAD ods.ods_order_load ON ods_order
 COLUMNS(order_id, user_id, product_id, amount, order_time, status,
         dt = to_date(order_time))
@@ -253,7 +276,7 @@ docker compose exec spark /opt/spark/bin/spark-submit \
   --master 'local[2]' \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.mysql:mysql-connector-j:8.4.0 \
-  /opt/offline-dw/scripts/ods_order_to_starrocks.py
+  /opt/offline-dw/scripts/ods_legacy/ods_order_to_starrocks.py
 ```
 
 </details>
@@ -270,11 +293,11 @@ docker compose exec spark /opt/spark/bin/spark-submit \
 商品/维度链路额外需要 5 张表：
 
 ```bash
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_product.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods/ods_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_scd2.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_sku_detail.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_sku_detail_add_partitions.sql
 ```
 
 完整跑法见「商品 / 维度链路」一节。
@@ -377,16 +400,16 @@ SELECT (SELECT count(*) FROM dwd.dwd_order_detail)                AS order_rows,
 cd ~/offline-dw
 
 # 1. 生成商品快照 CSV（--date 造历史快照）
-python3 scripts/gen_mock_products.py --date 2026-09-20
-python3 scripts/gen_mock_products.py --date 2026-09-21
-python3 scripts/gen_mock_products.py --date 2026-09-26
+python3 scripts/gen/gen_mock_products.py --date 2026-09-20
+python3 scripts/gen/gen_mock_products.py --date 2026-09-21
+python3 scripts/gen/gen_mock_products.py --date 2026-09-26
 
 # 2. 建表（只需一次）
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods_product.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd_order_sku_detail_add_partitions.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/ods/ods_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_scd2.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_sku_detail.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_sku_detail_add_partitions.sql
 
 # 3. CSV → ODS（Stream Load，snapshot_date 从文件名自动解析）
 bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260920.csv
@@ -394,8 +417,8 @@ bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260921.csv
 bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260926.csv
 
 # 4. DIM 层：SCD1 快照 与 SCD2 拉链表
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_load.sql
-docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2_load.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_load.sql
+docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_scd2_load.sql
 
 # 5. DWD 宽表：订单 + 下单当天的商品属性（逐天 INSERT OVERWRITE）
 bash scripts/dwd_sku_load.sh
@@ -409,7 +432,7 @@ FROM dim.dim_product_scd2;"
 
 ### ⚠️ SCD2 装载必须是"清空 + 重建"一次执行
 
-`sql/dim_product_scd2_load.sql` 里 **`TRUNCATE` 和 `INSERT` 写在同一个文件**，理由：
+`sql/dim/dim_product_scd2_load.sql` 里 **`TRUNCATE` 和 `INSERT` 写在同一个文件**，理由：
 
 `is_current` 没有任何约束能保护它。主键 `(product_id, valid_from)` 只保证"版本不重复"，**保证不了"每个商品恰好一个 `is_current=1`"** —— 那是业务语义，只能靠装载 SQL 算对。
 
@@ -462,14 +485,14 @@ WHERE a.category <> b.category OR a.price <> b.price OR a.status <> b.status;
 | `ods.ods_order_event` | `DUPLICATE KEY` | 事件流落地（事件：`order`/`pay`/`ship`/`finish`/`cancel`）。行数 == `(order_id,event_type)` 去重对数（有防线⑤ 守着）|
 | `ods.ods_kafka_offset` | `PRIMARY KEY(topic, partition_id)` | **消费位点表** —— 记住"读到哪了"，增量摄入靠它 |
 | `dwd.dwd_order_lifecycle` | `PRIMARY KEY(order_id)` | **累积快照**：五个里程碑列 + 派生列。当前 **900,000 行**（`order_time` 2026-09-20 ~ 2026-12-18，湖仓第 2 步已下沉 Spark 重建）|
-| `dwd.v_order_lifecycle_expected` | 视图 | 由事件流推导"期望快照"。**曾是**装载与对账的单一真相源；2026-10-14 起装载改走 `scripts/dwd_order_lifecycle_streamload.py`（湖侧事件流），视图保留作参考口径 |
+| `dwd.v_order_lifecycle_expected` | 视图 | 由事件流推导"期望快照"。**曾是**装载与对账的单一真相源；2026-10-14 起装载改走 `scripts/legacy_step2/dwd_order_lifecycle_streamload.py`（湖侧事件流），视图保留作参考口径 |
 
 **怎么跑**（逐天，三步）
 
 ```bash
 # ① 发当天到期的事件（先 dry-run 看汇总）
-python3 scripts/gen_mock_orders.py --date 2026-09-21 --dry-run
-python3 scripts/gen_mock_orders.py --date 2026-09-21
+python3 scripts/gen/gen_mock_orders.py --date 2026-09-21 --dry-run
+python3 scripts/gen/gen_mock_orders.py --date 2026-09-21
 
 # ② 摄入到 ODS —— 不需要手工跑！
 #    Routine Load 是【常驻】作业，消息进 Kafka 后会自动落 ODS。
@@ -591,7 +614,7 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 | 层 | 靠什么保证 |
 |---|---|
-| **ODS 摄入（两条链路）** | ⭐ **StarRocks Routine Load 原生 Exactly-Once** —— 位点由引擎维护、且与数据在同一事务里提交。作业配置见 `sql/ods_routine_load.sql` |
+| **ODS 摄入（两条链路）** | ⭐ **StarRocks Routine Load 原生 Exactly-Once** —— 位点由引擎维护、且与数据在同一事务里提交。作业配置见 `sql/ods/ods_routine_load.sql` |
 | ODS（订单） | **`PRIMARY KEY(order_id)` 表模型** —— 即使重复消费也自动折叠 |
 | ODS（事件）⚠️ | **`DUPLICATE KEY` 表模型 —— 重复【不会折叠】**，所以幂等**必须**靠摄入层（现已由 Routine Load 保证） |
 | ODS（商品） | 工作流开头 `TRUNCATE ods_product`，再全量重灌所有快照；Stream Load 标签**每次运行唯一** |
@@ -623,7 +646,7 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 | 删掉三样组件 | 位点表 + Python 脚本 + Shell 外壳（含 4 道防线）全部退役 |
 | **消掉重复实现的正确性风险** | 手工位点表 = 重新实现 StarRocks 自带的 Exactly-Once；10-05 静默清库事故就是这套手工逻辑的漏洞 |
 
-**改后**：两条常驻作业（`sql/ods_routine_load.sql`）
+**改后**：两条常驻作业（`sql/ods/ods_routine_load.sql`）
 
 | 作业 | topic | 目标表 |
 |---|---|---|
@@ -726,7 +749,7 @@ docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 RESUME ROUTINE LOAD FOR ods.ods_order_event_load;"
 
 # 数据质量检查的【自检】：用内存里的假数据证明检查真的能发现问题
-docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc_dim_product_selftest.sql
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dqc/dqc_dim_product_selftest.sql
 
 # 【指纹】跑工作流前后各执行一次，输出必须一字不差
 docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/fingerprint_product_chain.sql
@@ -790,7 +813,7 @@ docker compose restart dolphinscheduler
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
 12. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
-13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**（`history_partition_num=0`）。补数进来的新日期，必须先照 `sql/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这是动态分区的固有行为、属运维常规动作**；想省掉它可改表达式分区，见「后续方向 → 可选架构改进」。
+13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**（`history_partition_num=0`）。补数进来的新日期，必须先照 `sql/dwd/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这是动态分区的固有行为、属运维常规动作**；想省掉它可改表达式分区，见「后续方向 → 可选架构改进」。
 14. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
 15. ⭐ **常驻 Routine Load 的新运维负担** —— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
 16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`** —— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
@@ -837,8 +860,8 @@ docker compose restart dolphinscheduler
 
 **可选架构改进**（不是待办任务 —— 现状能正常工作，属于"想省掉人工操作"时才做）：
 
-- [ ] `dwd_order_sku_detail` 改**表达式分区** —— 现在是动态分区（`dynamic_partition.history_partition_num=0`：**只建未来、不建历史**），所以补历史某天前需要手工 `ALTER TABLE ... ADD PARTITION`。**这是 StarRocks 动态分区的固有行为，属运维常规动作**（建表时也用 `sql/dwd_add_history_partitions.sql` 补过 `p20260915`~`p20260919`）；改成表达式分区可一劳永逸消掉它（PITFALLS §3.2 推荐过）
-      —— **2026-10-14 更新**：90 天的分区已用 `sql/step5_1_add_partitions.sql`（126 条 `ALTER`，detail 62 + sku 64）补齐
+- [ ] `dwd_order_sku_detail` 改**表达式分区** —— 现在是动态分区（`dynamic_partition.history_partition_num=0`：**只建未来、不建历史**），所以补历史某天前需要手工 `ALTER TABLE ... ADD PARTITION`。**这是 StarRocks 动态分区的固有行为，属运维常规动作**（建表时也用 `sql/dwd/dwd_add_history_partitions.sql` 补过 `p20260915`~`p20260919`）；改成表达式分区可一劳永逸消掉它（PITFALLS §3.2 推荐过）
+      —— **2026-10-14 更新**：90 天的分区当时用一份临时的补分区 SQL（126 条 `ALTER`，该文件未入库），detail 62 + sku 64）补齐
       （`dwd_order_detail` 95 个、`dwd_order_sku_detail` 90 个），并把两表的 `dynamic_partition.enable` 置为 `false`
       —— **本项目**在放量后不再依赖动态分区（既不会自动建、也不会自动删）。**「改表达式分区」仍建议做**，
       否则每次新增日期范围都要重跑一遍"关开关 → 逐条 ALTER → 开开关"，而且漏跑就是 `Insert has filtered data` 类硬失败
@@ -909,7 +932,7 @@ Spark 几乎不动（固定开销主导：JVM + 全量 JDBC 搬运）。
 
 **① 当初这一跳的真实成本：13.7 秒，而它什么都没读到。**
 
-实测 `bash scripts/ods_order_event_ingest.sh`（位点已在 2379，无新消息）：
+实测 `bash scripts/ods_legacy/ods_order_event_ingest.sh`（位点已在 2379，无新消息）：
 
 ```
 退出码=0   墙钟=13670 ms
@@ -940,7 +963,7 @@ Routine Load 支持 JSON + **衍生列**（`COLUMNS` 里写函数），
 `dt=to_date(event_time)` 这类派生在导入时就能完成
 （[导入过程中实现数据转换](https://docs.starrocks.io/zh/docs/loading/Etl_in_loading/)）。
 
-**⑤ 实施时踩到的三个点（都已写进 `sql/ods_routine_load.sql` 注释）**
+**⑤ 实施时踩到的三个点（都已写进 `sql/ods/ods_routine_load.sql` 注释）**
 
 - **`kafka_offsets` 必须显式给、且与 `kafka_partitions` 按顺序对应** ——
   不给默认是 `OFFSET_END`（会**跳过**未读消息）；给 `OFFSET_BEGINNING` 会**重灌**。
@@ -1163,7 +1186,7 @@ docker run --rm --network offline-dw_default --memory 5g \
 
 DWS / ADS 没有单独成步，和明细一起灌（同一支 Spark 作业内两级聚合）：
 DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
-`sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`：
+`sql/dws_ads/dws_user_order_day_insert.sql` + `sql/dws_ads/ads_daily_sales_insert.sql`：
 派生指标一律「先各自 SUM 再相除」（`SUM(paid_amount)/SUM(paid_cnt)`），
 除零用 `when(denominator != 0, ...).otherwise(null)` 对齐 `NULLIF`。
 
@@ -1181,7 +1204,7 @@ DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
 #### SCD2 时点关联链路：`scripts/legacy_step2/dwd_order_sku_streamload.py`（已废弃）
 
 `dwd_order_sku_detail` 的口径是**范围 JOIN**：`o.dt BETWEEN s.valid_from AND s.valid_to`
-（见 `sql/dwd_order_sku_detail_load.sql`）。Spark 侧逐字照搬，只把事实侧来源从仓侧
+（见 `sql/dwd/dwd_order_sku_detail_load.sql`）。Spark 侧逐字照搬，只把事实侧来源从仓侧
 `dwd_order_detail` 换成**湖侧同口径明细**（`lake.ods.ods_order`，逐 key 已对账一致）。
 
 **为什么事实读湖、维度反而 JDBC 读仓**：商品链路没进湖（湖里只有订单/事件两张表），
@@ -1296,7 +1319,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 | 28 | **`concat_ws` 会跳过 `NULL`，导致整列错位** | 可空字段为 `NULL` 时 `concat_ws` 直接少输出一段，15 列变 14 列，后续列全部左移 | 每个可空列先 `F.coalesce(col, F.lit("\\N"))`（StarRocks 认的 NULL 字面量）；落盘后**自检"每行 TAB 数 = 列数-1"再推给 BE** |
 
 > ★ 坑 27 的定位手法值得记住：`too many filtered rows` 不会给错误 URL，
-> 于是写了 `scripts/probe_lifecycle_bisect.py` —— 按**行数二分**推给 BE，
+> 于是写了 `scripts/legacy_step2/probe_lifecycle_bisect.py` —— 按**行数二分**推给 BE，
 > 390 行时收敛到单行失败，读出 `2026110400184 ... 2,995.00`，逗号一目了然。
 > 这类"整批失败、没有错误样本"的导入问题，二分比逐行试快得多。
 
@@ -1321,7 +1344,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 **脚本**（`bash scripts/lake/run_dim.sh ddl|build|dry` / `bash scripts/lake/run_dwd.sh`）
 - `sql/lake/lake_dim.sql` + `scripts/lake/lake_dim_build.py`（SCD2 与当前版）
 - `sql/lake/lake_dwd.sql` + `scripts/lake/lake_dwd_build.py`（明细 / SKU / 累积快照，三张表一次建）
-- `sql/lake/lake_dws_ads.sql` + `scripts/lake/lake_dws_ads_build.py`（汇总层；口径逐字照搬仓侧 SQL，**保留但已不在主链路上**，见第 3 步）
+- ~~`sql/lake/lake_dws_ads.sql` + `scripts/lake/lake_dws_ads_build.py`~~（汇总层；口径逐字照搬仓侧 SQL。**2026-10-15 提交 `cfab3e0` 已删除** —— 链路改成「湖侧只到 DWD，仓侧用 `sql/dws_ads_from_lake.sql` 从 `lake.dwd` 物化出 dws/ads」，见第 3 步）
 
 **湖↔仓逐项对账（实测全一致）**：`detail` 的行数 / `count(DISTINCT order_id)` / 天数 / `sum(amount)` /
 `order_time` 区间；`lifecycle` 的行数 / `sum(amount)` / 阶段分布 / 三个滞后合计；`dws` / `ads` 的
@@ -1404,7 +1427,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 明细见「⭐ DWD / DWS / ADS 灌回仓侧」一节
 - [x] **汇总层（DWS / ADS）也下沉** —— 不在原计划里，和明细一起做了 ✅ **2026-10-14**
       —— ✅ **2026-10-14 追加：已进一步沉到湖侧**（`lake.dws.dws_user_order_day` / `lake.ads.ads_daily_sales`），见「⭐ 第 3 步：DWD / DWS / ADS 下沉到湖侧」
-      —— 落 `scripts/legacy_step2/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
+      —— 落 `scripts/legacy_step2/dws_ads_streamload.py`；口径照搬 `sql/dws_ads/dws_user_order_day_insert.sql` + `sql/dws_ads/ads_daily_sales_insert.sql`
       —— 实测：`dws_user_order_day` **18,000 行** / 90 天（200 用户/天 × 90）、`ads_daily_sales` **90 行**；
          `SUM(order_cnt)` 两侧都 = 854,844 ✅
 - [x] **SCD2 时点关联改写为 Spark SQL** ✅ **2026-10-14**
@@ -1417,7 +1440,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
          （`ods.ods_product` 补齐 90 天 × 50 商品 = 4,500 行 → `dim_product_scd2` 4,500 行）
       —— ⚠️ `SUM(amount)` 天然小于明细侧（内连接丢掉无当天版本的订单），**对账要按天比行数**
 - [x] **累积快照推导改写为 Spark SQL** ✅ **2026-10-14**
-      —— 落 `scripts/legacy_step2/dwd_order_lifecycle_streamload.py` + 宿主外壳 `run_lifecycle.sh`
+      —— 落 `scripts/legacy_step2/dwd_order_lifecycle_streamload.py` + 宿主外壳 `scripts/legacy_step2/run_lifecycle.sh`
       —— 判据：与旧视图 `dwd.v_order_lifecycle_expected` 口径等价
       —— 实测：湖侧 2,969,579 事件行 → **900,000 个订单**（`order_time` 覆盖
          2026-09-20 ~ 2026-12-18），**25.0 秒**灌完；与仓内 SQL 重算的

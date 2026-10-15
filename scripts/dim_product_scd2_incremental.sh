@@ -2,7 +2,7 @@
 # =============================================================================
 # SCD2 拉链表【增量维护】—— 只处理比现有最新版本更新的快照
 #
-# 背景：sql/dim_product_scd2_load.sql 是【全量重建】（TRUNCATE + 全量重推），
+# 背景：sql/dim/dim_product_scd2_load.sql 是【全量重建】（TRUNCATE + 全量重推），
 #       快照天数一多就变慢。这个脚本改成增量：只 UPDATE 关闭旧的当前版本、
 #       再 INSERT 新版本。
 #
@@ -22,7 +22,7 @@
 set -e
 
 cd "$(dirname "$0")/.."     # 切到仓库根目录，容器内是 /opt/offline-dw
-SQL_FILE="sql/dim_product_scd2_incremental.sql"
+SQL_FILE="sql/dim/dim_product_scd2_incremental.sql"
 
 MYSQL="docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot"
 QUERY="docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B -e"
@@ -100,7 +100,7 @@ fi
 
 if [ "$FAIL" != "0" ]; then
     echo
-    echo "工作流将中断在此处。修复方式：跑全量重建 sql/dim_product_scd2_load.sql"
+    echo "工作流将中断在此处。修复方式：跑全量重建 sql/dim/dim_product_scd2_load.sql"
     exit 1
 fi
 

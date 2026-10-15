@@ -26,7 +26,7 @@
     docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' \
       --conf spark.jars.ivy=/tmp/.ivy2 \
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.mysql:mysql-connector-j:8.4.0 \
-      /opt/offline-dw/scripts/ods_order_event_to_starrocks.py
+      /opt/offline-dw/scripts/ods_legacy/ods_order_event_to_starrocks.py
 """
 import json
 from datetime import datetime
@@ -160,7 +160,7 @@ print(u"本次各分区新位点: %s" % sorted(new_offsets.items()))
 
 # ---- retention 防线（尽力而为）----
 # Spark 容器里没有 kafka-python，这里会走 ImportError 分支跳过；
-# 真正的防线在 shell 外壳 scripts/ods_order_event_ingest.sh（用 kafka-get-offsets.sh）
+# 真正的防线在 shell 外壳 scripts/ods_legacy/ods_order_event_ingest.sh（用 kafka-get-offsets.sh）
 try:
     from kafka import KafkaConsumer
     from kafka.structs import TopicPartition

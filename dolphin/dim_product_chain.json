@@ -165,7 +165,7 @@
     "projectCode" : 23142056525568,
     "userId" : 1,
     "taskType" : "SHELL",
-    "taskParams" : {"localParams":[],"rawScript":"docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim_product_load.sql","resourceList":[]},
+    "taskParams" : {"localParams":[],"rawScript":"docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim/dim_product_load.sql","resourceList":[]},
     "taskParamList" : [ ],
     "taskParamMap" : null,
     "flag" : "YES",

@@ -9,7 +9,7 @@
 #   和逐天物化同一个理由：校验逻辑只写一份，避免节点内容与文件漂移。
 set -e
 
-SQL_FILE="$(dirname "$0")/../sql/dqc_dim_product.sql"
+SQL_FILE="$(dirname "$0")/../sql/dqc/dqc_dim_product.sql"
 if [ ! -f "$SQL_FILE" ]; then
     echo "❌ 找不到 SQL 文件: $SQL_FILE"
     exit 1

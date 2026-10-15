@@ -56,11 +56,11 @@ SCRATCH="${SCRATCH:-/mnt/d/develop/workspace/deepseek_harness_temp}"
 ```
 
 `/mnt/d/...` 是 WSL 里访问 Windows 盘的路径，**仓库的自包含性被破坏了**。
-更糟的是当时那支 `run_lake_dws_ads.sh` 第 20 行还会 `cp` 覆盖仓库里的 `scripts/lake_dws_ads.sql`
+更糟的是当时那支 `run_lake_dws_ads.sh` 第 20 行还会 `cp` 覆盖仓库里的一份临时 SQL（`scripts/lake_dws_ads.sql`，从未入库）
 （该脚本未入库，整套第 2 步产物已移到 `scripts/legacy_step2/`）：
 
 ```bash
-cp "$LOCAL/lake_dws_ads.sql" "$PROJ/scripts/lake_dws_ads.sql"
+cp "$LOCAL/lake_dws_ads.sql" "$PROJ/scripts/lake_dws_ads.sql"   # 历史写法，该文件已删
 ```
 
 **改法**：
@@ -110,7 +110,7 @@ scope_ids = (ev.filter((F.col("dt") >= d1) & (F.col("dt") <= d2))
 
 ### 缺陷 5：湖侧写入没有「写后自检」
 
-`lake_dwd_build.py` / `lake_dws_ads_build.py` 写完只打印行数，不校验。
+`lake_dwd_build.py`（以及已删除的 `lake_dws_ads_build.py`）写完只打印行数，不校验。
 仓侧那几支 `*_streamload.py` 有逐行自检（TAB 列数、逗号检查）与导入后回读比对，湖侧应该同等对待。
 
 **改法**：每次写完，回读「行数 + 金额合计 + 去重主键数」三者，与 Spark 侧期望值比对，不等则 `exit 2`。
@@ -128,8 +128,8 @@ PROJ=/path/to/offline-dw
 bash "$PROJ/scripts/lake/run_dwd.sh" build all
 bash "$PROJ/scripts/lake/run_dwd.sh" build dwd_order_detail 2026-11-01 2026-11-03
 bash "$PROJ/scripts/lake/run_dim.sh" build
-# run_dws_ads.sh 未入库；湖侧 DWS/ADS 现在建在
-# scripts/lake/lake_dws_ads_build.py（见 §2 步骤 3）
+# run_dws_ads.sh 未入库；湖侧 DWS/ADS 那套已删（见 cfab3e0），
+# 现行方案：湖侧只到 DWD，仓侧用 scripts/run_dws_ads_from_lake.sh 物化 dws/ads
 ```
 
 **验收**：同一命令连跑两遍，行数不变。
@@ -163,11 +163,11 @@ bash scripts/lake/run_dwd.sh build dwd_order_lifecycle "$D1" "$D2"   # ⚠️ �
 没有分区裁剪之外的优化，下游点查（按用户、按日期）会明显退化。所以保留仓侧表，
 但**数据来源从仓侧 dwd 换成湖侧 dwd**。
 
-**代码**（新增两个 SQL + 一个外壳；旧 `scripts/dws_ads_streamload.py` 已移到 `scripts/legacy_step2/`）：
+**代码**（新增两个 SQL + 一个外壳；旧 `scripts/dws_ads_streamload.py` 已移到 `scripts/legacy_step2/`。⚠️ 本文档写于 2026-10-14：其中「湖侧建 dws/ads」那套（`scripts/lake/lake_dws_ads_build.py`）在 2026-10-15 提交 `cfab3e0` 里被删除，最终方案是湖侧只到 DWD。下文相关段落仅作历史参考）：
 
 ```sql
--- sql/dws_from_lake.sql
--- 口径与 sql/dws_user_order_day_insert.sql 逐字一致，只把来源换成 lake.dwd.dwd_order_detail
+-- （历史示例，文件未入库）sql/dws_ads/dws_from_lake.sql —— 已删，取而代之的是 sql/dws_ads_from_lake.sql
+-- 口径与 sql/dws_ads/dws_user_order_day_insert.sql 逐字一致，只把来源换成 lake.dwd.dwd_order_detail
 INSERT OVERWRITE dws.dws_user_order_day
 SELECT user_id, dt,
        COUNT(*)                                              AS order_cnt,
@@ -180,8 +180,8 @@ GROUP BY user_id, dt;
 ```
 
 ```sql
--- sql/ads_from_lake.sql
--- 口径与 sql/ads_daily_sales_insert.sql 逐字一致
+-- （历史示例，文件未入库）sql/dws_ads/ads_from_lake.sql —— 已删，取而代之的是 sql/dws_ads_from_lake.sql
+-- 口径与 sql/dws_ads/ads_daily_sales_insert.sql 逐字一致
 INSERT OVERWRITE ads.ads_daily_sales
 SELECT dt,
        SUM(order_cnt)                                    AS order_cnt,
@@ -199,7 +199,7 @@ GROUP BY dt;
 > ⚠️ **`INSERT OVERWRITE` 对 PRIMARY KEY 表**：`dws_user_order_day` 是 `PRIMARY KEY(user_id, dt)`、
 > `ads_daily_sales` 是 `PRIMARY KEY(dt)`，**无分区**。StarRocks 的 PK 表**不支持** `INSERT OVERWRITE PARTITION`，
 > 但支持**无分区表的整表 `INSERT OVERWRITE`**。你们现在的
-> `sql/dws_user_order_day_insert.sql:21` 用的就是 `INSERT OVERWRITE`（按 `dt` 过滤），
+> `sql/dws_ads/dws_user_order_day_insert.sql:21` 用的就是 `INSERT OVERWRITE`（按 `dt` 过滤），
 > 所以**照原样能跑**；只有当你要改成「只覆盖某天」时才需要在外面包 `DELETE WHERE dt=...`。
 > **建议**：先按天 `DELETE WHERE dt = '${bizdate}'` + `INSERT INTO`，语义最明确、不受版本差异影响。
 

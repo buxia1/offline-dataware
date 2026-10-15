@@ -115,7 +115,7 @@ docker exec spark /opt/spark/bin/spark-submit \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   --repositories https://maven.aliyun.com/repository/public \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.mysql:mysql-connector-j:8.4.0 \
-  /opt/offline-dw/scripts/ods_order_to_starrocks.py
+  /opt/offline-dw/scripts/ods_legacy/ods_order_to_starrocks.py
 ```
 
 **作用**：读 Kafka 全量消息，解析 JSON，写入 `ods.ods_order`。
@@ -317,7 +317,7 @@ bash /opt/offline-dw/scripts/dqc_order_chain.sh
 
 **⚠️ 检查④ 有一个已知盲区**：`paid_cnt = 0` 时 `NULLIF(paid_cnt, 0)` 返回 `NULL` → `ABS(NULL - x)` 是 `NULL` → `CASE` 落到 `ELSE 0`，客单价错了也抓不到。自检里专门留了一个用例（4e）**如实记录这个盲区**，没有掩盖。
 
-**自检**：`sql/dqc_order_chain_selftest.sql` 用内存假数据证明这些规则真能发现问题（**18 个用例**：① 4 个、② 3 个、③ 3 个、④ 6 个、⑤ 2 个）。
+**自检**：`sql/dqc/dqc_order_chain_selftest.sql` 用内存假数据证明这些规则真能发现问题（**18 个用例**：① 4 个、② 3 个、③ 3 个、④ 6 个、⑤ 2 个）。
 
 **覆盖范围会随时间自然收窄**：`dwd_order_detail` 是动态分区表（`dynamic_partition.start = -30`），30 天前的分区会被自动删除；而 DWS/ADS **不是分区表**，旧行会一直留着。所以越久以前的日期，②③ 越无法校验。这是设计使然，不是 bug。
 
@@ -375,7 +375,7 @@ SELECT (SELECT count(*) FROM dwd.dwd_order_detail)   AS dwd,
 
 DS 会为范围内每一天生成一次执行，并把那天的日期作为"业务日期"传给 `${system.biz.date}`。
 
-> 补数有一个前提：**DWD 表里那一天的分区必须已经存在**。动态分区不会回溯创建历史分区，需要先手工 `ALTER TABLE ... ADD PARTITION`（见 `sql/dwd_add_history_partitions.sql`）。
+> 补数有一个前提：**DWD 表里那一天的分区必须已经存在**。动态分区不会回溯创建历史分区，需要先手工 `ALTER TABLE ... ADD PARTITION`（见 `sql/dwd/dwd_add_history_partitions.sql`）。
 
 ## 失败告警
 
@@ -579,7 +579,7 @@ wait_order_chain ──► truncate_and_load_ods ──► dim_product_load
 
 **收益**：同一段逻辑只存在一处，**改文件即生效**，不会再出现"节点里改了、文件里忘了改"的漂移。
 
-> 这个坑踩过一次：曾经有一份 `sql/dwd_order_detail_insert.sql`，里面用着早已废弃的 `${bizdate}` 变量 —— 对应的是"用 SQL 任务拼分区名"那个**根本跑不通**的方案。**该文件已删除**，教训保留在 PITFALLS 里。
+> 这个坑踩过一次：曾经有一份 `sql/dwd/dwd_order_detail_insert.sql`，里面用着早已废弃的 `${bizdate}` 变量 —— 对应的是"用 SQL 任务拼分区名"那个**根本跑不通**的方案。**该文件已删除**，教训保留在 PITFALLS 里。
 
 > **所以 `docker-compose.yml` 里给 `dolphinscheduler` 容器挂了 `./sql` 和 `./scripts`（只读），给 `spark` 容器挂了 `./data`。**
 > **副作用**：`sql/`、`scripts/` 里的文件名和路径**不能随便改** —— 一改名节点里写死的路径就失效。
@@ -630,17 +630,17 @@ docker exec -e SR_HOST=starrocks spark bash -c 'for f in /opt/offline-dw/data/di
 ## ③ dim_product_load（SCD1）
 
 ```bash
-docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim_product_load.sql
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim/dim_product_load.sql
 ```
 
-`<` 重定向由 **DS 容器的 shell** 执行，读的是 DS 容器里的 `/opt/offline-dw/sql/dim_product_load.sql`。**这条命令能跑通，就证明 A1 那个挂载生效了。**
+`<` 重定向由 **DS 容器的 shell** 执行，读的是 DS 容器里的 `/opt/offline-dw/sql/dim/dim_product_load.sql`。**这条命令能跑通，就证明 A1 那个挂载生效了。**
 
 **幂等靠 `PRIMARY KEY(product_id)` 同键覆盖，不需要 `TRUNCATE`。**
 
 ## ④ dim_product_scd2_load（SCD2）
 
 ```bash
-docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim_product_scd2_load.sql
+docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < /opt/offline-dw/sql/dim/dim_product_scd2_load.sql
 ```
 
 **这个文件里同时有 `TRUNCATE` 和 `INSERT`**，靠 mysql CLI 的多语句能力一次执行完。理由见 README「SCD2 装载必须是"清空 + 重建"一次执行」。
@@ -661,7 +661,7 @@ bash /opt/offline-dw/scripts/dwd_sku_load.sh
 
 - **从 `SELECT DISTINCT dt FROM dwd_order_detail` 动态取天数** —— 不写死。写死的日期列表在新增一天订单后会**静默漏算**。
 - **自动补齐缺失的历史分区** —— 对比"有数据的天" vs "现有分区"，缺的自动 `ADD PARTITION`（补分区前要关掉动态分区，用 `trap` 兜底恢复，见 PITFALLS §3.8）。
-- 逐天 `INSERT OVERWRITE`，SQL 从 `sql/dwd_order_sku_detail_load.sql` 读（不内联）。
+- 逐天 `INSERT OVERWRITE`，SQL 从 `sql/dwd/dwd_order_sku_detail_load.sql` 读（不内联）。
 
 **为什么必须覆盖全部天**：SCD2 是全量重建的，重建一次所有天的匹配结果都可能变。
 
@@ -692,7 +692,7 @@ DS 判断节点成败**只看退出码，不看日志内容** —— 只打印�
 
 **⚠️ 检查⑥ 为什么必须拆成两条查询**：只比属性值 → 抓不到"版本区间挪了"（范围 JOIN 不成立时，宽表那行**直接消失**，比较语句根本没机会执行）；只数孤儿行 → 抓不到"值变了"。实测：改 1 个商品品类报 **13**，挪 1 天版本区间报 **4** 行孤儿，**两种情况下 ④⑤ 都纹丝不动**。详见 PITFALLS §3.9。
 
-**自检**：`sql/dqc_dim_product_selftest.sql` 用内存里的假数据证明这些规则真的能发现问题（**13 个用例**：① 3 个、② 4 个、③ 3 个、⑥ 3 个，含上面那个哨兵值盲区；④⑤ 依赖真实表，造不出内存用例）。**一个从来没失败过的检查，跟没有检查是一样的。**
+**自检**：`sql/dqc/dqc_dim_product_selftest.sql` 用内存里的假数据证明这些规则真的能发现问题（**13 个用例**：① 3 个、② 4 个、③ 3 个、⑥ 3 个，含上面那个哨兵值盲区；④⑤ 依赖真实表，造不出内存用例）。**一个从来没失败过的检查，跟没有检查是一样的。**
 
 **这条链路是"自愈"的** —— 每个节点都清空+重建，所以中间表弄不坏（手工改坏 SCD2，重跑时节点④ 会整个覆盖掉）。**因此 DQC 真正能抓的是三处它修不了的地方**：CSV 输入本身有问题、装载 SQL 逻辑被改错、或**节点④ 没跑成功**（SCD2 已更新而宽表停在旧口径 —— 这正是 ⑥ 补上的那个盲区）。
 

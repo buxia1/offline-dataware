@@ -149,7 +149,7 @@ preflight() {
     || die "读不到 lake.dwd.dwd_order_detail（external catalog lake 是否可用？）"
   for t in dws.dws_user_order_day ads.ads_daily_sales; do
     mysql_q "SELECT 1 FROM $t LIMIT 1" >/dev/null 2>&1 \
-      || die "读不到 $t；请先执行 sql/dws_user_order_day.sql / sql/ads_daily_sales.sql 建表"
+      || die "读不到 $t；请先执行 sql/dws_ads/dws_user_order_day.sql / sql/dws_ads/ads_daily_sales.sql 建表"
   done
   log "  lake.dwd.dwd_order_detail / dws.dws_user_order_day / ads.ads_daily_sales  均可读"
   log "  区间：$D1 ~ $D2$([ "$FULL_RANGE" = 1 ] && echo '（全区间）')"

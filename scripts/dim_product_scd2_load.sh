@@ -13,10 +13,10 @@
 #   ③ 开关放在脚本参数里 → 恢复时不用改 DS 节点、不用导出导入工作流
 #
 # 【两个 SQL 的分工】
-#   sql/dim_product_scd2_incremental.sql  （增量）
+#   sql/dim/dim_product_scd2_incremental.sql  （增量）
 #       UPDATE 关闭旧的当前版本 + INSERT 新版本
 #       需要外壳替换 ${LAST}，见 scripts/dim_product_scd2_incremental.sh
-#   sql/dim_product_scd2_load.sql         （全量）
+#   sql/dim/dim_product_scd2_load.sql         （全量）
 #       TRUNCATE + 全量重推，永远从 ODS 完整推导
 #
 # 运行环境：DolphinScheduler 的 Shell 任务节点（脚本内部要 docker exec）
@@ -35,7 +35,7 @@ case "$MODE" in
     --full|--full-rebuild)
         echo "=== 模式：全量重建（TRUNCATE + 从 ODS 完整重推）==="
         echo "⚠️  会清空 dim.dim_product_scd2 后重建 —— 这是增量逻辑坏掉时的恢复手段"
-        docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim_product_scd2_load.sql
+        docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_scd2_load.sql
         echo "✅ 全量重建完成"
         ;;
     *)

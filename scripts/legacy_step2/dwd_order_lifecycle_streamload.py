@@ -11,7 +11,7 @@
   Milestone 取的是 MAX(event_time)，同一事件类型的重复副本不会改变 MAX。
   所以下游口径一致，但湖侧扫描量更小、且没有重复放大。
 
-【口径逐字照搬 sql/dwd_order_lifecycle.sql 的视图 dwd.v_order_lifecycle_expected】
+【口径逐字照搬 sql/dwd/dwd_order_lifecycle.sql 的视图 dwd.v_order_lifecycle_expected】
     agg = GROUP BY order_id:
         user_id      = MAX(user_id)        （注意：MAX 忽略 NULL）
         product_id   = MAX(product_id)

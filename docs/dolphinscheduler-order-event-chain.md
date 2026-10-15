@@ -12,15 +12,15 @@
 | `ods.ods_order_event` | 事件流落地（`DUPLICATE KEY`，8 列）|
 | `ods.ods_kafka_offset` | **消费位点表**（`PRIMARY KEY(topic, partition_id)`）|
 | `dwd.dwd_order_lifecycle` | 累积快照事实表（`PRIMARY KEY(order_id)`）|
-| `scripts/ods_order_event_ingest.sh` | 摄入外壳（增量 / `--reset`）|
-| `scripts/ods_order_event_to_starrocks.py` | Spark 摄入作业（被上面的外壳调用）|
+| `scripts/ods_legacy/ods_order_event_ingest.sh` | 摄入外壳（增量 / `--reset`）|
+| `scripts/ods_legacy/ods_order_event_to_starrocks.py` | Spark 摄入作业（被上面的外壳调用）|
 | `scripts/dwd_order_lifecycle_load.sh` | 累积快照装载 + 五道防线（默认增量 / `--full`）|
 
 ---
 
 ## 一、先说清楚：为什么生成器**不能**放进 DS
 
-事件数据的产生者是 `scripts/gen_mock_orders.py`（模拟"上游业务系统"）。**它不能放进 DS**，实测原因：
+事件数据的产生者是 `scripts/gen/gen_mock_orders.py`（模拟"上游业务系统"）。**它不能放进 DS**，实测原因：
 
 ```
 $ docker exec dolphinscheduler bash -c 'which python3'
@@ -68,7 +68,7 @@ bash: line 1: python3: command not found
 **脚本内容**：
 
 ```bash
-bash /opt/offline-dw/scripts/ods_order_event_ingest.sh
+bash /opt/offline-dw/scripts/ods_legacy/ods_order_event_ingest.sh
 ```
 
 **作用**：从 Kafka **增量**读新消息 → 写 `ods.ods_order_event` → 回写 `ods_kafka_offset` 位点。
@@ -204,7 +204,7 @@ DS 只负责"Kafka → 数仓"。**事件本身要有人发**，有三种来源�
 
 ```cron
 # 每天 01:30 发"昨天"的事件（与 DS 的 system.biz.date = D-1 对齐）
-30 1 * * * cd /home/l/offline-dw && /usr/bin/python3 scripts/gen_mock_orders.py --date "$(date -d 'yesterday' +\%F)" >> /tmp/gen_event.log 2>&1
+30 1 * * * cd /home/l/offline-dw && /usr/bin/python3 scripts/gen/gen_mock_orders.py --date "$(date -d 'yesterday' +\%F)" >> /tmp/gen_event.log 2>&1
 ```
 
 **⚠️ 不配 cron 的后果（必须知道）**：DS 工作流会照常按 02:30 跑，但**没有新事件** → 摄入节点打印 `没有新消息，退出`（退出码 0，**不报错**）→ 工作流"成功"但什么都没做。
@@ -231,10 +231,10 @@ DS 的 `${system.biz.date}` = **调度日期 − 1 天**（PITFALLS §2 实测�
 
 ```bash
 # ① 发某天的事件（先 dry-run 确认"逾期/前置"都是 0）
-sudo -u l python3 scripts/gen_mock_orders.py --date 2026-09-29 --dry-run
-sudo -u l python3 scripts/gen_mock_orders.py --date 2026-09-29
+sudo -u l python3 scripts/gen/gen_mock_orders.py --date 2026-09-29 --dry-run
+sudo -u l python3 scripts/gen/gen_mock_orders.py --date 2026-09-29
 # ② 摄入（增量，只读新消息）
-bash scripts/ods_order_event_ingest.sh
+bash scripts/ods_legacy/ods_order_event_ingest.sh
 # ③ 装载累积快照（增量）
 bash scripts/dwd_order_lifecycle_load.sh
 ```
@@ -309,9 +309,9 @@ lifecycle == 唯一订单数 == 视图行数
 ```bash
 # ① 从最早缺失的那天开始，逐天"生成 → 摄入 → 装载"，不能跳
 for d in 2026-09-23 2026-09-24 2026-09-25; do
-    sudo -u l python3 scripts/gen_mock_orders.py --date "$d" --dry-run   # 先看：逾期/前置必须 0
-    sudo -u l python3 scripts/gen_mock_orders.py --date "$d"             # 真发
-    bash scripts/ods_order_event_ingest.sh                                # 增量摄入
+    sudo -u l python3 scripts/gen/gen_mock_orders.py --date "$d" --dry-run   # 先看：逾期/前置必须 0
+    sudo -u l python3 scripts/gen/gen_mock_orders.py --date "$d"             # 真发
+    bash scripts/ods_legacy/ods_order_event_ingest.sh                                # 增量摄入
     bash scripts/dwd_order_lifecycle_load.sh                              # 增量装载
 done
 ```
@@ -322,7 +322,7 @@ done
 
 ```bash
 # 位点表 + 事件表一起清，下次从 earliest 重灌
-bash scripts/ods_order_event_ingest.sh --reset
+bash scripts/ods_legacy/ods_order_event_ingest.sh --reset
 bash scripts/dwd_order_lifecycle_load.sh --full      # 快照也全量重推
 ```
 

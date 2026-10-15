@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 运行累积快照 dwd.dwd_order_lifecycle 的 Spark 下沉作业
 #
-#   bash scripts/run_lifecycle.sh dry     # 只算不写：验证行数 + 落盘自检
-#   bash scripts/run_lifecycle.sh full    # TRUNCATE 后全量重灌
+#   bash scripts/legacy_step2/run_lifecycle.sh dry     # 只算不写：验证行数 + 落盘自检
+#   bash scripts/legacy_step2/run_lifecycle.sh full    # TRUNCATE 后全量重灌
 #
 # ★ 为什么清理/TRUNCATE 放在宿主侧：Spark 容器里没有 docker，
 #   作业本身只连 StarRocks 的 9030/8040，删不了表。

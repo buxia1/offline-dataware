@@ -10,13 +10,13 @@ SKU 明细链路：湖层 Iceberg(订单明细) ⋈ SCD2 商品维度(仓侧) �
   但读湖省掉那趟 JDBC。
 
 【为什么商品维度反而要 JDBC 读仓侧】
-  dim_product_scd2 在仓侧由 sql/dim_product_scd2_load.sql 从 ods_product 重推，
+  dim_product_scd2 在仓侧由 sql/dim/dim_product_scd2_load.sql 从 ods_product 重推，
   90 天快照重建后是 4,500 行、50 个商品、覆盖 2026-09-20 ~ 2026-12-18。
   商品链路并没有进湖（湖层只有 ods_order / ods_order_event 两张表），
   4,500 行 JDBC 读一次是毫秒级 —— 【只读维度、不读事实】是关键：
   慢的是写事实、不是读小维度。
 
-【口径逐字照搬 sql/dwd_order_sku_detail_load.sql】
+【口径逐字照搬 sql/dwd/dwd_order_sku_detail_load.sql】
     FROM dwd.dwd_order_detail o
     JOIN dim.dim_product_scd2 s
       ON  o.product_id = s.product_id
@@ -189,7 +189,7 @@ def main():
         part = (filtered.filter(F.col("dt").isin(*chunk))
                 # ★★ 必须取绝对值（2026-10-14 实测踩到）：
                 #   源表 lake.ods.ods_order 里有 3% 的负金额（生成器的 NEG_AMOUNT_RATE），
-                #   而仓侧口径（sql/dwd_order_sku_detail_load.sql 读的是 dwd_order_detail）
+                #   而仓侧口径（sql/dwd/dwd_order_sku_detail_load.sql 读的是 dwd_order_detail）
                 #   拿到的是【已经 ABS 过】的明细。少这一步 → 25,534 行金额为负、
                 #   sum(amount) 比 detail 少 8,476,266.40（仓侧当年就是这么错的）。
                 #   行数完全一致、只有金额错 —— 只看行数的对账发现不了。

@@ -11,7 +11,7 @@ Spark 直接从湖层 ods_order 用【和 DWD 完全相同的清洗口径】算�
 它的结果已实测与仓侧 dwd_order_detail 逐行一致（2026-09-20：9475 行、
 sum(amount)=1544512.70、时间边界完全相同），所以聚合口径等价。
 
-【聚合口径：与 sql/dws_user_order_day_insert.sql + sql/ads_daily_sales_insert.sql 逐字对齐】
+【聚合口径：与 sql/dws_ads/dws_user_order_day_insert.sql + sql/dws_ads/ads_daily_sales_insert.sql 逐字对齐】
     dws:  GROUP BY user_id, dt
           order_cnt      = COUNT(*)
           paid_cnt       = COUNT(CASE WHEN status='paid' THEN 1 END)
@@ -293,7 +293,7 @@ def main():
 
     # -----------------------------------------------------------------
     # 2) DWS：user_id × dt
-    #    ★ 语义与 sql/dws_user_order_day_insert.sql 一致
+    #    ★ 语义与 sql/dws_ads/dws_user_order_day_insert.sql 一致
     # -----------------------------------------------------------------
     dws = (detail.groupBy("user_id", "dt")
            .agg(F.count(F.lit(1)).alias("order_cnt"),
@@ -311,7 +311,7 @@ def main():
 
     # -----------------------------------------------------------------
     # 3) ADS：按天大盘 + 派生指标
-    #    ★ 语义与 sql/ads_daily_sales_insert.sql 一致
+    #    ★ 语义与 sql/dws_ads/ads_daily_sales_insert.sql 一致
     # -----------------------------------------------------------------
     ads = (dws.groupBy("dt")
            .agg(F.sum("order_cnt").alias("order_cnt"),

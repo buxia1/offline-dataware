@@ -34,8 +34,8 @@
 --   BETWEEN 不在支持列表里，必须展开成  dt >= '...' AND dt <= '...' 。
 --
 -- 【口径来源（逐字照搬，只允许两处差异）】
---   sql/dws_user_order_day_insert.sql   -> DWS 与 ADS 的聚合表达式
---   sql/ads_daily_sales_insert.sql
+--   sql/dws_ads/dws_user_order_day_insert.sql   -> DWS 与 ADS 的聚合表达式
+--   sql/dws_ads/ads_daily_sales_insert.sql
 --   允许的差异仅：来源表由仓侧 dwd.dwd_order_detail 换成 lake.dwd.dwd_order_detail；
 --                 过滤由「= 某一天」换成「区间 >= AND <=」。
 -- =============================================================================

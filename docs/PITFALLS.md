@@ -51,7 +51,7 @@ sudo timedatectl set-timezone Asia/Shanghai
 environment:
   TZ: Asia/Shanghai
 
-# 3. Spark session（scripts/ods_order_to_starrocks.py）
+# 3. Spark session（scripts/ods_legacy/ods_order_to_starrocks.py）
 spark = (SparkSession.builder
     .appName("ods_order")
     .config("spark.sql.session.timeZone", "Asia/Shanghai")
@@ -550,7 +550,7 @@ ALTER TABLE dwd.dwd_order_detail SET ("dynamic_partition.enable" = "false");
 
 | 位置 | 情况 |
 |---|---|
-| `sql/dwd_add_history_partitions.sql` | 原版结尾**漏了** `SET ... = 'true'`，跑一次就把开关永久留在 `false`（已补） |
+| `sql/dwd/dwd_add_history_partitions.sql` | 原版结尾**漏了** `SET ... = 'true'`，跑一次就把开关永久留在 `false`（已补） |
 | `scripts/dwd_sku_load.sh` | 用 `trap ... EXIT` 兜底：**无论成功、失败还是被 Ctrl-C，都保证恢复** |
 
 **通用做法：任何"改状态 → 干活 → 改回来"的流程，都要用 `trap` 兜底，别指望自己记得。**
@@ -746,7 +746,7 @@ WHERE matched IS NULL
 
 **现象**
 
-`sql/dqc_dim_product.sql` 里少了一个右括号（`AS BIGINT)` 应为 `AS BIGINT))`），报错却是：
+`sql/dqc/dqc_dim_product.sql` 里少了一个右括号（`AS BIGINT)` 应为 `AS BIGINT))`），报错却是：
 
 ```
 ERROR 1064 (HY000) at line 20: Getting syntax error at line 102, column 0.
@@ -837,7 +837,7 @@ Detail message: Column 'violations' cannot be resolved.
 **真正的定位方法：把文件里每个分支结尾那一行 diff 出来。**
 
 ```bash
-grep -n "AS BIGINT" sql/dqc_order_chain.sql
+grep -n "AS BIGINT" sql/dqc/dqc_order_chain.sql
 # 正确应为：  ... AS BIGINT) AS violations
 # 全是：      ... AS BIGINT)          ← 一眼看出 5 个分支都缺
 ```
@@ -1251,7 +1251,7 @@ Spark 的 JDBC 方言生成的是 **MySQL 方言 DDL**（`truncate=true` 那条�
 ```bash
 # 用 StarRocks 原生语句显式清空，再用 append 全量写入
 docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "TRUNCATE TABLE ods.ods_order_event"
-docker exec spark /opt/spark/bin/spark-submit ... scripts/ods_order_event_to_starrocks.py
+docker exec spark /opt/spark/bin/spark-submit ... scripts/ods_legacy/ods_order_event_to_starrocks.py
 ```
 
 但注意：**"先清再灌"本身又引入了"Kafka 过期 → 清库"的风险**（§1.3）。
@@ -1433,7 +1433,7 @@ memory=8GB
 **现象（2026-10-07，同一个坑一天踩两次）**
 
 ```bash
-wsl.exe -e bash -lc "cd /home/l/offline-dw && python3 scripts/gen_mock_orders.py --date 2026-09-22"
+wsl.exe -e bash -lc "cd /home/l/offline-dw && python3 scripts/gen/gen_mock_orders.py --date 2026-09-22"
 # ModuleNotFoundError: No module named 'kafka'
 ```
 
@@ -1662,7 +1662,7 @@ ALTER TABLE tbl SET (dynamic_partition.enable = false);
 SQL 文件里用占位符做参数，直接执行它：
 
 ```bash
-docker exec -i starrocks mysql ... < sql/dim_product_scd2_incremental.sql
+docker exec -i starrocks mysql ... < sql/dim/dim_product_scd2_incremental.sql
 ```
 
 **没有任何报错，退出码 0，但表一行都没变。**

@@ -11,7 +11,7 @@
 set -e
 
 cd "$(dirname "$0")/.."
-SQL_FILE="sql/dqc_order_chain.sql"
+SQL_FILE="sql/dqc/dqc_order_chain.sql"
 
 MYSQL="docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot"
 QUERY="docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B -e"

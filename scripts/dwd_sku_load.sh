@@ -9,13 +9,13 @@
 #   写死的日期列表在新增一天订单后会静默漏掉那一天 —— 不报错，只是少算。
 #
 # 【为什么 SQL 不内联在本脚本里】
-#   内联会让同一段 SQL 存在两处（这里 + sql/dwd_order_sku_detail_load.sql），
+#   内联会让同一段 SQL 存在两处（这里 + sql/dwd/dwd_order_sku_detail_load.sql），
 #   改了一份忘了另一份就会跑出错误结果。
 #   本脚本只负责：替换 ${D}/${DF} 两个占位符 + 逐天执行。
 set -e
 
 # 相对脚本自身定位 SQL 文件 —— 宿主和容器里都能找到，不依赖当前目录
-SQL_FILE="$(dirname "$0")/../sql/dwd_order_sku_detail_load.sql"
+SQL_FILE="$(dirname "$0")/../sql/dwd/dwd_order_sku_detail_load.sql"
 if [ ! -f "$SQL_FILE" ]; then
     echo "❌ 找不到 SQL 文件: $SQL_FILE"
     exit 1

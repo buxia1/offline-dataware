@@ -10,8 +10,8 @@
     order → pay → cancel             cancel      （先支付再取消）
 
 用法：
-    python3 scripts/gen_mock_orders.py --date 2026-09-20 --dry-run   # 只打印，不连 Kafka
-    python3 scripts/gen_mock_orders.py --date 2026-09-20             # 真发 Kafka
+    python3 scripts/gen/gen_mock_orders.py --date 2026-09-20 --dry-run   # 只打印，不连 Kafka
+    python3 scripts/gen/gen_mock_orders.py --date 2026-09-20             # 真发 Kafka
 
 【方案：按天产生事件】
     --date 只发「到期日 == 这一天」的事件：
@@ -40,7 +40,7 @@
 【和旧生成器的区别】
     · 旧：一次发 N 条「订单宽消息」，status 是随机的字符串
     · 新：按天发「事件」，每个事件带 event_type + event_time（里程碑时间戳）
-    · 旧脚本（scripts/gen_mock_orders.py 的老版本）不在本文件里，见 git 历史
+    · 旧脚本（scripts/gen/gen_mock_orders.py 的老版本）不在本文件里，见 git 历史
     · 本脚本写的是新 topic ods_order_event，旧 topic ods_order 完全不动
 """
 import argparse

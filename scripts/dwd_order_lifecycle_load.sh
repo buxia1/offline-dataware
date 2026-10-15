@@ -27,7 +27,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-SQL_FILE="sql/dwd_order_lifecycle_load.sql"
+SQL_FILE="sql/dwd/dwd_order_lifecycle_load.sql"
 TABLE="dwd.dwd_order_lifecycle"
 VIEW="dwd.v_order_lifecycle_expected"
 

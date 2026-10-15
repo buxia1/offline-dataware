@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """老链路（订单快照）生成器 —— 按天产生「那天下单」的订单宽消息
 
-发给 topic ods_order。消息 schema 和 scripts/ods_order_to_starrocks.py 完全对齐：
+发给 topic ods_order。消息 schema 和 scripts/ods_legacy/ods_order_to_starrocks.py 完全对齐：
     order_id, user_id, product_id, amount, order_time, status
 
 用法：
-    python3 scripts/gen_mock_orders_snapshot.py --date 2026-09-20 --dry-run
-    python3 scripts/gen_mock_orders_snapshot.py --date 2026-09-20
+    python3 scripts/gen/gen_mock_orders_snapshot.py --date 2026-09-20 --dry-run
+    python3 scripts/gen/gen_mock_orders_snapshot.py --date 2026-09-20
 
-【它和 scripts/gen_mock_orders.py 的区别（两个生成器，两条链路）】
+【它和 scripts/gen/gen_mock_orders.py 的区别（两个生成器，两条链路）】
     gen_mock_orders.py            事件流：一个订单多个事件 → 累积快照 dwd_order_lifecycle
     gen_mock_orders_snapshot.py   订单快照：一个订单一条   → 订单链路 dwd_order_detail
     两条链路互相独立，【号段也不重叠】：

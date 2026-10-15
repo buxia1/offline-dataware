@@ -1,6 +1,6 @@
 # 维度建模与 SCD2 拉链表
 
-> 这份文档讲"**为什么这么设计**"，配合 `sql/dim_product_*.sql` 看。
+> 这份文档讲"**为什么这么设计**"，配合 `sql/dim/dim_product_*.sql` 看。
 > 概念都落到本项目的**真实表和数据**上，不空谈理论。
 
 ---
@@ -80,7 +80,7 @@
 
 → 用 `dt BETWEEN valid_from AND valid_to` 能取到**下单当天**的品类 ✅
 
-**这就是本项目为什么必须用 SCD2 而不是 SCD1** —— 见 `sql/dwd_order_sku_detail_load.sql` 开头的注释。
+**这就是本项目为什么必须用 SCD2 而不是 SCD1** —— 见 `sql/dwd/dwd_order_sku_detail_load.sql` 开头的注释。
 
 ---
 
@@ -151,7 +151,7 @@ ORDER BY snapshot_date DESC    -- 不是 update_time
 
 ## 五、SCD2 装载：全量重建的四步推导
 
-`sql/dim_product_scd2_load.sql` 用的是 **`TRUNCATE` + 全量重推**。逻辑分四步：
+`sql/dim/dim_product_scd2_load.sql` 用的是 **`TRUNCATE` + 全量重推**。逻辑分四步：
 
 ### 第 1 步：`LAG` —— 把上一行拽到当前行
 
@@ -239,7 +239,7 @@ CASE WHEN LEAD(snapshot_date) OVER (...) IS NULL THEN 1 ELSE 0 END
 | 区间有**空洞**（09-21 到 09-23 之间没版本）| 那些天的订单**匹配不上** → **孤儿行** |
 | **哨兵值版本后面还有版本** | 被称为"当前版本"的那行后面居然还有行 → 逻辑矛盾 |
 
-**这就是 DQC 检查②存在的唯一理由** —— 见 `sql/dqc_dim_product.sql`。
+**这就是 DQC 检查②存在的唯一理由** —— 见 `sql/dqc/dqc_dim_product.sql`。
 
 ---
 
@@ -369,7 +369,7 @@ order_id  dt          商品  宽表里的 category
 | 3 | `is_current=1` ↔ `valid_to = 9999-12-31` | 两者是同一个判据算出来的，必须自洽 |
 | 4 | 物化宽表与 SCD2 **逐格一致** | 抓"SCD2 变了但宽表没重物化"（口径陈旧）|
 
-**这四条就是 `sql/dqc_dim_product.sql` 的检查①②③⑥。**
+**这四条就是 `sql/dqc/dqc_dim_product.sql` 的检查①②③⑥。**
 
 ```bash
 # 一次跑完 6 项（含④⑤的行数/金额对账）
@@ -378,7 +378,7 @@ bash scripts/dqc_dim_product.sh; echo "EXIT=$?"
 
 ### 9.2 但 DQC 必须**先自证能抓到错**
 
-`sql/dqc_dim_product_selftest.sql` 用**内存假数据**（`UNION ALL`，不碰真实表）故意构造坏数据，验证检查真的会报警：
+`sql/dqc/dqc_dim_product_selftest.sql` 用**内存假数据**（`UNION ALL`，不碰真实表）故意构造坏数据，验证检查真的会报警：
 
 > **一个从来没失败过的检查，跟没有检查是一样的。**
 
@@ -619,8 +619,8 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 
 | 文件 | 作用 |
 |---|---|
-| `sql/dwd_order_lifecycle.sql` | 表（`PRIMARY KEY(order_id)`，五个里程碑列 + 派生列）+ **期望视图** `dwd.v_order_lifecycle_expected` |
-| `sql/dwd_order_lifecycle_load.sql` | 装载（`INSERT` 即 UPSERT，占位符 `${FROM_DT}`）|
+| `sql/dwd/dwd_order_lifecycle.sql` | 表（`PRIMARY KEY(order_id)`，五个里程碑列 + 派生列）+ **期望视图** `dwd.v_order_lifecycle_expected` |
+| `sql/dwd/dwd_order_lifecycle_load.sql` | 装载（`INSERT` 即 UPSERT，占位符 `${FROM_DT}`）|
 | `scripts/dwd_order_lifecycle_load.sh` | 外壳 + **五道防线**（① 范围内无订单退出 ② 占位符替换校验 ③ 全表双向 EXCEPT 对账 ④ 不变式 ⑤ **事件表行数 = 去重对数**）|
 
 **两个实现细节和本文最初的设想不同（以代码为准）**：

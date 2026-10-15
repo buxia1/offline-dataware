@@ -1,7 +1,7 @@
 -- =============================================================================
 -- ODS 层：改用 StarRocks Routine Load 摄入（替代 Spark 批作业）
 --
---   sql/ods_routine_load.sql
+--   sql/ods/ods_routine_load.sql
 --
 -- 【这一步换掉的是什么】
 --   换掉的是 ODS 的【摄入方式】，不是把清洗/join 搬进 StarRocks。
@@ -162,4 +162,4 @@ FROM KAFKA(
 -- 若事件表被污染（行数翻倍）：
 --   TRUNCATE TABLE ods.ods_order_event;
 --   TRUNCATE TABLE ods.ods_kafka_offset;
---   bash scripts/ods_order_event_ingest.sh --reset     -- 用旧 Spark 路径重建
+--   bash scripts/ods_legacy/ods_order_event_ingest.sh --reset     -- 用旧 Spark 路径重建

@@ -14,7 +14,13 @@
 #   bash scripts/lake/run_dwd.sh build dwd_order_lifecycle
 #   bash scripts/lake/run_dwd.sh ddl                                            # 只建表
 #
+#   ★ 按天增量（给 DS 每天跑的就是这条）：
+#   bash scripts/lake/run_dwd.sh incremental all                # 区间自己算（水位 = 目标表 MAX(dt)）
+#   bash scripts/lake/run_dwd.sh incremental all --lookback 3   # 回捞最近 3 天（迟到事件）
+#   bash scripts/lake/run_dwd.sh incremental dwd_order_detail 2026-12-01 2026-12-18  # 手工修区间
+#
 # 幂等由 lake_dwd_build.py 保证：写前按本次范围 DELETE、写后回读自检（不一致 exit 2）。
+# 增量模式额外做「按天闭合检查」（DWD 每天行数 vs ODS 现算值；默认只 WARN）。
 # =============================================================================
 set -euo pipefail
 
@@ -33,16 +39,31 @@ TABLE="${2:-all}"
 D1="${3:-}"
 D2="${4:-}"
 
+# --lookback N：只对 incremental 有意义；可写在第 3 位，也可写在末尾
+LOOKBACK=""
+if [ "$D1" = "--lookback" ]; then
+  LOOKBACK="${D2:-}"
+  D1=""; D2=""
+fi
+if [ "${5:-}" = "--lookback" ]; then
+  LOOKBACK="${6:-}"
+fi
+if [ -n "$LOOKBACK" ] && ! [[ "$LOOKBACK" =~ ^[0-9]+$ ]]; then
+  echo "--lookback 需要非负整数，收到：$LOOKBACK" >&2; exit 64
+fi
+
 case "$MODE_ARG" in
-  dry)     BUILD_MODE="--mode dry" ;;
-  build)   BUILD_MODE="--mode append" ;;    # append 前会按本次范围 DELETE（幂等）
-  rebuild) BUILD_MODE="--mode rebuild" ;;   # 清理逻辑与 build 相同，仅语义命名
-  ddl)     BUILD_MODE="" ;;
-  *) echo "未知模式：$MODE_ARG（可用 dry|build|rebuild|ddl）" >&2; exit 64 ;;
+  dry)         BUILD_MODE="--mode dry" ;;
+  build)       BUILD_MODE="--mode append" ;;    # append 前会按本次范围 DELETE（幂等）
+  rebuild)     BUILD_MODE="--mode rebuild" ;;   # 清理逻辑与 build 相同，仅语义命名
+  incremental) BUILD_MODE="--mode incremental" ;;
+  ddl)         BUILD_MODE="" ;;
+  *) echo "未知模式：$MODE_ARG（可用 dry|build|rebuild|incremental|ddl）" >&2; exit 64 ;;
 esac
 
 RANGE=""
 [ -n "$D1" ] && RANGE="--start $D1 --end ${D2:-$D1}"
+[ -n "$LOOKBACK" ] && RANGE="$RANGE --lookback $LOOKBACK"
 
 echo "########## 湖侧 DWD：table=$TABLE mode=$MODE_ARG ${RANGE:-（全量）} ##########"
 echo "  HERE=$HERE"
@@ -78,11 +99,12 @@ else
 fi
 
 echo ""
-echo "########## 湖侧 DWD 行数 ##########"
+echo "########## 湖侧 DWD 行数 + 水位（水位 = 增量下次从这里往后算） ##########"
 docker exec "$CT" "${SPARK_SQL[@]}" \
-  -e "SELECT 'dwd_order_detail' t, count(*) n FROM lake.dwd.dwd_order_detail
-      UNION ALL SELECT 'dwd_order_sku_detail', count(*) FROM lake.dwd.dwd_order_sku_detail
-      UNION ALL SELECT 'dwd_order_lifecycle', count(*) FROM lake.dwd.dwd_order_lifecycle;" \
+  -e "SELECT 'dwd_order_detail' t, count(*) n, cast(max(dt) as string) watermark FROM lake.dwd.dwd_order_detail
+      UNION ALL SELECT 'dwd_order_sku_detail', count(*), cast(max(dt) as string) FROM lake.dwd.dwd_order_sku_detail
+      UNION ALL SELECT 'dwd_order_lifecycle', count(*),
+        (SELECT cast(max(dt) as string) FROM lake.ods.ods_order_event) FROM lake.dwd.dwd_order_lifecycle;" \
   2>&1 | grep -vE "$FILTER" || true
 
 echo "########## DONE ##########"

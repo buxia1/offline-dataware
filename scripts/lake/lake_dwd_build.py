@@ -14,6 +14,8 @@
   spark-submit build.py --table all --mode append
   spark-submit build.py --table dwd_order_detail --mode append --start 2026-09-20 --end 2026-09-20
   spark-submit build.py --table all --mode dry            # 只算不写
+  spark-submit build.py --table all --mode incremental    # ★ 按天增量：区间自己算（见下）
+  spark-submit build.py --table all --mode incremental --lookback 3   # 回捞最近 3 天（迟到事件）
 
 幂等约定（Iceberg 没有 TRUNCATE，一律「先 DELETE 本次范围、再 append」）：
   · detail / sku 带 dt：DELETE FROM <表> WHERE dt BETWEEN d1 AND d2
@@ -24,8 +26,24 @@
 
 所以 append / rebuild 两种 mode 的清理动作完全一致（都按上面规则删本次范围），
 mode 只用来区分"算不算、写不写"，重复执行同一命令行数不会变化。
+
+按天增量（--mode incremental）：区间 = [水位+1, ODS 最新完整日]，水位取【目标表自己的 MAX(dt)】：
+  · detail / sku 带 dt      -> MAX(dt)
+  · lifecycle 无 dt 列      -> MAX(dt) of lake.ods.ods_order_event
+  · 空表                    -> MIN(dt) of ODS（第一次跑自动退化成"建表区间全量"）
+  · 已知水位落后时，-1 天重算作为兜底（重算幂等，代价很小）
+  · --lookback N            -> 水位再往前 N 天，用来回捞迟到事件
+水位取"目标表自己"而不是 ODS，是为了保证 DWD ≤ ODS：若 ODS 某天刚被重放、
+而 DWD 还没算，水位会停在 DWD 的历史位置，下次增量自然把那天补上。
+
+只处理 ODS 已有的完整日：d1 > d2（没有新数据）时不算不写，打印 NOTHING TO DO 后正常退出——重复执行安全。
+
+写入后除逐表自检外，还有一道**按天闭合检查**：detail 每天行数 vs ODS 当天
+「user_id 非空」订单数、lifecycle vs 事件表当天 order_id 去重数。不一致的日期会被列出来；
+默认只 WARN（--strict-closure 才 exit 2）——因为「ODS 当天分区被重放但还没重算」是正常瞬态。
 """
 import argparse
+import datetime
 import sys
 
 from pyspark.sql import SparkSession, Window
@@ -209,6 +227,129 @@ BUILDERS = {
 
 ORDER_OF_EXEC = ["dwd_order_detail", "dwd_order_sku_detail", "dwd_order_lifecycle"]
 
+# 每张目标表对应的「期望行数」来源（按天闭合检查用）：
+#   op="notnull" -> 当天 ODS 里该列非空的行数（detail：user_id IS NOT NULL）
+#   op="distinct"-> 当天 ODS 里该列的去重数（lifecycle：事件表当天 order_id 去重数）
+CLOSURE_SPEC = {
+    "dwd_order_detail":     dict(src=SRC_ORDER, col="user_id",  op="notnull"),
+    "dwd_order_sku_detail": dict(src=SRC_ORDER, col="user_id",  op="notnull"),
+    "dwd_order_lifecycle":  dict(src=SRC_EVENT, col="order_id", op="distinct"),
+}
+
+
+def _d(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def _s(x):
+    return x.strftime("%Y-%m-%d")
+
+
+def built_boundary(spark, name):
+    """目标表自己的水位：已经算到哪一天了。
+
+    lifecycle 没有 dt 列，用事件 ODS 的 MAX(dt) —— 代价是可能重算一天，但幂等（先 DELETE 再 append）。
+    表不存在 / 为空 -> None（第一次跑，交由 resolve_range 退化到 ODS 的 MIN(dt)）。
+    """
+    try:
+        if name == "dwd_order_lifecycle":
+            val = spark.sql("SELECT max(dt) FROM %s" % SRC_EVENT).collect()[0][0]
+        else:
+            val = spark.sql("SELECT max(dt) FROM %s" % BUILDERS[name][1]).collect()[0][0]
+    except Exception as exc:                                    # noqa: BLE001
+        print("  [水位] %s 读不到 MAX(dt)（%s），按空表处理" % (name, type(exc).__name__))
+        return None
+    return _s(val) if val else None
+
+
+def resolve_range(spark, name, incremental, explicit_start, explicit_end, lookback):
+    """增量模式下的区间计算；返回 (d1, d2)。
+
+    · rebuild / 显式给了区间 -> 原样返回
+    · 空表                   -> [ods_min, ods_max]（等价于"把已有 ODS 全建一遍"）
+    · 有水位                 -> [水位+1, ods_max]
+    · --lookback N           -> d1 再往前 N 天
+    """
+    if not incremental or explicit_start:
+        return explicit_start, explicit_end
+    ods_min, ods_max = (spark.sql("SELECT min(dt), max(dt) FROM %s" % SRC_ORDER)
+                        .collect()[0])
+    if ods_max is None:
+        return None, None
+    ods_min, ods_max = _s(ods_min), _s(ods_max)
+
+    b = built_boundary(spark, name)
+    if b is None:
+        d1 = ods_min
+        print("  [区间] %s 目标表为空 -> 首次建表区间 [%s, %s]" % (name, d1, ods_max))
+    else:
+        d1 = _s(_d(b) + datetime.timedelta(days=1))
+        print("  [区间] %s 水位=%s -> 从 %s 起（上限取 ODS 完整日 %s）" % (name, b, d1, ods_max))
+
+    if lookback and lookback > 0:
+        back = _s(max(_d(d1) - datetime.timedelta(days=lookback), _d(ods_min)))
+        if back != d1:
+            print("  [区间] --lookback %d 回捞 -> d1 从 %s 改为 %s" % (lookback, d1, back))
+            d1 = back
+
+    if _d(d1) > _d(ods_max):
+        print("  [区间] %s 水位(%s) 已到 ODS 最新完整日(%s) -> NOTHING TO DO" % (name, b, ods_max))
+        return None, None
+    return d1, ods_max
+
+
+def day_closure_check(spark, name, d1, d2, strict):
+    """按天闭合检查：DWD 每天行数 vs 由 ODS 现算的期望行数。只在增量模式下跑。"""
+    spec = CLOSURE_SPEC[name]
+    if spec["op"] == "notnull":
+        exp = (spark.sql("SELECT dt, sum(CASE WHEN %s IS NOT NULL THEN 1 ELSE 0 END) n "
+                         "FROM %s WHERE dt >= '%s' AND dt <= '%s' GROUP BY dt"
+                         % (spec["col"], spec["src"], d1, d2))
+               .collect())
+    else:
+        exp = (spark.sql("SELECT dt, count(DISTINCT %s) n FROM %s "
+                         "WHERE dt >= '%s' AND dt <= '%s' GROUP BY dt"
+                         % (spec["col"], spec["src"], d1, d2))
+               .collect())
+    exp_map = {_s(r["dt"]): int(r["n"]) for r in exp}
+
+    if name == "dwd_order_lifecycle":
+        got = (spark.sql("SELECT e.dt dt, count(DISTINCT d.order_id) n "
+                         "FROM %s e JOIN %s d ON d.order_id = e.order_id "
+                         "WHERE e.dt >= '%s' AND e.dt <= '%s' GROUP BY e.dt"
+                         % (spec["src"], BUILDERS[name][1], d1, d2))
+               .collect())
+    else:
+        got = (spark.sql("SELECT dt, count(*) n FROM %s "
+                         "WHERE dt >= '%s' AND dt <= '%s' GROUP BY dt"
+                         % (BUILDERS[name][1], d1, d2))
+               .collect())
+    got_map = {_s(r["dt"]): int(r["n"]) for r in got}
+
+    bad = []
+    for day in sorted(set(exp_map) | set(got_map)):
+        e, g = exp_map.get(day, 0), got_map.get(day, 0)
+        if e != g:
+            bad.append("%s DWD=%d 期望=%d 差=%+d" % (day, g, e, g - e))
+    print("  CLOSURE %s 检查 %d 天 / 不一致 %d 天" % (name, len(exp_map), len(bad)))
+    if bad:
+        for line in bad[:10]:
+            print("    !! %s" % line)
+        if len(bad) > 10:
+            print("    ...（共 %d 天，只列前 10）" % len(bad))
+        msg = ("[%s] 按天闭合检查 %d 天不一致：DWD 与 ODS 现算值不符。"
+               "常见原因：该天 ODS 分区刚被重放但 DWD 还没重算；"
+               "修法 `--mode incremental --lookback N` 或显式 `--start/--end` 重算那几天"
+               % (name, len(bad)))
+        if strict:
+            fail(msg)
+        print("  !! WARN %s（默认不中断；--strict-closure 会 exit %d）"
+              % (msg, EXIT_SELF_CHECK_FAILED))
+    else:
+        print("  CLOSURE %s OK" % name)
+    return len(bad)
+
+
 
 def table_stats(df):
     """行数 / 金额合计 / 去重主键数（自检口径）。"""
@@ -249,8 +390,17 @@ def self_check(spark, name, tgt, df, d1, d2, scope):
     print("  SELF-CHECK %s OK" % name)
 
 
-def run_one(spark, name, mode, d1, d2):
+def run_one(spark, name, mode, d1, d2, incremental=False, lookback=0, strict_closure=False):
     fn, tgt = BUILDERS[name]
+
+    # ★ 增量：区间自己算（水位 = 目标表自己的 MAX(dt)）；算不出新数据就整块跳过
+    d1, d2 = resolve_range(spark, name, incremental, d1, d2, lookback)
+    skipped = (d1 is None and d2 is None)
+    if skipped:
+        print("=" * 70)
+        print("BUILD %s -> %s mode=%s SKIP（没有新数据）" % (name, tgt, mode))
+        return 0
+
     print("=" * 70)
     print("BUILD %s -> %s mode=%s range=%s..%s" % (name, tgt, mode, d1, d2))
     before = spark.sql("SELECT count(*) FROM %s" % tgt).collect()[0][0]
@@ -305,6 +455,10 @@ def run_one(spark, name, mode, d1, d2):
     # ---- 写入后自检 ----
     self_check(spark, name, tgt, df, d1, d2, scope)
 
+    # ---- 按天闭合检查（只有增量/区间模式才有意义；全量模式自检已覆盖） ----
+    if d1:
+        day_closure_check(spark, name, d1, d2, strict_closure)
+
     after = spark.sql("SELECT count(*) FROM %s" % tgt).collect()[0][0]
     print("  RESULT %s before=%d written=%d after=%d" % (name, before, n, after))
     return n
@@ -313,17 +467,29 @@ def run_one(spark, name, mode, d1, d2):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--table", required=True, choices=sorted(BUILDERS) + ["all"])
-    ap.add_argument("--mode", default="rebuild", choices=["rebuild", "append", "dry"])
+    ap.add_argument("--mode", default="rebuild",
+                    choices=["rebuild", "append", "dry", "incremental"])
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
+    # ★ --lookback N：增量的 d1 再往前 N 天，用来回捞迟到事件（重复计算幂等，代价很小）
+    ap.add_argument("--lookback", type=int, default=0)
+    # ★ --strict-closure：按天闭合检查不一致时直接 exit 2（默认只 WARN）
+    ap.add_argument("--strict-closure", action="store_true")
     args = ap.parse_args()
 
+    # incremental 语义 = "区间自己算"，落盘清理动作与 append 相同（写前 DELETE 本次范围）
+    incremental = (args.mode == "incremental")
+    mode = "append" if incremental else args.mode
+
     d1, d2 = args.start, (args.end or args.start)
+    print("MODE=%s%s" % (args.mode, "  lookback=%d" % args.lookback if args.lookback else ""))
     spark = build_spark()
     total = 0
     tables = ORDER_OF_EXEC if args.table == "all" else [args.table]
     for t in tables:
-        total += run_one(spark, t, args.mode, d1, d2)
+        total += run_one(spark, t, mode, d1, d2,
+                         incremental=incremental, lookback=args.lookback,
+                         strict_closure=args.strict_closure)
         print("")
     print("==========")
     print("DWD_TOTAL = %d" % total)

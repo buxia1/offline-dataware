@@ -2,8 +2,8 @@
 # =============================================================================
 # 事件流摄入外壳（增量版，2026-10-07 重构）
 #
-#   bash scripts/ods_order_event_ingest.sh              # 增量：只读位点之后的新消息
-#   bash scripts/ods_order_event_ingest.sh --reset      # 回补：清空事件表 + 清位点，从 earliest 重灌
+#   bash scripts/ods_legacy/ods_order_event_ingest.sh              # 增量：只读位点之后的新消息
+#   bash scripts/ods_legacy/ods_order_event_ingest.sh --reset      # 回补：清空事件表 + 清位点，从 earliest 重灌
 #
 # 【为什么默认必须是增量】
 #   原来的"先 TRUNCATE 再从 Kafka 全量重灌"有个致命前提：**Kafka 里必须有完整的全部历史**。
@@ -28,7 +28,7 @@ KAFKA_BIN=/opt/kafka/bin/kafka-get-offsets.sh
 TOPIC=ods_order_event
 PYSQL="docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B -e"
 MYSQL="docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot"
-SPARK_JOB=/opt/offline-dw/scripts/ods_order_event_to_starrocks.py
+SPARK_JOB=/opt/offline-dw/scripts/ods_legacy/ods_order_event_to_starrocks.py
 
 MODE="${1:---inc}"
 case "$MODE" in
@@ -36,7 +36,7 @@ case "$MODE" in
     --reset|--full)      RESET=1 ;;
     *)
         echo "❌ 未知参数: $MODE"
-        echo "用法: bash scripts/ods_order_event_ingest.sh [--inc | --reset]"
+        echo "用法: bash scripts/ods_legacy/ods_order_event_ingest.sh [--inc | --reset]"
         exit 1
         ;;
 esac
@@ -108,7 +108,7 @@ if [ "$ROWS_AFTER" != "$OFFSET_SUM_AFTER" ]; then
     echo "❌ 行数($ROWS_AFTER) ≠ 位点表之和($OFFSET_SUM_AFTER)"
     echo "   → 写入与记账不一致：要么 ODS 写失败但位点已推进（会丢消息），"
     echo "     要么写入了但位点没更新（下次会重复读）。"
-    echo "   → 恢复：确认 Kafka 完整后 bash scripts/ods_order_event_ingest.sh --reset"
+    echo "   → 恢复：确认 Kafka 完整后 bash scripts/ods_legacy/ods_order_event_ingest.sh --reset"
     FAIL=1
 fi
 
