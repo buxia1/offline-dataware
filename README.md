@@ -69,7 +69,8 @@ offline-dw/
 ├── data/dim/                        商品快照 CSV（生成物，不进版本库）
 ├── docs/
 │   ├── PITFALLS.md                 踩坑记录（最有价值的部分）
-│   └── dolphinscheduler-workflow.md  DS 工作流的节点配置
+│   ├── dolphinscheduler-workflow.md  DS 工作流的节点配置
+│   └── lake-tier-runbook.md        ⭐ 湖侧链路操作手册（现状 / 5 处已知缺陷 / 交接 4 步）
 ├── sql/                            各层建表与转换 SQL
 │   ├── ods_order.sql
 │   ├── ods_routine_load.sql                ⭐ 两条 Routine Load 作业（ODS 摄入，2026-10-09）
@@ -90,9 +91,18 @@ offline-dw/
 │   ├── dim_product_scd2_load.sql          SCD2 装载（TRUNCATE + INSERT 合一）
 │   ├── dwd_order_sku_detail.sql           订单 + 商品属性宽表
 │   ├── dwd_order_sku_detail_add_partitions.sql  补历史分区
-│   └── dwd_order_sku_detail_load.sql      物化装载（Shell 模板）
+│   ├── dwd_order_sku_detail_load.sql      物化装载（Shell 模板）
+│   │   ── 湖侧（Iceberg）──
+│   └── lake/                       lake_ods.sql / lake_dim.sql / lake_dwd.sql
+│                                    （lake_dws_ads.sql 保留，已不在主链路上）
 ├── scripts/
-│   ├── gen_mock_orders_snapshot.py  模拟订单**快照**生成器（--date，可重放，号段 +500）
+│   │   ── 湖侧链路（当前主线：Spark 读湖写湖）──
+│   ├── lake/                       ⭐ lake_ods_replay.sh / run_dim.sh / run_dwd.sh
+│   │                                + lake_*_build.py + lake_maintain.py（见 scripts/lake/README.md）
+│   │   ── ⚠️ 已废弃：第 2 步「写回仓侧」那一套 ──
+│   ├── legacy_step2/               dwd_*_streamload.py / dws_ads_streamload.py / run_*.sh
+│   │                                （保留原因与坑见 scripts/legacy_step2/README.md）
+│   ├── gen_mock_orders_snapshot.py  模拟订单**快照**生成器（--date，可重放，号段 = 事件流号段 +10000）
 │   ├── gen_mock_orders.py           模拟订单**事件流**生成器（--date，可重放，号段 +0）
 │   ├── check_routine_load.sh        ⭐ Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
 │   ├── dwd_overwrite.sh             DWD 按天覆盖（Shell，给 DS 用）
@@ -1060,10 +1070,10 @@ Kafka (ods_order_event / ods_order)
 
 | 组件 | 路径 | 作用 |
 |---|---|---|
-| 湖层 DDL | `sql/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
-| 灌数脚本 | `scripts/lake_ods_replay.sh` + `.py` | `bash scripts/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
+| 湖层 DDL | `sql/lake/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
+| 灌数脚本 | `scripts/lake/lake_ods_replay.sh` + `.py` | `bash scripts/lake/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
 | 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
-| 维护脚本 | `scripts/lake_maintain.py` | 只读盘点 + `--expire --keep N` 清历史快照 |
+| 维护脚本 | `scripts/lake/lake_maintain.py` | 只读盘点 + `--expire --keep N` 清历史快照 |
 
 **实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
 `ods_order_event` 2,969,579 行。湖↔仓逐 key 差集**双向为 0**（见下方推进清单第 1 步）。
@@ -1081,12 +1091,12 @@ Kafka (ods_order_event / ods_order)
 # 只盘点，不删任何东西（实测：零写入、可随时跑）
 docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
-  /opt/offline-dw/scripts/lake_maintain.py
+  /opt/offline-dw/scripts/lake/lake_maintain.py
 
 # 真清理：保留最近 5 个快照
 docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
-  /opt/offline-dw/scripts/lake_maintain.py --expire --keep 5
+  /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
 ```
 
 > `spark` 容器已把 `./scripts` 和 `./lake` 都挂进去了（`/opt/offline-dw/scripts`、`/opt/offline-dw/lake`），
@@ -1115,7 +1125,7 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 慢的是**写**不是读：JDBC 默认逐行 INSERT，每条一个 round-trip；Stream Load 把文件
 一次推给 BE，BE 直接消费。**这也是当初"湖仓是否值得"的最终证据 —— 省下的正是那趟 JDBC 搬运。**
 
-#### 明细链路：`scripts/dwd_order_detail_streamload.py`
+#### 明细链路：`scripts/legacy_step2/dwd_order_detail_streamload.py`（已废弃）
 
 ```bash
 docker run --rm --network offline-dw_default --memory 5g \
@@ -1149,7 +1159,7 @@ docker run --rm --network offline-dw_default --memory 5g \
 | 分区 | 95 个（p20260915~p20261218），90 个有数据 |
 | 耗时 | **34.0 秒**（读湖 3.5 s + 清洗 12.0 s + 15 批写入 18.9 s）|
 
-#### 汇总链路：`scripts/dws_ads_streamload.py`
+#### 汇总链路：`scripts/legacy_step2/dws_ads_streamload.py`（已废弃）
 
 DWS / ADS 没有单独成步，和明细一起灌（同一支 Spark 作业内两级聚合）：
 DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
@@ -1168,7 +1178,7 @@ DWS 按 `(user_id, dt)` 聚合、ADS 再按 `dt` 聚合。**口径逐字照搬**
 
 耗时：清洗 11.8 s + 9 批写入 40.8 s = **67.1 s**（两支作业可合并成一次 Spark 提交）。
 
-#### SCD2 时点关联链路：`scripts/dwd_order_sku_streamload.py`（宿主外壳 `run_dwd_sku_full.sh`）
+#### SCD2 时点关联链路：`scripts/legacy_step2/dwd_order_sku_streamload.py`（已废弃）
 
 `dwd_order_sku_detail` 的口径是**范围 JOIN**：`o.dt BETWEEN s.valid_from AND s.valid_to`
 （见 `sql/dwd_order_sku_detail_load.sql`）。Spark 侧逐字照搬，只把事实侧来源从仓侧
@@ -1232,7 +1242,7 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 > 只写 `--jars` 的话驱动进不了 AppClassLoader，会报 `No suitable driver found`。
 > 项目里已有 `ds/libs/mysql-connector-java-8.0.30.jar`，直接用它。
 
-#### 累积快照链路：`scripts/dwd_order_lifecycle_streamload.py`（宿主外壳 `run_lifecycle.sh`）
+#### 累积快照链路：`scripts/legacy_step2/dwd_order_lifecycle_streamload.py`（已废弃）
 
 `dwd.dwd_order_lifecycle` 的口径原本是仓内视图 `dwd.v_order_lifecycle_expected`：
 按 `order_id` 聚五个里程碑（`MAX(CASE WHEN event_type='...' THEN event_time END)`）
@@ -1246,9 +1256,9 @@ START=2026-09-20 END=2026-12-18 bash run_dwd_sku_full.sh
 
 ```bash
 # 全量重建（外壳会先 TRUNCATE，因为 upsert 删不掉"已不在快照里"的订单）
-bash scripts/run_lifecycle.sh full
+bash scripts/legacy_step2/run_lifecycle.sh full
 # 只算不写：验证行数 + 落盘自检（列数 / 千分位逗号）
-bash scripts/run_lifecycle.sh dry
+bash scripts/legacy_step2/run_lifecycle.sh dry
 ```
 
 **实测（2026-10-14）**：
@@ -1308,10 +1318,10 @@ bash scripts/run_lifecycle.sh dry
 | `lake.dws.dws_user_order_day` | 18,000 | 90 天 × 200 用户 |
 | `lake.ads.ads_daily_sales` | 90 | 90 天 |
 
-**脚本**（`bash scripts/run_lake_dim.sh ddl|build|dry` / `bash scripts/run_lake_dwd.sh` / `bash scripts/run_lake_dws_ads.sh`）
-- `scripts/lake_dim.sql` + `scripts/lake_dim_build.py`（SCD2 与当前版）
-- `scripts/lake_dwd.sql` + `scripts/lake_dwd_build.py`（明细 / SKU / 累积快照，三张表一次建）
-- `scripts/lake_dws_ads.sql` + `scripts/lake_dws_ads_build.py`（汇总层，口径逐字照搬仓侧 SQL）
+**脚本**（`bash scripts/lake/run_dim.sh ddl|build|dry` / `bash scripts/lake/run_dwd.sh`）
+- `sql/lake/lake_dim.sql` + `scripts/lake/lake_dim_build.py`（SCD2 与当前版）
+- `sql/lake/lake_dwd.sql` + `scripts/lake/lake_dwd_build.py`（明细 / SKU / 累积快照，三张表一次建）
+- `sql/lake/lake_dws_ads.sql` + `scripts/lake/lake_dws_ads_build.py`（汇总层；口径逐字照搬仓侧 SQL，**保留但已不在主链路上**，见第 3 步）
 
 **湖↔仓逐项对账（实测全一致）**：`detail` 的行数 / `count(DISTINCT order_id)` / 天数 / `sum(amount)` /
 `order_time` 区间；`lifecycle` 的行数 / `sum(amount)` / 阶段分布 / 三个滞后合计；`dws` / `ads` 的
@@ -1324,8 +1334,8 @@ bash scripts/run_lifecycle.sh dry
    旧表 25,534 行 `amount < 0`、`sum(amount)=132,414,787.10`，比它的源表 `dwd.dwd_order_detail`
    （`amount = ABS(...)`、`sum=140,891,053.50`）**少 8,476,266.40**。核对口径：
    `SELECT count(*) FROM ods.ods_order WHERE user_id IS NOT NULL AND amount < 0` = **25,534**
-   → 说明那批数据写进 SKU 表时**没有取 `ABS`**。修法：`scripts/dwd_order_sku_streamload.py` 的 `amount`
-   改用 `F.abs`，并用宿主外壳 `scripts/run_dwd_sku_full.sh 2026-09-20 2026-12-18` 重建
+   → 说明那批数据写进 SKU 表时**没有取 `ABS`**。修法：`scripts/legacy_step2/dwd_order_sku_streamload.py` 的 `amount`
+   改用 `F.abs`，并用宿主外壳 `scripts/legacy_step2/run_dwd_sku_full.sh 2026-09-20 2026-12-18` 重建
    （实测 854,844 行 / `sum=140,891,053.50` / 负值 0）。**对账时 SKU 的金额必须以 detail 为基准，不能拿旧仓侧 SKU 比。**
 3. ★ **Stream Load 的 `label` 复用会失败、且报错极难懂**（坑 29）：同一 label 重复提交，BE 返回
    `Status: Label Already Exists`，客户端侧却表现为 **`curl: (18) end of response with N bytes missing` /
@@ -1366,7 +1376,7 @@ bash scripts/run_lifecycle.sh dry
          双向差集 `wh_only = 0` / `lake_only = 0`；`ods_order` 两侧均 900,000
       —— ⚠️ **口径不对齐时 90 天没有一天对得上**（湖区每天比仓区少 398~658 行）——
          根因是**先按 dt 过滤、再去重**，会把 dt 恰好落在窗口外的历史事件整行丢掉；
-         已改为**按天去重**（`sql/lake_ods.sql` + `scripts/lake_ods_replay.py`，commit `7ba26ff`）
+         已改为**按天去重**（`sql/lake/lake_ods.sql` + `scripts/lake/lake_ods_replay.py`，commit `7ba26ff`）
 - [x] **确认现有链路零影响**
       —— 判据：「运维命令」里各项检查全部仍然通过（800/2379/763/763/900/601/8 + 两条 DQC `EXIT=0`）
 - [x] **湖表维护：清历史快照** —— 见上方「湖表快照清理」
@@ -1384,7 +1394,7 @@ bash scripts/run_lifecycle.sh dry
 **第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运）
 
 - [x] **订单明细清洗改写为 Spark SQL** —— 读湖层文件，不读 JDBC ✅ **2026-10-14**
-      —— 落 `scripts/dwd_order_detail_streamload.py`（Spark 读 Iceberg → 清洗 → Stream Load 回仓侧）
+      —— 落 `scripts/legacy_step2/dwd_order_detail_streamload.py`（Spark 读 Iceberg → 清洗 → Stream Load 回仓侧）
       —— 实测：湖层 900,000 行 → `user_id` 非空 **854,844** 行 → 仓侧 854,844 行；
          **逐日「行数 + `sum(amount)`」90/90 天一致**；`(dt, order_id)` 重复 = 0；耗时 **34.0 秒**
 - [x] **记录性能对比** —— 「文件直读」vs「JDBC 搬运」实测耗时 ✅ **2026-10-14**
@@ -1394,12 +1404,12 @@ bash scripts/run_lifecycle.sh dry
       —— 明细见「⭐ DWD / DWS / ADS 灌回仓侧」一节
 - [x] **汇总层（DWS / ADS）也下沉** —— 不在原计划里，和明细一起做了 ✅ **2026-10-14**
       —— ✅ **2026-10-14 追加：已进一步沉到湖侧**（`lake.dws.dws_user_order_day` / `lake.ads.ads_daily_sales`），见「⭐ 第 3 步：DWD / DWS / ADS 下沉到湖侧」
-      —— 落 `scripts/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
+      —— 落 `scripts/legacy_step2/dws_ads_streamload.py`；口径照搬 `sql/dws_user_order_day_insert.sql` + `sql/ads_daily_sales_insert.sql`
       —— 实测：`dws_user_order_day` **18,000 行** / 90 天（200 用户/天 × 90）、`ads_daily_sales` **90 行**；
          `SUM(order_cnt)` 两侧都 = 854,844 ✅
 - [x] **SCD2 时点关联改写为 Spark SQL** ✅ **2026-10-14**
       —— ⚠️ 2026-10-14 发现仓侧 SKU 表旧数据 `amount` 未取 `ABS`（25,534 行负值、少 8,476,266.40），已修脚本并重建；见「⭐ 第 3 步」第 2 条
-      —— 落 `scripts/dwd_order_sku_streamload.py` + 宿主外壳 `run_dwd_sku_full.sh`
+      —— 落 `scripts/legacy_step2/dwd_order_sku_streamload.py` + 宿主外壳 `run_dwd_sku_full.sh`
       —— 判据：与 `dwd_order_sku_detail` 逐行等价（原 763 行；放量后 90 天是 854,844 行）
       —— 实测：**854,844 行**；逐日行数 **90/90 天与 `dwd_order_detail` 相等**；
          `order_id` 去重 = 行数（无扇出）；`valid_from <> dt` / `valid_to < dt` 均为 **0**
@@ -1407,7 +1417,7 @@ bash scripts/run_lifecycle.sh dry
          （`ods.ods_product` 补齐 90 天 × 50 商品 = 4,500 行 → `dim_product_scd2` 4,500 行）
       —— ⚠️ `SUM(amount)` 天然小于明细侧（内连接丢掉无当天版本的订单），**对账要按天比行数**
 - [x] **累积快照推导改写为 Spark SQL** ✅ **2026-10-14**
-      —— 落 `scripts/dwd_order_lifecycle_streamload.py` + 宿主外壳 `run_lifecycle.sh`
+      —— 落 `scripts/legacy_step2/dwd_order_lifecycle_streamload.py` + 宿主外壳 `run_lifecycle.sh`
       —— 判据：与旧视图 `dwd.v_order_lifecycle_expected` 口径等价
       —— 实测：湖侧 2,969,579 事件行 → **900,000 个订单**（`order_time` 覆盖
          2026-09-20 ~ 2026-12-18），**25.0 秒**灌完；与仓内 SQL 重算的

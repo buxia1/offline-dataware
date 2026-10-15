@@ -17,14 +17,14 @@
 | ADS | `ads_daily_sales` 90 | 90 |
 
 湖↔仓 10 张表逐项对账（行数 / distinct 主键 / 天数 / 金额合计）**全一致**。
-跑全量湖侧 DWD 的命令是 `bash scripts/run_lake_dwd.sh build all`（约 2 分钟），
+跑全量湖侧 DWD 的命令是 `bash scripts/lake/run_dwd.sh build all`（约 2 分钟），
 但**它现在的 `--mode append` 会重复追加**（见 ⚠️ 缺陷 1）。
 
 ---
 
 ## 1. ⚠️ 必须先修的 5 处缺陷（都在湖侧脚本里，还没修）
 
-### 缺陷 1：`scripts/run_lake_dwd.sh` 用了 `append`，重跑会把三张表翻倍
+### 缺陷 1：`scripts/lake/run_dwd.sh` 用了 `append`，重跑会把三张表翻倍
 
 第 56 行附近：
 
@@ -56,7 +56,8 @@ SCRATCH="${SCRATCH:-/mnt/d/develop/workspace/deepseek_harness_temp}"
 ```
 
 `/mnt/d/...` 是 WSL 里访问 Windows 盘的路径，**仓库的自包含性被破坏了**。
-更糟的是 `run_lake_dws_ads.sh` 第 20 行还会 `cp` 覆盖仓库里的 `scripts/lake_dws_ads.sql`：
+更糟的是当时那支 `run_lake_dws_ads.sh` 第 20 行还会 `cp` 覆盖仓库里的 `scripts/lake_dws_ads.sql`
+（该脚本未入库，整套第 2 步产物已移到 `scripts/legacy_step2/`）：
 
 ```bash
 cp "$LOCAL/lake_dws_ads.sql" "$PROJ/scripts/lake_dws_ads.sql"
@@ -124,10 +125,11 @@ scope_ids = (ev.filter((F.col("dt") >= d1) & (F.col("dt") <= d2))
 
 ```bash
 PROJ=/path/to/offline-dw
-bash "$PROJ/scripts/run_lake_dwd.sh" build all
-bash "$PROJ/scripts/run_lake_dwd.sh" build dwd_order_detail 2026-11-01 2026-11-03
-bash "$PROJ/scripts/run_lake_dim.sh" build
-bash "$PROJ/scripts/run_lake_dws_ads.sh" build
+bash "$PROJ/scripts/lake/run_dwd.sh" build all
+bash "$PROJ/scripts/lake/run_dwd.sh" build dwd_order_detail 2026-11-01 2026-11-03
+bash "$PROJ/scripts/lake/run_dim.sh" build
+# run_dws_ads.sh 未入库；湖侧 DWS/ADS 现在建在
+# scripts/lake/lake_dws_ads_build.py（见 §2 步骤 3）
 ```
 
 **验收**：同一命令连跑两遍，行数不变。
@@ -142,10 +144,10 @@ bash "$PROJ/scripts/run_lake_dws_ads.sh" build
 
 ```bash
 D1=$(date -d "-3 day" +%F); D2=$(date +%F)
-bash scripts/run_lake_dwd.sh build dwd_order_detail   "$D1" "$D2"
-bash scripts/run_lake_dwd.sh build dwd_order_sku_detail "$D1" "$D2"
-bash scripts/run_lake_dwd.sh build dwd_order_lifecycle "$D1" "$D2"   # ⚠️ 缺陷 4 修完才准
-bash scripts/run_lake_dws_ads.sh build "$D1" "$D2"                   # ⚠️ 需先给 py 加上区间参数
+bash scripts/lake/run_dwd.sh build dwd_order_detail   "$D1" "$D2"
+bash scripts/lake/run_dwd.sh build dwd_order_sku_detail "$D1" "$D2"
+bash scripts/lake/run_dwd.sh build dwd_order_lifecycle "$D1" "$D2"   # ⚠️ 缺陷 4 修完才准
+# 湖侧 DWS/ADS 的区间参数见 §2 步骤 3
 ```
 
 **为什么不推荐做真正的 upsert**：DWS 是 `(user_id, dt)` 主键、ADS 是 `dt` 主键、DWD 是
@@ -161,7 +163,7 @@ bash scripts/run_lake_dws_ads.sh build "$D1" "$D2"                   # ⚠️ �
 没有分区裁剪之外的优化，下游点查（按用户、按日期）会明显退化。所以保留仓侧表，
 但**数据来源从仓侧 dwd 换成湖侧 dwd**。
 
-**代码**（新增两个 SQL + 一个外壳，或用现有 `scripts/dws_ads_streamload.py` 改成读湖侧）：
+**代码**（新增两个 SQL + 一个外壳；旧 `scripts/dws_ads_streamload.py` 已移到 `scripts/legacy_step2/`）：
 
 ```sql
 -- sql/dws_from_lake.sql
@@ -216,7 +218,7 @@ SELECT (SELECT sum(paid_amount) FROM ads.ads_daily_sales WHERE dt='2026-11-15') 
 
 ### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler
 
-**为什么**：现在全是手工跑（`bash scripts/run_lake_*.sh`），没有增量、没有失败告警。
+**为什么**：现在全是手工跑（`bash scripts/lake/run_*.sh`），没有增量、没有失败告警。
 仓侧那套调度（串行丢弃、`ds/alerts/notify.sh` 告警）是现成的，**照抄结构即可**。
 
 接线顺序（串行，别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
@@ -236,7 +238,7 @@ SELECT (SELECT sum(paid_amount) FROM ads.ads_daily_sales WHERE dt='2026-11-15') 
   UNION ALL SELECT 'lifecycle_wh', count(*), count(DISTINCT order_id), sum(amount) FROM dwd.dwd_order_lifecycle;
   -- 两边对应行的 r/o/a 三个数必须相等，否则告警
   ```
-- **维护节点**：`python3 scripts/lake_maintain.py`（只读盘点）+ `--expire --keep N`（清快照）。
+- **维护节点**：`python3 scripts/lake/lake_maintain.py`（只读盘点）+ `--expire --keep N`（清快照）。
   实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，行数不变。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 —— 

@@ -58,7 +58,7 @@ APP_ARGS=(--date "${DATE}")
 [[ ${DRY_RUN} -eq 1 ]] && APP_ARGS+=(--dry-run)
 
 docker exec spark /opt/spark/bin/spark-submit "${SPARK_ARGS[@]}" \
-  /opt/offline-dw/scripts/lake_ods_replay.py "${APP_ARGS[@]}"
+  /opt/offline-dw/scripts/lake/lake_ods_replay.py "${APP_ARGS[@]}"
 
 docker exec spark chown -R 185:185 /opt/offline-dw/lake/warehouse 2>/dev/null || true
 

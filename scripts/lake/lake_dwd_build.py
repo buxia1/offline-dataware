@@ -5,17 +5,25 @@
 
 三张表的口径**逐字照搬**仓侧实现（只把事实来源从仓侧换成湖侧 Iceberg）：
 
-  dwd_order_detail      <- scripts/dwd_order_detail_streamload.py（口径来自 sql/dwd_order_detail.sql
-                           + scripts/dwd_overwrite.sh 的清洗段）
-  dwd_order_sku_detail  <- scripts/dwd_order_sku_streamload.py（口径来自 sql/dwd_order_sku_detail_load.sql）
-  dwd_order_lifecycle   <- scripts/dwd_order_lifecycle_streamload.py（口径来自 sql/dwd_order_lifecycle.sql
-                           的视图 dwd.v_order_lifecycle_expected）
+  dwd_order_detail      <- scripts/legacy_step2/dwd_order_detail_streamload.py
+  dwd_order_sku_detail  <- scripts/legacy_step2/dwd_order_sku_streamload.py
+  dwd_order_lifecycle   <- scripts/legacy_step2/dwd_order_lifecycle_streamload.py
 
 用法：
   spark-submit build.py --table dwd_order_detail --mode rebuild
-  spark-submit build.py --table all --mode rebuild
-  spark-submit build.py --table dwd_order_detail --mode append --start 2026-09-20 --end 2026-09-30
-  spark-submit build.py --table dwd_order_detail --mode dry      # 只算不写
+  spark-submit build.py --table all --mode append
+  spark-submit build.py --table dwd_order_detail --mode append --start 2026-09-20 --end 2026-09-20
+  spark-submit build.py --table all --mode dry            # 只算不写
+
+幂等约定（Iceberg 没有 TRUNCATE，一律「先 DELETE 本次范围、再 append」）：
+  · detail / sku 带 dt：DELETE FROM <表> WHERE dt BETWEEN d1 AND d2
+                        没有给区间时 = 全量重写（DELETE 整表）
+  · lifecycle 无 dt   ：DELETE FROM <表> WHERE order_id IN (本次 scope 订单集合)
+  · 写完后回读「行数 + SUM(amount) + COUNT(DISTINCT order_id)」与 Spark 侧期望比对，
+    任一项不一致 -> 打印明确错误并 exit 2（由 run_dwd.sh 整体判失败）
+
+所以 append / rebuild 两种 mode 的清理动作完全一致（都按上面规则删本次范围），
+mode 只用来区分"算不算、写不写"，重复执行同一命令行数不会变化。
 """
 import argparse
 import sys
@@ -32,7 +40,7 @@ T_DETAIL = "lake.dwd.dwd_order_detail"
 T_SKU = "lake.dwd.dwd_order_sku_detail"
 T_LIFE = "lake.dwd.dwd_order_lifecycle"
 
-# 三张目标表的列顺序（与 sql/lake_dwd.sql 的 CREATE TABLE 严格一致）
+# 三张目标表的列顺序（与 sql/lake/lake_dwd.sql 的 CREATE TABLE 严格一致）
 COLS_DETAIL = ["order_id", "dt", "user_id", "product_id", "amount", "order_time", "status"]
 COLS_SKU = ["order_id", "dt", "user_id", "product_id", "amount", "order_time", "status",
             "category", "brand", "sku_price", "valid_from", "valid_to"]
@@ -41,6 +49,22 @@ COLS_LIFE = ["order_id", "user_id", "product_id", "amount", "order_time", "pay_t
              "ship_lag_days", "finish_lag_days", "last_event_time", "update_time"]
 
 EPOCH = "1970-01-01 00:00:00"
+
+# 自检失败统一退出码（写作模式用于告诉 runner「数不对，别当成功」）
+EXIT_SELF_CHECK_FAILED = 2
+
+# lifecycle 增量按订单集合删时用的 temp view 名
+SCOPE_VIEW = "_lake_dwd_scope_order_ids"
+
+
+def fail(msg):
+    """自检/关联校验不通过：打印明确错误，并以 exit 2 结束整个 spark-submit。"""
+    text = "!!! SELF-CHECK FAILED: %s" % msg
+    print(text)
+    sys.stdout.flush()
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+    sys.exit(EXIT_SELF_CHECK_FAILED)
 
 
 def build_spark():
@@ -90,7 +114,9 @@ def build_detail(spark, d1=None, d2=None):
 
 # --------------------------------------------------------------------------
 # 2) dwd_order_sku_detail
-#    仓侧口径：o.dt BETWEEN s.valid_from AND s.valid_to（SCD2 时点关联，inner join）
+#    仓侧口径：o.dt BETWEEN s.valid_from AND s.valid_to（SCD2 时点关联）
+#    ★ 用 LEFT JOIN 而不是 INNER：inner 会把「当天找不到商品版本」的订单静默丢掉，
+#      这类失配必须显式暴露（run_one 里统计 valid_from IS NULL，>0 则告警 + exit 2）。
 #    维度侧从仓侧 dim_product_scd2 换成湖侧（湖仓主存迁湖后的必然）
 # --------------------------------------------------------------------------
 def build_sku(spark, d1=None, d2=None):
@@ -103,7 +129,7 @@ def build_sku(spark, d1=None, d2=None):
     joined = (fact.join(F.broadcast(dim),
                         (fact.product_id == dim._dim_pid) &
                         (fact.dt >= dim.valid_from) & (fact.dt <= dim.valid_to),
-                        "inner")
+                        "left")
               .select(*[F.col(c) for c in COLS_SKU]))
     return joined
 
@@ -113,16 +139,30 @@ def build_sku(spark, d1=None, d2=None):
 #    仓侧视图 dwd.v_order_lifecycle_expected 的逐字移植：
 #    五个里程碑 MAX(CASE WHEN event_type=... THEN event_time END)
 #    ★ GREATEST 必须用 COALESCE 兜底（任一里程碑 NULL 会让整列退化）
+#
+#    增量语义（scope）：
+#      scope = 该区间【任一事件分区】里出现过的 order_id 的并集
+#              —— 不只是「该区间新出现的订单」：老订单当天收到新里程碑事件也要重算
+#      聚合必须【回全表、不按 dt 过滤】：order_time（event_type='order'）可能落在
+#      比事件当天更早的分区，若只聚合 [d1,d2] 的事件，老订单的 order_time 会被抹成 NULL。
 # --------------------------------------------------------------------------
 def build_lifecycle(spark, d1=None, d2=None):
-    ev = read_events(spark, d1, d2)
-    # 增量：只重算 dt >= 起点的那些订单（与仓侧 --inc 的 scope_orders 语义一致）
-    if d1:
-        scope = ev.filter(F.col("dt") >= F.lit(d1)).select("order_id").distinct()
-    else:
-        scope = None
+    # 全量事件（不带 dt 过滤），供 scope 订单做完整历史重聚合
+    ev_all = read_events(spark)
 
-    ev_all = read_events(spark) if scope is not None else ev
+    scope = None
+    if d1:
+        # ★ scope 用区间事件表的 order_id 并集（distinct 后是全量里那一小撮订单）
+        scope = (read_events(spark, d1, d2)
+                 .select("order_id").distinct()
+                 .cache())
+        n_scope = scope.count()
+        print("  SCOPE dt in [%s, %s] 订单数 = %d" % (d1, d2, n_scope))
+        # 先 join scope 再 groupBy：等价于「全表 groupBy 后 semi-join scope」，
+        # 但只把 scope 订单的完整历史喂给聚合，既不漏老订单的早分区 order_time，
+        # 也不多算无关订单。注意 join 用的是全表事件，没有 dt 过滤。
+        ev_all = ev_all.join(scope, on="order_id", how="inner")
+
     agg = (ev_all.groupBy("order_id").agg(
         F.max("user_id").alias("user_id"),
         F.max("product_id").alias("product_id"),
@@ -133,8 +173,6 @@ def build_lifecycle(spark, d1=None, d2=None):
         F.max(F.when(F.col("event_type") == "finish", F.col("event_time"))).alias("finish_time"),
         F.max(F.when(F.col("event_type") == "cancel", F.col("event_time"))).alias("cancel_time"),
     ))
-    if scope is not None:
-        agg = agg.join(F.broadcast(scope), "order_id", "inner")
 
     ts = F.lit(EPOCH).cast("timestamp")
     last_ev = F.greatest(
@@ -160,7 +198,7 @@ def build_lifecycle(spark, d1=None, d2=None):
           .withColumn("finish_lag_days", F.datediff("finish_time", "order_time"))
           .withColumn("update_time", F.current_timestamp())
           .select(*[F.col(c) for c in COLS_LIFE]))
-    return df
+    return df, scope
 
 
 BUILDERS = {
@@ -172,6 +210,45 @@ BUILDERS = {
 ORDER_OF_EXEC = ["dwd_order_detail", "dwd_order_sku_detail", "dwd_order_lifecycle"]
 
 
+def table_stats(df):
+    """行数 / 金额合计 / 去重主键数（自检口径）。"""
+    r = (df.agg(
+            F.count(F.lit(1)).alias("n"),
+            F.coalesce(F.sum("amount"), F.lit(0).cast("decimal(38,2)")).alias("s"),
+            F.countDistinct("order_id").alias("k"))
+         .collect()[0])
+    return int(r["n"]), r["s"], int(r["k"])
+
+
+def self_check(spark, name, tgt, df, d1, d2, scope):
+    """写入后回读落库数据，与 Spark 侧期望比对；不一致 -> exit 2。"""
+    exp_n, exp_s, exp_k = table_stats(df)
+
+    back = spark.read.format("iceberg").load(tgt)
+    if name == "dwd_order_lifecycle":
+        # lifecycle 本次只重写了 scope 内的订单 -> 只回读这部分（其余行不该被动过）
+        if scope is not None:
+            back = back.join(scope, on="order_id", how="inner")
+    elif d1:
+        # detail / sku 本次只重写了 dt 区间 -> 只回读该区间
+        back = back.filter((F.col("dt") >= F.lit(d1)) & (F.col("dt") <= F.lit(d2)))
+
+    got_n, got_s, got_k = table_stats(back)
+    print("  SELF-CHECK %s 期望(n=%d, sum=%s, key=%d) 回读(n=%d, sum=%s, key=%d)"
+          % (name, exp_n, exp_s, exp_k, got_n, got_s, got_k))
+
+    bad = []
+    if got_n != exp_n:
+        bad.append("行数 回读=%d 期望=%d" % (got_n, exp_n))
+    if got_k != exp_k:
+        bad.append("去重主键数 回读=%d 期望=%d" % (got_k, exp_k))
+    if got_s != exp_s:
+        bad.append("金额合计 回读=%s 期望=%s" % (got_s, exp_s))
+    if bad:
+        fail("[%s] 写入后自检不一致：%s" % (name, "；".join(bad)))
+    print("  SELF-CHECK %s OK" % name)
+
+
 def run_one(spark, name, mode, d1, d2):
     fn, tgt = BUILDERS[name]
     print("=" * 70)
@@ -179,11 +256,30 @@ def run_one(spark, name, mode, d1, d2):
     before = spark.sql("SELECT count(*) FROM %s" % tgt).collect()[0][0]
     print("  当前行数 = %d" % before)
 
-    df = fn(spark, d1, d2).cache()
+    built = fn(spark, d1, d2)
+    if name == "dwd_order_lifecycle":
+        df, scope = built
+    else:
+        df, scope = built, None
+    df = df.cache()
     n = df.count()
     print("  算出 %d 行" % n)
+
+    # ★ SKU 失配告警：left join 后 valid_from IS NULL = 当天没有命中的商品版本。
+    #   以前 inner join 会把这批订单静默丢掉，现在必须报出来；写入模式直接 exit 2。
+    if name == "dwd_order_sku_detail":
+        n_miss = df.filter(F.col("valid_from").isNull()).count()
+        print("  SKU 失配检查：left join 后 valid_from IS NULL = %d / %d 行" % (n_miss, n))
+        if n_miss > 0:
+            msg = ("SKU SCD2 关联失配 %d / %d 行（valid_from IS NULL）：这些订单在 dt "
+                   "当天没有有效商品版本，left join 已保留但维度字段为 NULL" % (n_miss, n))
+            print("  !! WARN %s" % msg)
+            if mode != "dry":
+                fail(msg)
+            print("  [dry-run] 仅告警不中断（写入模式会 exit %d）" % EXIT_SELF_CHECK_FAILED)
+
     if n == 0:
-        print("  !! 0 行，跳过")
+        print("  !! 0 行，跳过（不做任何 DELETE）")
         return 0
 
     if mode == "dry":
@@ -191,21 +287,26 @@ def run_one(spark, name, mode, d1, d2):
         df.show(3, truncate=False)
         return n
 
-    if mode == "rebuild":
-        # 全量重建：先清空（Iceberg 没有 TRUNCATE，用 DELETE）
+    # ---- 幂等清理：只删「本次要写的范围」，再 append ----
+    if not d1:
         spark.sql("DELETE FROM %s" % tgt)
-        print("  已清空目标表")
-        df.writeTo(tgt).append()
+        print("  全量模式：已 DELETE 整表")
+    elif name == "dwd_order_lifecycle":
+        # lifecycle 没有 dt 列 -> 按订单集合删；scope 先落 temp view 才能进 SQL 子查询
+        scope.createOrReplaceTempView(SCOPE_VIEW)
+        spark.sql("DELETE FROM %s WHERE order_id IN (SELECT order_id FROM %s)" % (tgt, SCOPE_VIEW))
+        print("  lifecycle 增量：已按 scope 订单集合 DELETE（temp view=%s）" % SCOPE_VIEW)
     else:
-        # 增量：先把范围内已有的行删掉再写（幂等），ODS 是 append-only 不代表 DWD 也是
-        if d1:
-            spark.sql("DELETE FROM %s WHERE dt >= '%s' AND dt <= '%s'" % (tgt, d1, d2))
-        df.writeTo(tgt).append()
+        spark.sql("DELETE FROM %s WHERE dt >= '%s' AND dt <= '%s'" % (tgt, d1, d2))
+        print("  已 DELETE dt in [%s, %s] 的旧行" % (d1, d2))
+
+    df.writeTo(tgt).append()
+
+    # ---- 写入后自检 ----
+    self_check(spark, name, tgt, df, d1, d2, scope)
 
     after = spark.sql("SELECT count(*) FROM %s" % tgt).collect()[0][0]
     print("  RESULT %s before=%d written=%d after=%d" % (name, before, n, after))
-    if mode == "rebuild" and after != n:
-        print("  !! 重建后行数 %d != 算出的 %d" % (after, n))
     return n
 
 
