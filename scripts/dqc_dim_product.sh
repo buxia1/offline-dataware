@@ -20,7 +20,7 @@ docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT count(*) AS rows_, count(DISTINCT product_id) AS pids,
        COALESCE(sum(is_current),0) AS cur,
        round(COALESCE(sum(is_current),0)/NULLIF(count(DISTINCT product_id),0),2) AS ratio
-FROM dim.dim_product_scd2;"
+FROM lake.dim.dim_product_scd2;"
 
 echo "=== 校验（全部通过才有 0 行）==="
 VIOLATIONS=$(docker exec -i starrocks mysql -P9030 -h127.0.0.1 -uroot -N -B < "$SQL_FILE")

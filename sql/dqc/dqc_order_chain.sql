@@ -36,7 +36,7 @@ WITH checks AS (
                count(CASE WHEN status = 'paid'   THEN 1 END) AS p,
                sum(CASE WHEN status = 'paid'   THEN amount ELSE 0 END) AS pa,
                sum(CASE WHEN status = 'refund' THEN amount ELSE 0 END) AS ra
-        FROM dwd.dwd_order_detail
+        FROM lake.dwd.dwd_order_detail
         GROUP BY user_id, dt
     ) b ON a.user_id = b.user_id AND a.dt = b.dt
 
@@ -47,7 +47,7 @@ WITH checks AS (
     --   → 逐天重建时只检查"已重建到的那天"，不会因为"后面的天还没做"而红灯
     SELECT '② DWS 覆盖 DWD 全部日期' AS check_name,
            CAST(count(*) AS BIGINT) AS violations
-    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
+    FROM (SELECT DISTINCT dt FROM lake.dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
     WHERE d.dt NOT IN (SELECT dt FROM dws.dws_user_order_day)
 
     UNION ALL
@@ -91,8 +91,8 @@ WITH checks AS (
     --   实测有 3 天不满足。写成检查会永远红灯。
     SELECT '⑤ DWD 行数不超过 ODS' AS check_name,
            CAST(COALESCE(sum(CASE WHEN d.c > o.c THEN 1 ELSE 0 END), 0) AS BIGINT) AS violations
-    FROM (SELECT dt, count(*) c FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}' GROUP BY dt) d
-    JOIN (SELECT dt, count(*) c FROM ods.ods_order      WHERE dt <= '${AS_OF}' GROUP BY dt) o
+    FROM (SELECT dt, count(*) c FROM lake.dwd.dwd_order_detail WHERE dt <= '${AS_OF}' GROUP BY dt) d
+    JOIN (SELECT dt, count(*) c FROM lake.ods.ods_order      WHERE dt <= '${AS_OF}' GROUP BY dt) o
       ON d.dt = o.dt
     UNION ALL
 
@@ -102,8 +102,8 @@ WITH checks AS (
     --    （标量子查询比 IN 单行派生表稳：见 PITFALLS §3.12）
     SELECT '⑤b ODS 覆盖 DWD 全部日期' AS check_name,
            CAST(count(*) AS BIGINT) AS violations
-    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
-    LEFT JOIN (SELECT DISTINCT dt FROM ods.ods_order WHERE dt <= '${AS_OF}') o ON o.dt = d.dt
+    FROM (SELECT DISTINCT dt FROM lake.dwd.dwd_order_detail WHERE dt <= '${AS_OF}') d
+    LEFT JOIN (SELECT DISTINCT dt FROM lake.ods.ods_order WHERE dt <= '${AS_OF}') o ON o.dt = d.dt
     WHERE o.dt IS NULL
 
     UNION ALL
@@ -112,8 +112,8 @@ WITH checks AS (
     --    LEFT JOIN ... IS NULL 而不是 NOT IN / NOT EXISTS：见 PITFALLS §3.9
     SELECT '⑤b ODS 覆盖 DWD 全部日期' AS check_name,
            CAST(count(*) AS BIGINT) AS violations
-    FROM (SELECT DISTINCT dt FROM dwd.dwd_order_detail) d
-    LEFT JOIN (SELECT DISTINCT dt FROM ods.ods_order) o ON o.dt = d.dt
+    FROM (SELECT DISTINCT dt FROM lake.dwd.dwd_order_detail) d
+    LEFT JOIN (SELECT DISTINCT dt FROM lake.ods.ods_order) o ON o.dt = d.dt
     WHERE o.dt IS NULL
 )
 SELECT check_name, violations

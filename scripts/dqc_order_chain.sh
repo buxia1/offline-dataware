@@ -32,7 +32,7 @@ fi
 echo "=== 当前状态（检查范围 dt <= $AS_OF）==="
 $QUERY "SELECT count(*) AS dwd_rows, count(DISTINCT dt) AS dwd_days,
                COALESCE(sum(amount),0) AS dwd_amount
-        FROM dwd.dwd_order_detail WHERE dt <= '$AS_OF';"
+        FROM lake.dwd.dwd_order_detail WHERE dt <= '$AS_OF';"
 $QUERY "SELECT count(*) AS dws_rows, count(DISTINCT dt) AS dws_days
         FROM dws.dws_user_order_day WHERE dt <= '$AS_OF';"
 

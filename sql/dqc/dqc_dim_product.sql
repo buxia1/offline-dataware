@@ -21,7 +21,7 @@ WITH checks AS (
     -- ① 每个商品恰好一个当前版本
     SELECT '① 每商品恰好一个当前版本' AS check_name,
            CAST(count(DISTINCT product_id) AS BIGINT) - CAST(COALESCE(sum(is_current), 0) AS BIGINT) AS violations
-    FROM dim.dim_product_scd2
+    FROM lake.dim.dim_product_scd2
 
     UNION ALL
 
@@ -41,7 +41,7 @@ WITH checks AS (
     FROM (
         SELECT product_id, valid_to,
                LEAD(valid_from) OVER (PARTITION BY product_id ORDER BY valid_from) AS next_from
-        FROM dim.dim_product_scd2
+        FROM lake.dim.dim_product_scd2
     ) t
 
     UNION ALL
@@ -52,15 +52,15 @@ WITH checks AS (
                     WHEN is_current = 1 AND valid_to <> DATE '9999-12-31' THEN 1
                     WHEN is_current = 0 AND valid_to  = DATE '9999-12-31' THEN 1
                     ELSE 0 END), 0) AS BIGINT)
-    FROM dim.dim_product_scd2
+    FROM lake.dim.dim_product_scd2
 
     UNION ALL
 
     -- ④ 物化对账（行数）：宽表每一行都该来自订单明细，不多不少
     SELECT '④ 物化行数一致',
            CAST(ABS(
-               (SELECT count(*) FROM dwd.dwd_order_detail)
-             - (SELECT count(*) FROM dwd.dwd_order_sku_detail)
+               (SELECT count(*) FROM lake.dwd.dwd_order_detail)
+             - (SELECT count(*) FROM lake.dwd.dwd_order_sku_detail)
            ) AS BIGINT)
 
     UNION ALL
@@ -68,8 +68,8 @@ WITH checks AS (
     -- ⑤ 物化对账（金额）：JOIN 写错最典型的表现就是金额被放大（一对多）
     SELECT '⑤ 物化金额一致',
            CAST(CASE WHEN ABS(
-               (SELECT COALESCE(sum(amount), 0) FROM dwd.dwd_order_detail)
-             - (SELECT COALESCE(sum(amount), 0) FROM dwd.dwd_order_sku_detail)
+               (SELECT COALESCE(sum(amount), 0) FROM lake.dwd.dwd_order_detail)
+             - (SELECT COALESCE(sum(amount), 0) FROM lake.dwd.dwd_order_sku_detail)
            ) < 0.01 THEN 0 ELSE 1 END AS BIGINT)
 
     UNION ALL
@@ -99,8 +99,8 @@ WITH checks AS (
     SELECT '⑥ 重物化属性一致',
            CAST(
              (SELECT count(*)
-              FROM dwd.dwd_order_sku_detail sku
-              JOIN dim.dim_product_scd2 s
+              FROM lake.dwd.dwd_order_sku_detail sku
+              JOIN lake.dim.dim_product_scd2 s
                 ON sku.product_id = s.product_id
                AND sku.dt BETWEEN s.valid_from AND s.valid_to
               WHERE NOT (sku.category  <=> s.category
@@ -110,8 +110,8 @@ WITH checks AS (
              (SELECT count(*)
               FROM (
                   SELECT s.product_id AS matched
-                  FROM dwd.dwd_order_sku_detail sku
-                  LEFT JOIN dim.dim_product_scd2 s
+                  FROM lake.dwd.dwd_order_sku_detail sku
+                  LEFT JOIN lake.dim.dim_product_scd2 s
                     ON sku.product_id = s.product_id
                    AND sku.dt BETWEEN s.valid_from AND s.valid_to
               ) t

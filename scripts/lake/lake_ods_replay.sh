@@ -40,7 +40,8 @@ for j in iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
          spark-token-provider-kafka-0-10_2.12-3.5.1.jar \
          kafka-clients-3.4.1.jar \
          commons-pool2-2.11.1.jar ; do
-  [[ -f "${SPARK_JAR_DIR}/${j}" ]] || { echo "❌ 缺 jar: ${j}" >&2; exit 3; }
+  docker exec "${SPARK_CT:-spark}" test -f "/opt/offline-dw/jars/${j}" \
+    || { echo "❌ 缺 jar（容器 ${SPARK_CT:-spark} 内 /opt/offline-dw/jars）: ${j}" >&2; exit 3; }
   JARS="${JARS},/opt/offline-dw/jars/${j}"
 done
 JARS="${JARS#,}"

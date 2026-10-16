@@ -21,7 +21,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ="$(cd "$HERE/../.." && pwd)"
 SPARK_CT="${SPARK_CT:-spark}"
-LOCK_DIR="${LOCK_DIR:-$PROJ/scripts/.spark_job.lock}"
+LOCK_DIR="${LOCK_DIR:-/tmp/.spark_job.lock}"   # 容器内路径（DS 里 ./scripts 是只读挂载）
 FILTER='^[0-9]{2}/|WARN |SLF4J|^Using Spark|Setting default|To adjust|Spark Web UI|Spark master|HiveConf|ObjectStore'
 
 # shellcheck source=_spark_lib.sh

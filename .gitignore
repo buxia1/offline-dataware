@@ -29,4 +29,7 @@ __pycache__/
 *.pyc
 
 # ---------- 湖层数据（Iceberg warehouse，可重建）----------
-lake/
+/lake/
+
+# ---------- 湖侧 Spark 作业串行锁（运行时创建/删除）----------
+scripts/.spark_job.lock/
