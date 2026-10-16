@@ -1,8 +1,9 @@
-# 湖侧链路操作手册（交付包：现状 / 验收脚本 / 待接调度）
+# 湖侧链路操作手册（现状 / 验收脚本 / 调度现状）
 
-> 本文对应仓库提交 `d92be7e` 之后的状态。**五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、
-> 仓侧 dws/ads 物化（含按天自动增量）已实现并实测过。**
-> 剩下没做的是：**DolphinScheduler 接线** 与 **可重复执行的对账作业**（见 §2 步骤 4）。
+> 本文对应仓库提交 `d92be7e` 之后的状态，**已于 2026-10-16 更新到「调度已接入并跑通」**。
+> **五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、仓侧 dws/ads 物化（含按天自动增量）
+> 已实现并实测过；DolphinScheduler 接线与可重复执行的对账作业也已完成**（见 §2 步骤 4）。
+> 仍未做：**失败告警配置**、**湖表维护进调度**、**`user_id IS NULL` 口径拍板**（见附录 C）。
 > 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
 ---
@@ -67,8 +68,10 @@ REFRESH EXTERNAL TABLE 之后： 854844  ← 正确
 失败只告警（`ods_order_flat` 是 Kafka 外表，刷新报错属正常）。
 **你自己写的任何读湖侧的下游任务，第一步也必须先 `REFRESH EXTERNAL TABLE`。**
 
-> 补丁文件 `fix_dws_refresh.py`（工作区 `D:\develop\workspace\deepseek_harness_temp\fix_dws_refresh.py`）
-> 就是往 runner 里加这段防护的转写器。
+> 这段防护已经**直接落在仓库脚本里**：`scripts/run_dws_ads_from_lake.sh` 的 `LAKE_TABLES`
+> 数组是**数据驱动**的 —— 每张湖表的「是否关键 / 刷新失败是 `die` 还是只 `warn` / 为什么」
+> 都写在数组元素里（`lake.dwd.dwd_order_detail` 是唯一 `critical=1` 的，拿不到新快照直接 `die`）。
+> `scripts/recon_lake_wh.sh` 开头也对湖侧表做同样的刷新。
 
 ### 1.2 复核附录 A 的 5 处缺陷修复（判据都给好了）
 
@@ -142,8 +145,9 @@ bash scripts/lake/run_dwd.sh build dwd_order_lifecycle  "$D1" "$D2"
 没有分区裁剪之外的优化，下游点查（按用户、按日期）会明显退化。所以保留仓侧表，
 但**数据来源从仓侧 dwd 换成湖侧 dwd**。
 
-**代码**：`scripts/run_dws_ads_from_lake.sh`（110 → **约 325 行**）+ 它内嵌的 SQL，
-配套测试脚本 `test_inc_dws_ads.sh`（在 `D:\develop\workspace\deepseek_harness_temp\`）。
+**代码**：`scripts/run_dws_ads_from_lake.sh`（110 → **约 325 行**）+ 它内嵌的 SQL。
+（当时那 30 条断言的测试脚本 `test_inc_dws_ads.sh` 是一次性工具、未入库；
+现在仓库里常驻的回归自测是 `scripts/test_recon.sh`，专门覆盖对账脚本本身。）
 
 **三种运行模式**（默认模式从 TRUNCATE 全量改成了 auto 增量 —— 日常调度无人值守不能再整表清空）：
 
@@ -205,38 +209,37 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 --    ads:90|90|854844|105680366.50
 ```
 
-### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ⬜ 未做，剩下的主要工作
+### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ✅ 2026-10-16 已完成（维护节点除外）
 
-**为什么**：现在全是手工跑，没有增量、没有失败告警。仓侧那套调度（串行丢弃、
-`ds/alerts/notify.sh` 告警）是现成的，**照抄结构即可**。
+**已落地**：工作流 **`offline_dataware_lake`**（v5，`release_state=1`），定时 `0 0 2 * * ? *`
+（每天 02:00，schedule id 7 **已上线**），执行策略「串行等待」。
+**首次端到端实测**：实例 346，8 个节点全绿、**3 分 34 秒**。节点名与命令见 `README.md`
+的「⭐ 当前生产链路」。
 
-接线顺序（串行，别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
+接线顺序（串行，实测就是这个拓扑；别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
 
 ```
-[湖侧增量 DWD] → [仓侧 dws/ads 物化] → [对账] → [湖表维护]
+[lake_ods_replay] → [lake_ods_product] → [lake_dim_build] → [lake_dwd_incremental]
+                  → [wh_dws_ads_materialize]
+                  → { [dqc_order_chain], [dqc_dim_product], [recon_lake_wh] }
 ```
 
-- **对账节点**（本次一次性核对的口径，沉淀成脚本）：
-
-  ```sql
-  -- 一行一表：湖侧 vs 仓侧逐项比
-  SELECT 'detail' t, count(*) r, count(DISTINCT order_id) o, sum(amount) a FROM lake.dwd.dwd_order_detail
-  UNION ALL SELECT 'detail_wh', count(*), count(DISTINCT order_id), sum(amount) FROM dwd.dwd_order_detail
-  UNION ALL SELECT 'sku', count(*), count(DISTINCT order_id), sum(amount) FROM lake.dwd.dwd_order_sku_detail
-  UNION ALL SELECT 'sku_wh', count(*), count(DISTINCT order_id), sum(amount) FROM dwd.dwd_order_sku_detail
-  UNION ALL SELECT 'lifecycle', count(*), count(DISTINCT order_id), sum(amount) FROM lake.dwd.dwd_order_lifecycle
-  UNION ALL SELECT 'lifecycle_wh', count(*), count(DISTINCT order_id), sum(amount) FROM dwd.dwd_order_lifecycle;
-  -- 两边对应行的 r/o/a 三个数必须相等，否则告警
-  ```
-
-  ⚠️ **对账作业执行前也必须先 `REFRESH EXTERNAL TABLE`**，否则拿旧快照比对 = 白比。
-  建议把「对称差 ≠ 0」「刷新失败」都接进告警（仓侧 `ds/alerts/notify.sh` 是现成的模板）。
-
-- **维护节点**：`python3 scripts/lake/lake_maintain.py`（只读盘点）+
-  `--expire --keep N`（清快照）。实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，行数不变。
+- **对账节点已沉淀成脚本**：`scripts/recon_lake_wh.sh`（**只读**；退出码 `0` 全绿 / `2` 对账不一致
+  → DS 告警 / `1` 用法或环境错误）。四层校验，分层是有意的：
+  **A 水位·新鲜度** → **B 湖侧闭合**（DWD 每天行数 vs 由 ODS **现算**的期望 —— **这是唯一能发现
+  「湖仓两边一起错」的检查，对称差永远发现不了**）→ **C 湖↔仓逐行对称差** →
+  **D 仓侧覆盖 / 硬基线**。参数：`--range D1 D2` / `--fast` / `--strict` / `--allow-lag N` / `--json`。
+  自测：`bash scripts/test_recon.sh`（内存假数据，**9/9 通过**）；全区间实测 **3.1 秒**。
+  注意：它比的是**仓侧 `dws`/`ads`**（仓侧 `ods`/`dwd`/`dim` 已不再被调度更新，拿它们比没有意义）。
+- **维护节点：仍未进调度** ⚠️ —— `python3 scripts/lake/lake_maintain.py`（只读盘点）+
+  `--expire --keep N`（清快照）。实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，
+  行数不变。这是附录 C 里仍没打勾的项之一。
+- **失败告警：仍未配** ⚠️ —— 定时建好后 `warning_type=0`（不告警）；四个旧流程都是
+  `warning_type=2` + 告警组 2。不配的话每天 02:00 失败**没有人会收到通知**。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
+  （实测：Routine Load 那两个作业 `ods_order_load` / `ods_order_event_load` 至今仍在 RUNNING。）
 
 ---
 
@@ -254,7 +257,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 
 ## 附录 B：本轮 30 条断言的实测记录（`PASS=30 FAIL=0`）
 
-测试脚本：`test_inc_dws_ads.sh`（工作区）。全部代码改动落在
+测试脚本：`test_inc_dws_ads.sh`（一次性工具，未入库）。全部代码改动落在
 `scripts/run_dws_ads_from_lake.sh`（`1 file changed, 214 insertions(+), 101 deletions(-)`），
 `bash -n` 通过。
 
@@ -297,14 +300,21 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
 - [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
 - [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
-- [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
-- [ ] DolphinScheduler 里全链路**串行**接入 + 失败告警生效（步骤 4）
+- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` v5，8 节点，
+      流程与定时都已上线；实测实例 346 全绿 **3 分 34 秒**
+- [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
+      `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
+- [ ] ⚠️ **失败告警未配**：该定时的 `warning_type=0` / `warning_group_id=0`
+      （四个旧流程都是 `warning_type=2` + 告警组 2）。不配 = 每天 02:00 失败没人收到通知
 - [ ] 湖表维护（`expire_snapshots` / `remove_orphan_files`）已进调度
-- [ ] 对账作业可重复执行（不是一次性人工核对），且执行前 `REFRESH EXTERNAL TABLE`
-- [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异后，才评估停更仓侧 ods/dim/dwd
+- [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
+- [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异
 
-> 最后一条是关键：**仓侧 ODS/DWD 停更 = Routine Load 停 = 失去实时摄入**。
-> 湖侧目前只有离线重放能力，这个决定建议放到最后、并且先并行跑 1~2 个月看差异。
+> 关于「停更仓侧 ods/dim/dwd」这一条：**2026-10-16 起仓侧 `ods`/`dim`/`dwd` 事实上已经不再被
+> 调度更新**了（新链路只物化仓侧 `dws`/`ads`；仓侧 `ods` 仍由 Routine Load 写入）。
+> 但**仓侧 ODS 停更 = Routine Load 停 = 失去实时摄入** —— 湖侧目前只有离线重放能力
+> （`scripts/lake/lake_ods_replay.py` 直读 Kafka），延时以小时计，所以这个决定仍建议放到最后、
+> 并且先并行跑 1~2 个月看差异。
 
 ---
 

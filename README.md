@@ -67,7 +67,12 @@
 > 查询 / 服务层，只保留 `dws` / `ads` 两层物化结果，仓侧 `ods` / `dwd` / `dim` 不再更新。
 
 **调度**：DolphinScheduler 工作流 **`offline_dataware_lake`** —— 流程已上线
-（`release_state=1`，version 5），定时 `0 0 2 * * ? *`（每天 02:00），执行策略「串行等待」。
+（`release_state=1`，version 5），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
+（schedule id 7 `release_state=1`，2026-10-16），执行策略「串行等待」。
+
+> ⚠️ **失败告警还没配**：该定时的 `warning_type=0` / `warning_group_id=0`（四个旧流程都是
+> `warning_type=2` + 告警组 2）。不配的话，每天 02:00 这一跑失败**不会有人收到通知**，
+> 只能第二天翻执行历史。
 
 **每天 8 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后）：
 
@@ -94,6 +99,15 @@
 | `dim_product_chain` | 仓侧 ODS → DIM(SCD2) → SKU 宽表 | 节点 2 + 3 + 4 |
 | `order_event_chain` | 仓侧累积快照 `dwd_order_lifecycle` | 节点 4（`lake.dwd.dwd_order_lifecycle`） |
 | `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⚠️ 无人取代**且已离线** —— 要继续收告警就得单独把它上线 |
+
+> **关于 Routine Load（2026-10-16 实测）**：`ods_order_load`（→ `ods.ods_order`）与
+> `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**都还在 RUNNING**，
+> 方向是 **Kafka → 仓侧 `ods.*`**，与湖侧**没有任何数据流**（湖侧是
+> `scripts/lake/lake_ods_replay.py` 独立批式读同一批 topic 重放进 Iceberg）。
+> ⚠️ 将来若要上线 `routine_load_health`，**先修脚本再上线**：`scripts/check_routine_load.sh`
+> 里还留着 2026-10-08 的旧阈值（`EXPECT_EVENT=2379` → 「行数异常膨胀」判据 `≥4758`），
+> 而 `ods_order_event` 现在已有 3,120,421 行 —— **一上线就会每 30 分钟误报一次 `exit 1`**；
+> 另一条「整表去重不变式」（`3120421 ≠ 2911488`）同理。
 
 > ⚠️ 仓侧 `ods.*` / `dwd.*` / `dim.*` 这几张表**从 2026-10-16 起不再被调度更新**
 > （只有 Routine Load 还在往仓侧 `ods` 写）。保留它们是为了对照与回滚，**不要再往上建报表**。
@@ -1536,10 +1550,13 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 - [x] **湖↔仓对账作业** —— `scripts/recon_lake_wh.sh`（水位 / 湖侧闭合 / 整行对称差 / 覆盖与硬基线
       四层；只读），实测自测 **9/9 通过**、全区间 **3.1 秒**，已挂进工作流
 - [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5，8 节点，实例 346 全绿 **3 分 34 秒**
-- [ ] **定时上线** ⚠️ —— 流程已上线，但它的**定时**（`t_ds_schedules` id 7）仍是 `release_state=0`
-      —— 判据：定时管理里该 schedule 显示「上线」；**否则每天 02:00 不会自动跑**（见「重要提醒」①）
-- [ ] **旧链路退役收尾** —— 四个旧流程均已离线；脚本已收进 `scripts/legacy_warehouse/`
-      —— 待决定：四个流程删掉还是留着；若保留 Routine Load 告警需求，需单独上线 `routine_load_health`
+- [x] **定时上线** ✅ **2026-10-16 完成** —— `t_ds_schedules` id 7 `release_state=1`，
+      每天 02:00 会自动跑
+      —— 判据：`SELECT release_state FROM t_ds_schedules WHERE id = 7` 返回 1
+- [ ] **失败告警** ⚠️ —— 该定时的 `warning_type=0` / `warning_group_id=0`（**没配告警**）
+      —— 判据：定时管理里编辑该 schedule，告警类型选「失败」、告警组选同一个（id 2）
+- [x] **旧链路退役收尾**（按决定：**先留着、不上线、先不动**）—— 四个旧流程均已离线
+      （`release_state=0`），脚本已收进 `scripts/legacy_warehouse/`
 
 ### 待决问题
 
@@ -1547,7 +1564,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 |---|---|---|
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
-| 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程全部保持离线（`release_state=0`）。⚠️ 遗留一条：新流程的**定时**还是「下线」，要去定时管理点一次上线 |
+| 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程保持离线（`release_state=0`，按决定先留着不动）。定时已上线（schedule id 7 `release_state=1`）。⚠️ 新遗留一条：该定时的**告警未配**（`warning_type=0`），失败不会通知任何人 |
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ### 高危操作：重建容器前的「金丝雀」检查
