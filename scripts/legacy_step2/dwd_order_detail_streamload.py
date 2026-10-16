@@ -9,7 +9,7 @@ v1 用 Spark JDBC 写：09-20 单天 9475 行花了 **467 秒**（≈20 行/秒�
 Stream Load 是 StarRocks 官方给大批量导入的口子（HTTP + CSV 文件，BE 直接消费），
 同样数据实测 **秒级**。
 
-【口径：与仓侧老作业 scripts/dwd_overwrite.sh 逐字对齐】
+【口径：与仓侧老作业 scripts/legacy_warehouse/dwd_overwrite.sh 逐字对齐】
     老作业（StarRocks 内 SQL）：
         INSERT OVERWRITE dwd.dwd_order_detail PARTITION (p${D})
         SELECT order_id, dt, user_id, product_id, ABS(amount), order_time, status

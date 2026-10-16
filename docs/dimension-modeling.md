@@ -621,7 +621,7 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 |---|---|
 | `sql/dwd/dwd_order_lifecycle.sql` | 表（`PRIMARY KEY(order_id)`，五个里程碑列 + 派生列）+ **期望视图** `dwd.v_order_lifecycle_expected` |
 | `sql/dwd/dwd_order_lifecycle_load.sql` | 装载（`INSERT` 即 UPSERT，占位符 `${FROM_DT}`）|
-| `scripts/dwd_order_lifecycle_load.sh` | 外壳 + **五道防线**（① 范围内无订单退出 ② 占位符替换校验 ③ 全表双向 EXCEPT 对账 ④ 不变式 ⑤ **事件表行数 = 去重对数**）|
+| `scripts/legacy_warehouse/dwd_order_lifecycle_load.sh` | 外壳 + **五道防线**（① 范围内无订单退出 ② 占位符替换校验 ③ 全表双向 EXCEPT 对账 ④ 不变式 ⑤ **事件表行数 = 去重对数**）|
 
 **两个实现细节和本文最初的设想不同（以代码为准）**：
 
@@ -688,7 +688,7 @@ JOIN (SELECT user_id, sum(paid_amount) amt FROM dws_user_order_day GROUP BY user
 
 | 方向 | 说明 |
 |---|---|
-| ~~SCD2 改增量维护~~ | ✅ **已完成**（`scripts/dim_product_scd2_load.sh`，默认增量、`--full` 恢复全量；与全量重建的指纹已实测一致）|
+| ~~SCD2 改增量维护~~ | ✅ **已完成**（`scripts/legacy_warehouse/dim_product_scd2_load.sh`，默认增量、`--full` 恢复全量；与全量重建的指纹已实测一致）|
 | **累积快照事实表** | ✅ **全部完成**（见 §10.8）：表/视图/装载/五道防线 + 摄入改增量（位点表）+ 逐天回放 09-20 ~ 09-28（**900 行**）+ 接入 DS（工作流三 `order_event_chain`）|
 | **更多维度** | 用户维度、地区维度（现在只有商品维度）|
 | **一致性维度共享** | 若将来订单事实与商品事实要"按品类"对账，需引入真正的**共享维度**（现在只存 `product_id` 外键，见 §10.4）|

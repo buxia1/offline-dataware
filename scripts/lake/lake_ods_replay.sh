@@ -5,7 +5,7 @@
 #   bash scripts/lake_ods_replay.sh --date 2026-09-20
 #   bash scripts/lake_ods_replay.sh --date 2026-09-20 --dry-run
 #
-# 与仓侧 scripts/dwd_overwrite.sh 的关系：
+# 与仓侧 scripts/legacy_warehouse/dwd_overwrite.sh 的关系：
 #   · 参数风格【一样】：--date 只跑一天，who 循环由外面（DS/人工）做
 #   · 幂等【一样】：重跑同一天结果不变
 #   · 实现【不同】：仓侧靠 INSERT OVERWRITE PARTITION(...)，湖侧靠 dynamic 分区

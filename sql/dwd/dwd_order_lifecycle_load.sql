@@ -6,7 +6,7 @@
 --     补数       : ${FROM_DT} = 要补那天   → 那天及之后受影响的订单一起刷新（自愈）
 --     全量重建   : ${FROM_DT} = 1970-01-01 （外壳脚本先 TRUNCATE）
 --
--- ⚠️ 这个占位符必须由 scripts/dwd_order_lifecycle_load.sh 替换后再执行。
+-- ⚠️ 这个占位符必须由 scripts/legacy_warehouse/dwd_order_lifecycle_load.sh 替换后再执行。
 --    直接 docker exec ... mysql < 本文件 是【静默 no-op】（PITFALLS §7.2）：
 --    CAST('${FROM_DT}' AS DATE) = NULL，而 dt >= NULL 恒为 NULL（不是 TRUE）
 --    → 0 行命中、不报错、退出码 0。已实测复现。

@@ -1,5 +1,5 @@
 -- ⚠️ 已作废（2026-10-03）：不要再用这个文件。
---     补 dwd_order_sku_detail 的分区已由 scripts/dwd_sku_load.sh 自动完成
+--     补 dwd_order_sku_detail 的分区已由 scripts/legacy_warehouse/dwd_sku_load.sh 自动完成
 --     （对比"有数据的天" vs "现有分区"，缺的自动 ADD PARTITION，并用 trap 恢复开关）。
 --     保留本文件仅为记录历史做法。
 --

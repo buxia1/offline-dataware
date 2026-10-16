@@ -30,7 +30,7 @@ MODE="${1:---inc}"
 case "$MODE" in
     --inc|--incremental)
         echo "=== 模式：增量维护（默认）==="
-        exec bash scripts/dim_product_scd2_incremental.sh
+        exec bash "$(dirname "$0")/dim_product_scd2_incremental.sh"
         ;;
     --full|--full-rebuild)
         echo "=== 模式：全量重建（TRUNCATE + 从 ODS 完整重推）==="

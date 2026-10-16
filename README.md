@@ -60,6 +60,46 @@
 
 ---
 
+## ⭐ 当前生产链路（2026-10-16 起）
+
+> 上面「架构」图是 **2026-10-09 那版仓侧链路**，作为历史与对照保留。
+> **现在每天真正在跑的是湖侧链路**：计算下沉到 Spark + Iceberg（湖），StarRocks 退化为
+> 查询 / 服务层，只保留 `dws` / `ads` 两层物化结果，仓侧 `ods` / `dwd` / `dim` 不再更新。
+
+**调度**：DolphinScheduler 工作流 **`offline_dataware_lake`** —— 流程已上线
+（`release_state=1`，version 5），定时 `0 0 2 * * ? *`（每天 02:00），执行策略「串行等待」。
+
+**每天 8 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后）：
+
+| # | 节点 | 脚本 | 建议超时 |
+|---|---|---|---|
+| 1 | `lake_ods_replay` | `D="${system.biz.date}"` + `bash scripts/lake/lake_ods_replay.sh --date "${D:0:4}-${D:4:2}-${D:6:2}"` | 30 min |
+| 2 | `lake_ods_product` | `bash scripts/lake/run_ods_product.sh file "/opt/offline-dw/data/dim/product_snapshot_${system.biz.date}.csv"` | 15 min |
+| 3 | `lake_dim_build` | `bash scripts/lake/run_dim.sh build` | 15 min |
+| 4 | `lake_dwd_incremental` | `bash scripts/lake/run_dwd.sh incremental all --lookback 3` | 60 min |
+| 5 | `wh_dws_ads_materialize` | `bash scripts/run_dws_ads_from_lake.sh`（**永不传 `--truncate`**） | 30 min |
+| 6 | `dqc_order_chain` | `bash scripts/dqc_order_chain.sh ${system.biz.date}` | 10 min |
+| 7 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
+| 8 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
+
+**首次端到端实测（2026-10-16，实例 346）**：8 个节点全部 `SUCCESS`，**3 分 34 秒**；
+收尾数据 `dwd_order_detail 854,844` / `dws 18,000` / `ads 90`。
+
+**旧链路已退役**（四个旧工作流都还在 DS 里，但 `release_state=0` 全部离线；
+脚本收进 `scripts/legacy_warehouse/`，退役说明见该目录 README）：
+
+| 旧工作流 | 原职责 | 现在由谁取代 |
+|---|---|---|
+| `offline_dataware` | 仓侧 `dwd → dws → ads` SQL 作业链 | 节点 4 + 5 |
+| `dim_product_chain` | 仓侧 ODS → DIM(SCD2) → SKU 宽表 | 节点 2 + 3 + 4 |
+| `order_event_chain` | 仓侧累积快照 `dwd_order_lifecycle` | 节点 4（`lake.dwd.dwd_order_lifecycle`） |
+| `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⚠️ 无人取代**且已离线** —— 要继续收告警就得单独把它上线 |
+
+> ⚠️ 仓侧 `ods.*` / `dwd.*` / `dim.*` 这几张表**从 2026-10-16 起不再被调度更新**
+> （只有 Routine Load 还在往仓侧 `ods` 写）。保留它们是为了对照与回滚，**不要再往上建报表**。
+
+---
+
 ## 目录结构
 
 ```
@@ -115,24 +155,23 @@ offline-dw/
 │   │                                + lake_*_build.py + lake_maintain.py（见 scripts/lake/README.md）
 │   │   ── 模拟数据（手工造数，不进调度）──
 │   ├── gen/                        gen_mock_orders*.py / gen_mock_products.py
-│   │   ── 仓侧链路（DS 调度的入口）──
-│   ├── dim_product_scd2_load.sh    SCD2 装载外壳（含多道防线）
-│   ├── dim_product_scd2_incremental.sh  SCD2 增量装载
-│   ├── dwd_order_lifecycle_load.sh 累积快照装载外壳（默认增量、--full 全量重建）
-│   ├── dwd_overwrite.sh            DWD 按天覆盖（Shell，给 DS 用）
-│   ├── dwd_sku_load.sh             商品宽表逐天物化
-│   ├── load_product_to_ods.sh      商品 CSV → ODS（Stream Load）
+│   │   ── 仓侧物化 / 校验（DS 当前调度的入口）──
 │   ├── run_dws_ads_from_lake.sh    ⭐ 仓侧 DWS/ADS 从湖侧物化（默认按天自动增量；--truncate 才全量）
-│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1，挂 DS 定时告警）
-│   ├── dqc_dim_product.sh          商品维度 DQC
+│   ├── recon_lake_wh.sh            ⭐ 湖↔仓对账（只读；退出码 2 = 不一致）
+│   ├── test_recon.sh               对账脚本自测（内存假数据）
+│   ├── dqc_dim_product.sh          商品维度 DQC（已指向湖侧 dim）
 │   ├── dqc_order_chain.sh          订单链路 DQC（可选业务日期参数）
+│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1；⚠️ 对应流程当前离线）
+│   │   ── ⚠️ 已退役：仓侧 ODS→DIM→DWD 那一套（2026-10-16）──
+│   ├── legacy_warehouse/           dim_product_scd2_*.sh / dwd_*.sh / load_product_to_ods.sh
+│   │                                （退役原因与取代关系见该目录 README.md）
 │   │   ── ⚠️ 已退役：Routine Load 取代了这套 Spark 增量摄入 ──
 │   ├── ods_legacy/                 ods_order_event_ingest.sh / ods_order_*_to_starrocks.py
 │   │                                （退役原因见 README「ODS 摄入」一节）
 │   │   ── ⚠️ 已退役：第 2 步「写回仓侧」那一套 ──
 │   └── legacy_step2/               dwd_*_streamload.py / dws_ads_streamload.py / run_*.sh
 │                                    （保留原因与坑见 scripts/legacy_step2/README.md）
-├── dolphin/                        DS 工作流导出（4 个 JSON，可重新导入覆盖）
+├── dolphin/                        DS 工作流导出（可重新导入覆盖；⚠️ 见「重要提醒」的两条不可信）
 ├── kafka/                          空目录（Kafka 数据不挂载）
 ├── starrocks/
 │   ├── fe/{conf,log,meta}          meta 挂载用于持久化
@@ -141,8 +180,6 @@ offline-dw/
 ├── spark/{conf,jars}
 └── ds/{bin,libs,logs}
 ```
-
-**没有进版本库的**（见 `.gitignore`）：运行时数据（meta/storage/data/logs）和下载的二进制依赖（jar）。
 
 **没有进版本库的**（见 `.gitignore`）：运行时数据（meta/storage/data/logs）和下载的二进制依赖（jar）。
 
@@ -413,16 +450,16 @@ docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_o
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dwd/dwd_order_sku_detail_add_partitions.sql
 
 # 3. CSV → ODS（Stream Load，snapshot_date 从文件名自动解析）
-bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260920.csv
-bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260921.csv
-bash scripts/load_product_to_ods.sh data/dim/product_snapshot_20260926.csv
+bash scripts/legacy_warehouse/load_product_to_ods.sh data/dim/product_snapshot_20260920.csv
+bash scripts/legacy_warehouse/load_product_to_ods.sh data/dim/product_snapshot_20260921.csv
+bash scripts/legacy_warehouse/load_product_to_ods.sh data/dim/product_snapshot_20260926.csv
 
 # 4. DIM 层：SCD1 快照 与 SCD2 拉链表
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_load.sql
 docker compose exec -T starrocks mysql -P9030 -h127.0.0.1 -uroot < sql/dim/dim_product_scd2_load.sql
 
 # 5. DWD 宽表：订单 + 下单当天的商品属性（逐天 INSERT OVERWRITE）
-bash scripts/dwd_sku_load.sh
+bash scripts/legacy_warehouse/dwd_sku_load.sh
 
 # 6. 验证（4 条不变式见上一节）
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
@@ -502,7 +539,7 @@ docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM
 bash scripts/check_routine_load.sh;  echo "EXIT=$?"
 
 # ③ 装载累积快照（默认增量；--full 是全量重建的恢复手段）
-bash scripts/dwd_order_lifecycle_load.sh
+bash scripts/legacy_warehouse/dwd_order_lifecycle_load.sh
 ```
 
 **⚠️ 逐天回放必须按顺序**（生成器**有状态**）：它读 `ods_order_event` 判断"哪些里程碑还没发"，只发"到期日 **==** `--date`"的事件 —— **跳过某天就永远不补发**。脚本为此内置两类告警（`overdue` / `missing_prev`），命中会 `exit 1` 并打印明细。
@@ -724,7 +761,7 @@ bash scripts/dqc_dim_product.sh
 bash scripts/dqc_order_chain.sh;  echo "订单 EXIT=$?"
 
 # 累积快照：装载 + 五道防线（默认增量、--full 全量重建）
-bash scripts/dwd_order_lifecycle_load.sh
+bash scripts/legacy_warehouse/dwd_order_lifecycle_load.sh
 
 # 累积快照：阶段分布（卡单一眼可见）
 docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
@@ -844,7 +881,7 @@ docker compose restart dolphinscheduler
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（`dwd_order_detail` 从 4 天 → **8 天 / 763 行**）
 - [x] **DQC 加一条「重算对账」** —— `⑥ 重物化属性一致`：宽表里的商品属性必须等于 SCD2 对该日期算出的属性。盖住两个盲区：属性值不同、以及 **JOIN 不上的孤儿行**（范围 JOIN 不满足时那行会直接消失，计数纹丝不动）。写 `<=>` 而非 `<>`（NULL 安全），用 `LEFT JOIN` 而非 `NOT EXISTS`（StarRocks 不支持关联子查询里的非等值谓词）
 - [x] 作业失败告警（邮件 / 钉钉）—— DS 里四个工作流都配了 `warning_type=2` + 告警组 `2`
-- [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/dim_product_scd2_incremental.sh`，指纹一字不差）
+- [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/legacy_warehouse/dim_product_scd2_incremental.sh`，指纹一字不差）
 - [x] **累积快照事实表**（下单 → 支付 → 发货 → 完成）—— 表/视图/装载/五道防线，**09-20 ~ 09-28 共 900 行**，卡单三类可见
 - [x] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表）—— 幂等已实测（重跑 `读到 0 行`）。**（2026-10-09 该方案已被 Routine Load 取代）**
 - [x] **把订单事件 / 累积快照链路接进 DS**（工作流三 `order_event_chain`：`dwd_lifecycle_load`，02:30，失败策略 `END`）
@@ -1135,6 +1172,12 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
 
+> ⚠️ **本节记的是「第 2 步」当时的做法，已在 2026-10-15 被第 3 步取代**：下面 `legacy_step2`
+> 的 Stream Load 脚本（把湖侧结果写回**仓侧** `dwd`）已经退役 —— 现在 `dim` / `dwd` **留在湖侧**，
+> 仓侧只物化 `dws` / `ads`（见「⭐ 第 3 步」与「⭐ 当前生产链路」）。
+> 本节保留是因为 **JDBC 467 秒 vs Stream Load 34 秒的性能对比表**与「为什么不用 Spark JDBC」
+> 的结论**仍然有效**，也是当初「湖仓值不值得」的最终证据。
+
 湖层 ODS 就位后，**计算下沉到 Spark**：Spark 直读 Iceberg 清洗/聚合，再把结果
 **Stream Load 回仓侧的 `dwd` / `dws` / `ads`**。仓侧表结构、下游查询、DolphinScheduler
 作业名一律不动。
@@ -1165,7 +1208,7 @@ docker run --rm --network offline-dw_default --memory 5g \
 
 （`--dates 2026-09-20,2026-09-21` 指定散天；`--dry-run` 只算不写。）
 
-**口径逐字照搬仓侧老作业 `scripts/dwd_overwrite.sh`**：`user_id IS NOT NULL` /
+**口径逐字照搬仓侧老作业 `scripts/legacy_warehouse/dwd_overwrite.sh`**：`user_id IS NOT NULL` /
 `ABS(amount)` / 按订单取 `ABS(amount)` 最大行 / 按 `dt` 分区。**唯一刻意差异**是数据来源
 由仓侧 `ods.ods_order` 换成湖侧 `lake.ods.ods_order`（同一批 Kafka 消息的双写副本，
 逐 key 零差异）。多天批跑时 `ROW_NUMBER` 的 `PARTITION BY` 必须带 `dt`
@@ -1430,7 +1473,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 > 变成 Iceberg **隐藏分区**（`PARTITIONED BY (dt)`），没有空分区堆积问题，
 > 下方第 3 步的重定分区与桶数针对的是**仓侧 StarRocks 表**，仍然要做。
 
-**第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运）
+**第 2 步 · DWD 计算下沉到 Spark**（直读文件，这才消掉那 82% 的 JDBC 搬运） —— ✅ **2026-10-14 完成**（后被第 3 步取代：`dwd` 留在湖侧，不再回灌仓侧；本节脚本已收进 `scripts/legacy_step2/`）
 
 - [x] **订单明细清洗改写为 Spark SQL** —— 读湖层文件，不读 JDBC ✅ **2026-10-14**
       —— 落 `scripts/legacy_step2/dwd_order_detail_streamload.py`（Spark 读 Iceberg → 清洗 → Stream Load 回仓侧）
@@ -1465,8 +1508,10 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— ⚠️ 期望行数 **不是 854,844**：`dwd_order_detail` 少了 `user_id IS NULL` 的
          45,156 单，而累积快照按 `order_id` 聚合事件、**包含**这些单（占位 `user_id=NULL`）
       —— ℹ️ 用户 2026-10-14 曾决定"暂时不动"，本步是**用户改主意后**才做的（m04729）
-- [ ] **服务层查询不受影响** —— 必要时用 external catalog 视图过渡
+- [x] **服务层查询不受影响** ✅ **2026-10-16**
       —— 判据：现有报表 SQL 结果不变
+      —— 实测：仓侧 `dws` / `ads` 仍由 `scripts/run_dws_ads_from_lake.sh` 物化（行数 18,000 / 90
+         与迁移前逐行一致），报表 SQL 与下游读取方式零改动；湖侧用 external catalog `lake` 直查
 
 **第 3 步 · 放量**（先 1000 单/天跑通，再上 1 万单/天 × 90 天）
 
@@ -1479,13 +1524,30 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 - [ ] **放量到 1 万单/天 × 90 天**（≈270 万事件）
       —— 判据：峰值内存不越容器上限（尤其 StarRocks 3 GB）；作业不 OOM
 
+**第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 除定时上线外已完成
+
+- [x] **方案 C 落地** —— `run_dwd.sh` / `run_dim.sh` 改为常驻 `docker exec spark`（不再 `docker run`
+      临时容器），串行锁移到容器内 `/tmp/.spark_job.lock`
+      —— 原因：旧写法从 DS 容器跑时 `docker run -v` 的**源路径由宿主 daemon 解析**，而宿主没有
+         `/opt/offline-dw` → Docker 静默建空目录 → Spark 读写到一个空 warehouse（**错且不报错**）
+- [x] **商品快照进湖** —— `scripts/lake/run_ods_product.sh`（CSV → `lake.ods.ods_product`，
+      `snapshot_date` 由文件名解析，`DELETE + append` 幂等）；短期继续吃 CSV，不改成实时流
+- [x] **DQC 指向湖侧** —— `dqc_order_chain.sh` / `dqc_dim_product.sh` 改为校验 `lake.*`
+- [x] **湖↔仓对账作业** —— `scripts/recon_lake_wh.sh`（水位 / 湖侧闭合 / 整行对称差 / 覆盖与硬基线
+      四层；只读），实测自测 **9/9 通过**、全区间 **3.1 秒**，已挂进工作流
+- [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5，8 节点，实例 346 全绿 **3 分 34 秒**
+- [ ] **定时上线** ⚠️ —— 流程已上线，但它的**定时**（`t_ds_schedules` id 7）仍是 `release_state=0`
+      —— 判据：定时管理里该 schedule 显示「上线」；**否则每天 02:00 不会自动跑**（见「重要提醒」①）
+- [ ] **旧链路退役收尾** —— 四个旧流程均已离线；脚本已收进 `scripts/legacy_warehouse/`
+      —— 待决定：四个流程删掉还是留着；若保留 Routine Load 告警需求，需单独上线 `routine_load_health`
+
 ### 待决问题
 
 | # | 问题 | 建议 |
 |---|---|---|
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
-| 4 | **定时作业口径未统一** | DolphinScheduler 里仍是旧的 StarRocks SQL 作业（用户已于 2026-10-14 全部停掉）；若重启调度，会把湖侧口径覆盖回旧口径——要么把作业换成 Spark 版，要么确认两套口径等价 |
+| 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程全部保持离线（`release_state=0`）。⚠️ 遗留一条：新流程的**定时**还是「下线」，要去定时管理点一次上线 |
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ### 高危操作：重建容器前的「金丝雀」检查
@@ -1600,8 +1662,15 @@ dolphin/
 SKU 关联用 `inner` 静默丢单、lifecycle 增量语义不完整、湖侧写入无自检）**已于 2026-10-14 全部修复**
 （见手册附录 A 的逐条验收判据）。
 
-#### 📘 DS 调度接线规格（交接给你在 DS 里建）
+#### 📘 DS 调度接线规格
 
-`docs/ds-wiring-spec.md` —— 湖仓新架构下**每天要跑的 4 条命令**、`offline_dataware` 等流程的
-**节点顺序 / 命令 / 依赖 / 重试策略**、旧节点处置清单，以及接线前必须解决的两个坑
-（`scripts/lake/run_dwd.sh` 的 `docker run -v` 源路径由宿主 daemon 解析、`scripts/lake/run_dim.sh` 依赖 Windows 临时目录）。
+`docs/ds-wiring-spec.md` —— 湖仓新架构下**每天要跑的几条命令**、流程的
+**节点顺序 / 命令 / 依赖 / 重试策略**、旧节点处置清单，以及接线前必须解决的两个坑。
+
+**状态：2026-10-16 已按本规格建成 `offline_dataware_lake` 并跑通**（见「⭐ 当前生产链路」）。
+文中 §1 的两个坑（宿主路径、Windows 临时目录）与 §7 的待拍板项**已被方案 C 取代**，
+读的时候以「⭐ 当前生产链路」一节为准。
+
+> ⚠️ **导出 JSON 的坑再强调一次**：`dolphin/offline_dataware_lake.json` 若要入库，
+> 必须**在流程改好之后再导出**。2026-10-16 15:11 导出的那一份里，`lake_ods_product` 节点
+> 还写着坏的 `${D}`（未定义，会写 `product_snapshot_.csv`）—— 拿它恢复会把 bug 带回来。

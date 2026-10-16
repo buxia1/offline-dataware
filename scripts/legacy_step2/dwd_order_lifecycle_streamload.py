@@ -4,7 +4,7 @@
 累积快照事实表 dwd.dwd_order_lifecycle 的 Spark 版（湖层事件流 → 仓侧）
 
 【为什么从湖层读事件表】
-  老作业 scripts/dwd_order_lifecycle_load.sh 是「StarRocks 内部读 ods.ods_order_event
+  老作业 scripts/legacy_warehouse/dwd_order_lifecycle_load.sh 是「StarRocks 内部读 ods.ods_order_event
   → 视图 dwd.v_order_lifecycle_expected 聚合 → INSERT 回表」。
   仓侧事件表 3,120,421 行里有 150,842 行是同日完全重复（生成器 DUP_EVENT_RATE 注入），
   而湖侧是按 (dt, order_id, event_type) 去重后的 2,969,579 行。两者【聚合结果等价】：

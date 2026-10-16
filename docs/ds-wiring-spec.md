@@ -9,6 +9,13 @@
 > 本文写于 2026-10-15，当天核过的事实：DS 容器 `apache/dolphinscheduler-standalone-server:3.2.0`
 > （容器名 `dolphinscheduler`），4 个流程、4 条 schedule、以上命令均在本地环境实测通过。
 
+> ✅ **2026-10-16 更新：本文已落地** —— 按本规格建成了工作流 **`offline_dataware_lake`**
+> （v5，8 个节点，`release_state=1` 已上线），实例 346 端到端全绿（3 分 34 秒）。
+> 实际节点名与命令见 `README.md` 的「⭐ 当前生产链路」一节（**以那里为准**）。
+> 文中 §1 提到的两个坑（`run_dwd.sh` 的宿主路径、`run_dim.sh` 的 Windows 临时目录）
+> **已由方案 C 消除**（改为常驻 `docker exec spark` + 容器内锁 `/tmp/.spark_job.lock`）；
+> §7 的待拍板项 1、2 已定。
+
 ---
 
 ## 0. 目标链路

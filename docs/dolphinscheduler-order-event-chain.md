@@ -14,7 +14,7 @@
 | `dwd.dwd_order_lifecycle` | 累积快照事实表（`PRIMARY KEY(order_id)`）|
 | `scripts/ods_legacy/ods_order_event_ingest.sh` | 摄入外壳（增量 / `--reset`）|
 | `scripts/ods_legacy/ods_order_event_to_starrocks.py` | Spark 摄入作业（被上面的外壳调用）|
-| `scripts/dwd_order_lifecycle_load.sh` | 累积快照装载 + 五道防线（默认增量 / `--full`）|
+| `scripts/legacy_warehouse/dwd_order_lifecycle_load.sh` | 累积快照装载 + 五道防线（默认增量 / `--full`）|
 
 ---
 
@@ -236,7 +236,7 @@ sudo -u l python3 scripts/gen/gen_mock_orders.py --date 2026-09-29
 # ② 摄入（增量，只读新消息）
 bash scripts/ods_legacy/ods_order_event_ingest.sh
 # ③ 装载累积快照（增量）
-bash scripts/dwd_order_lifecycle_load.sh
+bash scripts/legacy_warehouse/dwd_order_lifecycle_load.sh
 ```
 
 **或者直接点 DS 界面的「执行」** —— 摄入/装载都是增量的，手工触发与定时触发行为完全一致。
@@ -312,7 +312,7 @@ for d in 2026-09-23 2026-09-24 2026-09-25; do
     sudo -u l python3 scripts/gen/gen_mock_orders.py --date "$d" --dry-run   # 先看：逾期/前置必须 0
     sudo -u l python3 scripts/gen/gen_mock_orders.py --date "$d"             # 真发
     bash scripts/ods_legacy/ods_order_event_ingest.sh                                # 增量摄入
-    bash scripts/dwd_order_lifecycle_load.sh                              # 增量装载
+    bash scripts/legacy_warehouse/dwd_order_lifecycle_load.sh                              # 增量装载
 done
 ```
 
@@ -323,7 +323,7 @@ done
 ```bash
 # 位点表 + 事件表一起清，下次从 earliest 重灌
 bash scripts/ods_legacy/ods_order_event_ingest.sh --reset
-bash scripts/dwd_order_lifecycle_load.sh --full      # 快照也全量重推
+bash scripts/legacy_warehouse/dwd_order_lifecycle_load.sh --full      # 快照也全量重推
 ```
 
 **⚠️ 前提是 Kafka 里数据完整** —— 如果 Kafka 已经过期删除，`--reset` 会灌进残缺数据。

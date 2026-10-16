@@ -551,7 +551,7 @@ ALTER TABLE dwd.dwd_order_detail SET ("dynamic_partition.enable" = "false");
 | 位置 | 情况 |
 |---|---|
 | `sql/dwd/dwd_add_history_partitions.sql` | 原版结尾**漏了** `SET ... = 'true'`，跑一次就把开关永久留在 `false`（已补） |
-| `scripts/dwd_sku_load.sh` | 用 `trap ... EXIT` 兜底：**无论成功、失败还是被 Ctrl-C，都保证恢复** |
+| `scripts/legacy_warehouse/dwd_sku_load.sh` | 用 `trap ... EXIT` 兜底：**无论成功、失败还是被 Ctrl-C，都保证恢复** |
 
 **通用做法：任何"改状态 → 干活 → 改回来"的流程，都要用 `trap` 兜底，别指望自己记得。**
 
@@ -1752,7 +1752,7 @@ snapshot_date > NULL     →  恒为 NULL（不是 TRUE）
 > **这是 `NULL` 比较陷阱的第 N 个变体。** 同类：`BETWEEN` 遇 `NULL`（§3.7）、`DATE_ADD(哨兵值)` 返回 `NULL` 导致检查静默放过（§2.7 / DQC ②）、`NULL <> x` 不是 `TRUE`。
 > **共同点：`NULL` 参与的判断既不报错、也不为真，而是"消失"。**
 
-**本项目里正确套路的范例**：`scripts/dwd_sku_load.sh`
+**本项目里正确套路的范例**：`scripts/legacy_warehouse/dwd_sku_load.sh`
 
 ```bash
 sed -e "s/\${D}/${D}/g" -e "s/\${DF}/${DF}/g" "$SQL_FILE" \
