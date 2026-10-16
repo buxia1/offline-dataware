@@ -1166,21 +1166,28 @@ Kafka (ods_order_event / ods_order)
 `ods_order_event`、`ods_product`、`dim_product`、`dim_product_scd2`、`dwd_order_detail`、
 `dwd_order_sku_detail`、`dwd_order_lifecycle`），**以后新增湖表不用改脚本**。
 
-```bash
-# 只盘点，不删任何东西（实测：零写入、15 秒，可随时跑）
-docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
-  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
-  /opt/offline-dw/scripts/lake/lake_maintain.py
+**推荐用法：`scripts/lake/run_maintain.sh`**（与 `run_dim.sh` / `run_dwd.sh` 同一套约定：
+容器存活检查 + 容器内串行锁 + 日志过滤 + **把 py 的退出码原样透传**）：
 
-# 真清理：保留最近 5 个快照
+```bash
+bash scripts/lake/run_maintain.sh                       # 只读盘点，零写入（实测 15 秒）
+bash scripts/lake/run_maintain.sh --expire              # 真清理，默认每表保留 5 个快照
+bash scripts/lake/run_maintain.sh --expire --keep 3     # 换保留个数
+bash scripts/lake/run_maintain.sh --tables dwd_order_detail,ods_product --expire
+```
+
+**DS 维护节点（第 9 个）就填这一行**：
+
+```
+bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5
+```
+
+**等价的手工命令**（不想用 wrapper 时；`--expire` 去掉就是只读盘点）：
+
+```bash
 docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
-
-# 只处理指定表（简名、全名都认）
-docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
-  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
-  /opt/offline-dw/scripts/lake/lake_maintain.py --tables dwd_order_detail,ods_product --expire --keep 3
 ```
 
 > `spark` 容器已把 `./scripts` 和 `./lake` 都挂进去了（`/opt/offline-dw/scripts`、`/opt/offline-dw/lake`），

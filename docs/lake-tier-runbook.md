@@ -232,13 +232,13 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   **D 仓侧覆盖 / 硬基线**。参数：`--range D1 D2` / `--fast` / `--strict` / `--allow-lag N` / `--json`。
   自测：`bash scripts/test_recon.sh`（内存假数据，**9/9 通过**）；全区间实测 **3.1 秒**。
   注意：它比的是**仓侧 `dws`/`ads`**（仓侧 `ods`/`dwd`/`dim` 已不再被调度更新，拿它们比没有意义）。
-- **维护节点：脚本已就绪并自验通过，仍未进调度** ⚠️ —— 一条命令，**自动枚举 8 张湖表**
+- **维护节点：脚本已就绪并自验通过，仍未进调度** ⚠️ —— wrapper `scripts/lake/run_maintain.sh`
+  一条命令，**自动枚举 8 张湖表**
   （不写死表名，以后加表不用改脚本）：
   ```bash
-  docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
-    --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
-    /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
+  bash scripts/lake/run_maintain.sh --expire --keep 5     # wrapper：容器检查 + 串行锁 + 退出码透传
   ```
+  DS 维护节点（第 9 个）填 `bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`。
   `--tables a,b` 可限定表；**不加 `--expire` 就是只读盘点**（零写入，15 秒）。
   **脚本自己验收**：快照数下降 且 行数不变，不达标退出码 `1`（可直接挂进 DS 当告警用）。
   实测 2026-10-16：8 张表快照 `46/18/12/11/9/7/2/2` → **全部 ≤5**，
