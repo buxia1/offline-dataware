@@ -70,9 +70,8 @@
 （`release_state=1`，version 5），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
 （schedule id 7 `release_state=1`，2026-10-16），执行策略「串行等待」。
 
-> ⚠️ **失败告警还没配**：该定时的 `warning_type=0` / `warning_group_id=0`（四个旧流程都是
-> `warning_type=2` + 告警组 2）。不配的话，每天 02:00 这一跑失败**不会有人收到通知**，
-> 只能第二天翻执行历史。
+> ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
+> （实测 `t_ds_schedules` id 7）。每天 02:00 这一跑失败会发通知。
 
 **每天 8 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后）：
 
@@ -894,7 +893,7 @@ docker compose restart dolphinscheduler
 - [x] 用 DS **补数**回填历史数据（**实测两个坑**：`${system.biz.date}` = 调度日期 −1 天；执行方式必须选「串行执行」，否则被"串行丢弃"静默丢掉）
 - [x] 补上 `ods_order` 里 09-22~09-25 那 4 天（`dwd_order_detail` 从 4 天 → **8 天 / 763 行**）
 - [x] **DQC 加一条「重算对账」** —— `⑥ 重物化属性一致`：宽表里的商品属性必须等于 SCD2 对该日期算出的属性。盖住两个盲区：属性值不同、以及 **JOIN 不上的孤儿行**（范围 JOIN 不满足时那行会直接消失，计数纹丝不动）。写 `<=>` 而非 `<>`（NULL 安全），用 `LEFT JOIN` 而非 `NOT EXISTS`（StarRocks 不支持关联子查询里的非等值谓词）
-- [x] 作业失败告警（邮件 / 钉钉）—— DS 里四个工作流都配了 `warning_type=2` + 告警组 `2`
+- [x] 作业失败告警（邮件 / 钉钉）—— DS 里五个工作流都配了 `warning_type=2` + 告警组 `2`
 - [x] SCD2 改增量维护，并与全量重建做等价性验证（`scripts/legacy_warehouse/dim_product_scd2_incremental.sh`，指纹一字不差）
 - [x] **累积快照事实表**（下单 → 支付 → 发货 → 完成）—— 表/视图/装载/五道防线，**09-20 ~ 09-28 共 900 行**，卡单三类可见
 - [x] **订单事件链路的摄入改增量**（`ods_kafka_offset` 位点表）—— 幂等已实测（重跑 `读到 0 行`）。**（2026-10-09 该方案已被 Routine Load 取代）**
@@ -1148,7 +1147,7 @@ Kafka (ods_order_event / ods_order)
 | 湖层 DDL | `sql/lake/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
 | 灌数脚本 | `scripts/lake/lake_ods_replay.sh` + `.py` | `bash scripts/lake/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
 | 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
-| 维护脚本 | `scripts/lake/lake_maintain.py` | 只读盘点 + `--expire --keep N` 清历史快照 |
+| 维护脚本 | `scripts/lake/lake_maintain.py` | **自动枚举** `lake.ods/dim/dwd` 全部表（当前 8 张）：只读盘点 / `--expire --keep N` 清历史快照 / `--tables a,b` 限定表。清理后**自验「快照数下降 且 行数不变」**，不达标退出码 1（可直接挂 DS 告警）|
 
 **实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
 `ods_order_event` 2,969,579 行。湖↔仓逐 key 差集**双向为 0**（见下方推进清单第 1 步）。
@@ -1161,9 +1160,14 @@ Kafka (ods_order_event / ods_order)
 **为什么必须做**：Iceberg 每次写入都留一个新快照，历史快照各自带一份 manifest。
 90 天全量灌完后实测：`ods_order` **181 个快照**、`ods_order_event` **184 个**，
 而真正的数据只有 90 / 93 个 parquet（8.3 MB / 41.8 MB）——**152 MB 里约 60 MB 是元数据**。
+日常链路每天都在加：2026-10-16 盘点到 `dwd_order_detail` 已经 **46 个快照**。
+
+脚本**自动枚举** `lake.ods` / `lake.dim` / `lake.dwd` 下的**全部**表（当前 8 张：`ods_order`、
+`ods_order_event`、`ods_product`、`dim_product`、`dim_product_scd2`、`dwd_order_detail`、
+`dwd_order_sku_detail`、`dwd_order_lifecycle`），**以后新增湖表不用改脚本**。
 
 ```bash
-# 只盘点，不删任何东西（实测：零写入、可随时跑）
+# 只盘点，不删任何东西（实测：零写入、15 秒，可随时跑）
 docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake/lake_maintain.py
@@ -1172,17 +1176,34 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
+
+# 只处理指定表（简名、全名都认）
+docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
+  --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
+  /opt/offline-dw/scripts/lake/lake_maintain.py --tables dwd_order_detail,ods_product --expire --keep 3
 ```
 
 > `spark` 容器已把 `./scripts` 和 `./lake` 都挂进去了（`/opt/offline-dw/scripts`、`/opt/offline-dw/lake`），
 > **不需要临时容器**；只要 `iceberg-spark-runtime` 那个 jar 用 `--jars` 指到 `/opt/offline-dw/jars/` 下即可。
 
-**实测效果（2026-10-14）**：快照 181 / 184 → **各 5 个**；表目录 **152 MB → 92 MB**（回收 60 MB）；
-耗时 9.3 s + 14.6 s；清理后 `lake.ods.ods_order_event` 仍 **2,969,579 行**、`ods_order` 仍 **900,000 行**，
-一条不少（快照存活不影响当前数据，只影响「时间旅行」能回看多久）。
+**两条判据：脚本自己验，缺一不可** —— ① **快照数下降**（或本来就 ≤ `keep`）② **行数不变**。
+清理完它会再盘一遍，逐表打印 `快照 before -> after / 行数 before -> after`，
+**任一项不达标就以退出码 1 结束**；清理后快照数 > `keep + 1` 也算失败
+（说明 `older_than` 没早于要清的快照 —— 这是 `expire_snapshots` 最阴的静默失败，见脚本头踩坑 3）。
 
-> 两条判据：**「快照数下降」**且**「行数不变」**，缺一不可。
-> `remove_orphan_files`（清无主文件）本次**没做** —— 先证明快照清理安全，再单独评估。
+**实测效果**
+
+| 时间 | 对象 | 快照 before | 快照 after | 磁盘 | 行数 | 耗时 |
+|---|---|---|---|---|---|---|
+| 2026-10-14 | ODS 两表（90 天全量刚灌完）| 181 / 184 | 各 5 | `152 MB → 92 MB`（回收 60 MB）| 2,969,579 / 900,000 不变 | 9.3 s + 14.6 s |
+| 2026-10-16 | **全部 8 张表** | 46 / 18 / 12 / 11 / 9 / 7 / 2 / 2 | **全部 ≤ 5** | `177 MB → 143 MB`（`dwd/` 116 → 83 MB）| 逐表一致（854,844 / 900,000 / 3,118,737 / 4,500 / 50 …）| 清理 26.1 s，含盘点共 42 s |
+
+> 2026-10-16 那次的现场：清理完**立刻**跑 `bash scripts/recon_lake_wh.sh` ——
+> **26 项全绿、5.1 秒**（湖↔仓逐行对称差、湖侧闭合、仓侧硬基线一个不少）。
+> 这说明「清快照」不会动到湖里当前的数据，湖仓一致性毫发无损。
+
+> 快照存活**不影响当前数据**，只影响「时间旅行」能回看多久 —— 所以 `--keep 5` 就够。
+> `remove_orphan_files`（清无主文件）**仍然没做** —— 先证明快照清理安全，再单独评估。
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
 
@@ -1477,6 +1498,10 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 判据：「运维命令」里各项检查全部仍然通过（800/2379/763/763/900/601/8 + 两条 DQC `EXIT=0`）
 - [x] **湖表维护：清历史快照** —— 见上方「湖表快照清理」
       —— 实测：快照 181 / 184 → 各 5 个；**152 MB → 92 MB**；行数不变（安全）
+- [x] **维护脚本扩到全部湖表 + 自己验收** —— `lake_maintain.py` 自动枚举 8 张湖表，
+      清理后自验「快照数下降 且 行数不变」，不达标退出码 1
+      —— 实测 2026-10-16：快照 → 全部 ≤ 5；`lake/warehouse` **177 MB → 143 MB**；
+      8 张表行数逐表不变、退出码 `0`；随后对账 **26 项全绿 / 5.1 秒**
 - [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
       —— 2026-10-14 补充：湖层已从「只读旁路」扩为 **ODS/DIM/DWD/DWS/ADS 全分层镜像**（见「第 3 步」）
       —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs
@@ -1553,8 +1578,9 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 - [x] **定时上线** ✅ **2026-10-16 完成** —— `t_ds_schedules` id 7 `release_state=1`，
       每天 02:00 会自动跑
       —— 判据：`SELECT release_state FROM t_ds_schedules WHERE id = 7` 返回 1
-- [ ] **失败告警** ⚠️ —— 该定时的 `warning_type=0` / `warning_group_id=0`（**没配告警**）
-      —— 判据：定时管理里编辑该 schedule，告警类型选「失败」、告警组选同一个（id 2）
+- [x] **失败告警** ✅ **2026-10-16 完成** —— 该定时已配 `warning_type=2` + `warning_group_id=2`
+      （与四个旧流程同一个告警组）
+      —— 判据：`SELECT warning_type, warning_group_id FROM t_ds_schedules WHERE id = 7` 返回 `2 / 2`
 - [x] **旧链路退役收尾**（按决定：**先留着、不上线、先不动**）—— 四个旧流程均已离线
       （`release_state=0`），脚本已收进 `scripts/legacy_warehouse/`
 
@@ -1564,7 +1590,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 |---|---|---|
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
-| 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程保持离线（`release_state=0`，按决定先留着不动）。定时已上线（schedule id 7 `release_state=1`）。⚠️ 新遗留一条：该定时的**告警未配**（`warning_type=0`），失败不会通知任何人 |
+| 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程保持离线（`release_state=0`，按决定先留着不动）。定时已上线（schedule id 7 `release_state=1`）；告警也已配好（`warning_type=2` + 告警组 2）。|
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ### 高危操作：重建容器前的「金丝雀」检查

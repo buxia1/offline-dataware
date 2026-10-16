@@ -3,7 +3,8 @@
 > 本文对应仓库提交 `d92be7e` 之后的状态，**已于 2026-10-16 更新到「调度已接入并跑通」**。
 > **五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、仓侧 dws/ads 物化（含按天自动增量）
 > 已实现并实测过；DolphinScheduler 接线与可重复执行的对账作业也已完成**（见 §2 步骤 4）。
-> 仍未做：**失败告警配置**、**湖表维护进调度**、**`user_id IS NULL` 口径拍板**（见附录 C）。
+> 仍未做：**湖表维护进调度**、**`user_id IS NULL` 口径拍板**（见附录 C）。
+> 失败告警已于 2026-10-16 配好（该定时 `warning_type=2` + 告警组 2）。
 > 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
 ---
@@ -231,11 +232,21 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   **D 仓侧覆盖 / 硬基线**。参数：`--range D1 D2` / `--fast` / `--strict` / `--allow-lag N` / `--json`。
   自测：`bash scripts/test_recon.sh`（内存假数据，**9/9 通过**）；全区间实测 **3.1 秒**。
   注意：它比的是**仓侧 `dws`/`ads`**（仓侧 `ods`/`dwd`/`dim` 已不再被调度更新，拿它们比没有意义）。
-- **维护节点：仍未进调度** ⚠️ —— `python3 scripts/lake/lake_maintain.py`（只读盘点）+
-  `--expire --keep N`（清快照）。实测已把快照从 181/184 清到各 5 个、磁盘 152 MB → 92 MB，
-  行数不变。这是附录 C 里仍没打勾的项之一。
-- **失败告警：仍未配** ⚠️ —— 定时建好后 `warning_type=0`（不告警）；四个旧流程都是
-  `warning_type=2` + 告警组 2。不配的话每天 02:00 失败**没有人会收到通知**。
+- **维护节点：脚本已就绪并自验通过，仍未进调度** ⚠️ —— 一条命令，**自动枚举 8 张湖表**
+  （不写死表名，以后加表不用改脚本）：
+  ```bash
+  docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
+    --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
+    /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
+  ```
+  `--tables a,b` 可限定表；**不加 `--expire` 就是只读盘点**（零写入，15 秒）。
+  **脚本自己验收**：快照数下降 且 行数不变，不达标退出码 `1`（可直接挂进 DS 当告警用）。
+  实测 2026-10-16：8 张表快照 `46/18/12/11/9/7/2/2` → **全部 ≤5**，
+  `lake/warehouse` **177 MB → 143 MB**、行数逐表不变、退出码 `0`；
+  紧接着 `bash scripts/recon_lake_wh.sh` **26 项全绿 / 5.1 秒**。
+  只剩「挂进 DS」这一步没落 —— 见附录 C。
+- **失败告警：已配** ✅（2026-10-16）—— `t_ds_schedules` id 7 `warning_type=2` + 告警组 `2`，
+  与四个旧流程一致；每天 02:00 失败会发通知。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
@@ -304,9 +315,12 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       流程与定时都已上线；实测实例 346 全绿 **3 分 34 秒**
 - [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
       `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
-- [ ] ⚠️ **失败告警未配**：该定时的 `warning_type=0` / `warning_group_id=0`
-      （四个旧流程都是 `warning_type=2` + 告警组 2）。不配 = 每天 02:00 失败没人收到通知
-- [ ] 湖表维护（`expire_snapshots` / `remove_orphan_files`）已进调度
+- [x] **失败告警已配**（2026-10-16）：该定时 `warning_type=2` / `warning_group_id=2`
+      （与四个旧流程同一个告警组）—— 判据：
+      `SELECT warning_type, warning_group_id FROM t_ds_schedules WHERE id = 7`
+- [ ] 湖表维护**已进调度** —— `expire_snapshots` 那半已就绪并自验通过（8 张表全覆盖、
+      快照 ≤ 5、行数不变、退出码 0、对账 26 项全绿），**只差挂进 DS**；
+      `remove_orphan_files` 仍**未做**（先证明快照清理安全，再单独评估）
 - [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
 - [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异
 
