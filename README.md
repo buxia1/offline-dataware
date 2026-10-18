@@ -108,10 +108,16 @@
 > `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**都还在 RUNNING**，
 > 方向是 **Kafka → 仓侧 `ods.*`**，与湖侧**没有任何数据流**（湖侧是
 > `scripts/lake/lake_ods_replay.py` 独立批式读同一批 topic 重放进 Iceberg）。
-> ⚠️ 将来若要上线 `routine_load_health`，**先修脚本再上线**：`scripts/check_routine_load.sh`
-> 里还留着 2026-10-08 的旧阈值（`EXPECT_EVENT=2379` → 「行数异常膨胀」判据 `≥4758`），
-> 而 `ods_order_event` 现在已有 3,120,421 行 —— **一上线就会每 30 分钟误报一次 `exit 1`**；
-> 另一条「整表去重不变式」（`3120421 ≠ 2911488`）同理。
+> ✅ **`scripts/check_routine_load.sh` 已于 2026-10-18 修为 v2，可直接上线**（只差在 DS 里建
+> 流程/节点，调度侧尚未挂）。v1 的两条判据都是过期误报：
+> ① 「行数异常膨胀（`≥ EXPECT_EVENT*2` = 4758）」用的是 2026-10-08 改造前基数，而事件表现有
+>   3,120,421 行 → 每 30 分钟必误报；v2 改为看 Routine Load 自己的 **`OffsetLag`**（追平时≈1，
+>   阈值 `LAG_MAX=5000` 可覆盖），行数只打印不判定。
+> ② 「整表去重不变式」不成立：`ods_order_event` 是 `DUPLICATE KEY`，重放/重投的重复行是设计内
+>   行为（实测 90 天每天都有重复、重复率 **1.05×**、单 key 最多 4 条）→ v2 改为**重复率软阈值**
+>   `DUP_MAX=120`（1.20×），真正的强不变式挪到 `ods_order`（900,000 行 == 900,000 个 `order_id`，
+>   实测成立）。
+> 实测：正常 `EXIT=0`（宿主与 DS 容器内各跑一次）；`LAG_MAX=0` / `DUP_MAX=100` 都能卡出 `EXIT=1`。
 
 > ⚠️ 仓侧 `ods.*` / `dwd.*` / `dim.*` 这几张表**从 2026-10-16 起不再被调度更新**
 > （只有 Routine Load 还在往仓侧 `ods` 写）。保留它们是为了对照与回滚，**不要再往上建报表**。
