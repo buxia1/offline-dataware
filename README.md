@@ -1280,35 +1280,33 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 
 > 快照存活**不影响当前数据**，只影响「时间旅行」能回看多久 —— 所以 `--keep 5` 就够。
 
-#### `remove_orphan_files`（清无主文件）—— 已评估，结论是「不紧急」
+#### `remove_orphan_files`（清无主文件）—— 实测结论：**没有可删的，不用做**
 
-`expire_snapshots` 只删元数据，**不删数据文件**；快照里没人引用之后，文件就变成「无主」躺在盘上。
-2026-10-18 做了一次**零写入**的量化评估（盘上 `data/` 实数 vs 当前快照 `files` 元数据表引用数）：
+`expire_snapshots` 只删元数据、**不删数据文件**，所以盘上的文件总比「当前快照引用」的多。
+2026-10-18 用 `dry_run` 把 **8 张表全跑了一遍**（Spark + Iceberg 1.9）：
 
-| 表 | 盘上 `data/`（文件 / MB）| 当前快照引用（文件 / MB）| 溢出（文件 / MB）|
-|---|---|---|---|
-| `lake.ods.ods_order` | 188 / 8.5 | 90 / 7.8 | 98 / 0.7 |
-| `lake.ods.ods_order_event` | 194 / 46.7 | 93 / 44.0 | 101 / 2.7 |
-| `lake.ods.ods_product` | 184 / 0.6 | 90 / 0.3 | 94 / 0.3 |
-| `lake.dim.dim_product` | 88 / 0.1 | 44 / 0.1 | 44 / 0.0 |
-| `lake.dim.dim_product_scd2` | 88 / 0.2 | 44 / 0.2 | 44 / 0.0 |
-| `lake.dwd.dwd_order_detail` | 192 / 8.8 | 90 / 7.9 | 102 / 0.9 |
-| `lake.dwd.dwd_order_lifecycle` | **1,604 / 35.7** | 402 / 29.3 | **1,202 / 6.4** |
-| `lake.dwd.dwd_order_sku_detail` | 192 / 9.8 | 90 / 8.8 | 102 / 1.0 |
-| **合计** | **2,730 / 110.4** | **943 / 98.4** | **1,787 / ≈12.0** |
+```sql
+CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order',
+     older_than => TIMESTAMP '2026-10-01 00:00:00', dry_run => true);
+```
 
-**这是「无主文件的上界」，不是准数**：保留的 5 个快照里较老的还会引用一部分文件，
-真正无主的只会更少。所以：
+→ **8 张表全部返回 0 行，一个无主文件都没有**（`dry_run` 生效、文件数前后一致、零删除）。
 
-- **收益 ≈ 12 MB（约占 11%），不紧急** —— 现在磁盘 100 MB 量级，没必要为此加作业。
-- 要做就先 **dry-run**：
-  `CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order', older_than => TIMESTAMP '<now - 3 天>', dry_run => true)`
-  —— 返回的是「可删文件清单」，逐个表汇总出文件数/字节，再决定是否真删。
-- **安全红线**：`older_than` 必须比「最后一次写入」再晚 **3 天**（Iceberg 默认值），
-  且只能在维护节点（所有写入已结束、串行锁在手上）之后跑；`--apply` 是**不可逆删除**，
-  先 dry-run 跑几天再开。
-- 建议形态：给 `scripts/lake/lake_maintain.py` 加 `--orphan`（默认 dry-run，只打印汇总）；
-  `--orphan --apply` 才真删。验收判据：**行数不变** + `recon_lake_wh.sh` 26 项全绿 + 磁盘下降。
+原因：Iceberg 判「无主」的判据是**有没有被任何一个 metadata JSON 引用**，不是只看当前快照。
+`write.metadata.delete-after-commit.enabled` 默认 `false`，历史 metadata JSON 都留着
+（每张表 14~138 个），它们各自列着当时快照引用的文件 —— 那些「多出来的文件」仍算被引用。
+
+盘上 `data/` 与当前快照引用的差（供参考，**这不是无主文件，是时间旅行副本**）：
+
+| | 盘上 `data/` | 当前快照引用 |
+|---|---|---|
+| 合计 | 2,730 文件 / 110.4 MB | 943 文件 / 98.4 MB |
+
+**结论：不做。** 真要回收那 ~12 MB，得同时删历史 metadata（`write.metadata.previous-versions-max`），
+代价是缩短时间旅行窗口 —— 不划算；`--keep 5` 的快照清理已经够了。
+
+以后复查就用上面那条 `dry_run`（`spark-sql` 里跑 `CALL` 必须带
+`--jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar`，否则报 `PARSE_SYNTAX_ERROR at 'CALL'`）。
 
 **⚠️ 两条运行时注意（2026-10-18 实测踩到）**
 
