@@ -1279,7 +1279,36 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 > 这说明「清快照」不会动到湖里当前的数据，湖仓一致性毫发无损。
 
 > 快照存活**不影响当前数据**，只影响「时间旅行」能回看多久 —— 所以 `--keep 5` 就够。
-> `remove_orphan_files`（清无主文件）**仍然没做** —— 先证明快照清理安全，再单独评估。
+
+#### `remove_orphan_files`（清无主文件）—— 已评估，结论是「不紧急」
+
+`expire_snapshots` 只删元数据，**不删数据文件**；快照里没人引用之后，文件就变成「无主」躺在盘上。
+2026-10-18 做了一次**零写入**的量化评估（盘上 `data/` 实数 vs 当前快照 `files` 元数据表引用数）：
+
+| 表 | 盘上 `data/`（文件 / MB）| 当前快照引用（文件 / MB）| 溢出（文件 / MB）|
+|---|---|---|---|
+| `lake.ods.ods_order` | 188 / 8.5 | 90 / 7.8 | 98 / 0.7 |
+| `lake.ods.ods_order_event` | 194 / 46.7 | 93 / 44.0 | 101 / 2.7 |
+| `lake.ods.ods_product` | 184 / 0.6 | 90 / 0.3 | 94 / 0.3 |
+| `lake.dim.dim_product` | 88 / 0.1 | 44 / 0.1 | 44 / 0.0 |
+| `lake.dim.dim_product_scd2` | 88 / 0.2 | 44 / 0.2 | 44 / 0.0 |
+| `lake.dwd.dwd_order_detail` | 192 / 8.8 | 90 / 7.9 | 102 / 0.9 |
+| `lake.dwd.dwd_order_lifecycle` | **1,604 / 35.7** | 402 / 29.3 | **1,202 / 6.4** |
+| `lake.dwd.dwd_order_sku_detail` | 192 / 9.8 | 90 / 8.8 | 102 / 1.0 |
+| **合计** | **2,730 / 110.4** | **943 / 98.4** | **1,787 / ≈12.0** |
+
+**这是「无主文件的上界」，不是准数**：保留的 5 个快照里较老的还会引用一部分文件，
+真正无主的只会更少。所以：
+
+- **收益 ≈ 12 MB（约占 11%），不紧急** —— 现在磁盘 100 MB 量级，没必要为此加作业。
+- 要做就先 **dry-run**：
+  `CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order', older_than => TIMESTAMP '<now - 3 天>', dry_run => true)`
+  —— 返回的是「可删文件清单」，逐个表汇总出文件数/字节，再决定是否真删。
+- **安全红线**：`older_than` 必须比「最后一次写入」再晚 **3 天**（Iceberg 默认值），
+  且只能在维护节点（所有写入已结束、串行锁在手上）之后跑；`--apply` 是**不可逆删除**，
+  先 dry-run 跑几天再开。
+- 建议形态：给 `scripts/lake/lake_maintain.py` 加 `--orphan`（默认 dry-run，只打印汇总）；
+  `--orphan --apply` 才真删。验收判据：**行数不变** + `recon_lake_wh.sh` 26 项全绿 + 磁盘下降。
 
 **⚠️ 两条运行时注意（2026-10-18 实测踩到）**
 

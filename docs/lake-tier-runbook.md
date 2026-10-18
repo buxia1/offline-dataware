@@ -3,7 +3,7 @@
 > 本文对应仓库提交 `d92be7e` 之后的状态，**已于 2026-10-16 更新到「调度已接入并跑通」**。
 > **五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、仓侧 dws/ads 物化（含按天自动增量）
 > 已实现并实测过；DolphinScheduler 接线与可重复执行的对账作业也已完成**（见 §2 步骤 4）。
-> 仍未做：**`remove_orphan_files`**（见附录 C）；`user_id IS NULL` 的口径已于 2026-10-18 拍板（见 §2 步骤 2 末）。
+> 仍未做：**`remove_orphan_files`**（已评估：无主文件上界 1,787 个 / ≈12 MB，收益小不紧急，见附录 C）；`user_id IS NULL` 的口径已于 2026-10-18 拍板（见 §2 步骤 2 末）。
 > 失败告警已于 2026-10-16 配好（该定时 `warning_type=2` + 告警组 2）。
 > 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
@@ -332,7 +332,11 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       （`bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`，超时 15 min，
       前置 = `dqc_order_chain` / `dqc_dim_product` / `recon_lake_wh`；实例 347 里 **43 秒**、退出码 0）。
       脚本自验通过（8 张表全覆盖、快照 ≤ 5、行数不变、对账 26 项全绿）。
-      `remove_orphan_files` 仍**未做**（先证明快照清理安全，再单独评估）
+      `remove_orphan_files` 仍**未做，但已评估**（2026-10-18，零写入量化）：盘上 `data/` 共
+      **2,730 个文件 / 110.4 MB**，当前快照只引用 **943 个 / 98.4 MB** → **无主文件上界
+      1,787 个 / ≈12 MB（约 11%）**（真数要 `remove_orphan_files(dry_run => true)` 才准；
+      其中 `dwd_order_lifecycle` 一张表占 1,202 个 / 6.4 MB）。收益小、不紧急；
+      要做就先 dry-run、`older_than` ≥ 最近写入 + 3 天、只在该节点末尾跑，验收 = 行数不变 + recon 26 绿
 - [x] 口径已拍板（2026-10-18）：**保留现状** —— 明细层过滤（854,844 = 900,000 − 45,156），
       快照层 / ODS 保留全量（NULL 45,187 / 45,156）；
       判据：`count(*) - count(user_id)` = **0 / 45,187 / 45,156**
