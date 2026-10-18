@@ -212,9 +212,9 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 --    ads:90|90|854844|105680366.50
 ```
 
-### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ✅ 2026-10-16 已完成（全部 9 个节点）
+### 步骤 4：调度 + 维护 + 对账 + 台账 接进 DolphinScheduler —— ✅ 2026-10-16 已完成（v8，全部 10 个节点）
 
-**已落地**：工作流 **`offline_dataware_lake`**（**v7**，`release_state=1`），定时 `0 0 2 * * ? *`
+**已落地**：工作流 **`offline_dataware_lake`**（**v8**，`release_state=1`；v7 九节点 10-16 → v8 于 10-18 补第 10 个节点「巡检台账」），定时 `0 0 2 * * ? *`
 （每天 02:00，schedule id 7 **已上线**，失败告警 `warning_type=2` / 告警组 2），执行策略「串行等待」。
 **端到端实测**：实例 346（8 节点）全绿 **3 分 34 秒**；实例 347（v7，9 节点，
 2026-10-16 16:55:15 → 16:59:31）全绿 **4 分 16 秒**。节点名与命令见 `README.md`
@@ -226,7 +226,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 [lake_ods_replay] → [lake_ods_product] → [lake_dim_build] → [lake_dwd_incremental]
                   → [wh_dws_ads_materialize]
                   → { [dqc_order_chain], [dqc_dim_product], [recon_lake_wh] }
-                  → [lake_maintain]
+                  → [lake_maintain] → [lake_ops_ledger]
 ```
 
 - **对账节点已沉淀成脚本**：`scripts/recon_lake_wh.sh`（**只读**；退出码 `0` 全绿 / `2` 对账不一致
@@ -249,6 +249,11 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   `lake/warehouse` **177 MB → 143 MB**、行数逐表不变、退出码 `0`；
   紧接着 `bash scripts/recon_lake_wh.sh` **26 项全绿 / 5.1 秒**。
   已挂进 DS 当第 9 个节点（前置 = 三个质检/对账节点全部结束），实例 347 里本节点 **43 秒**。
+- **巡检台账：已进调度** ✅（v8 第 10 个节点，2026-10-18）—— `scripts/ops/ops_ledger.sh` 每天往
+  `ds/logs/ops/ledger.csv` 追加一行：链路状态 / 三个闸门 state / 湖表行数 / 快照数 / Kafka 消息数 /
+  仓库体积。**从 `lake_maintain` 与 `recon_lake_wh` 的日志解析，不重跑 Spark**（实测 3 秒）。
+  它**只记录不判断**（不告警、不修复）；「连续 7 天零差异」就从这本 CSV 数
+  （`awk -F, 'NR>1 && $11=="OK"'`，第 11 列 = `recon_result`）。首次定时写入 2026-10-19 02:00。
 - **失败告警：已配** ✅（2026-10-16）—— `t_ds_schedules` id 7 `warning_type=2` + 告警组 `2`，
   与四个旧流程一致；每天 02:00 失败会发通知。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
@@ -321,7 +326,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
 - [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
 - [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
-- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v7，9 节点**，
+- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v8，10 节点**，
       流程与定时都已上线；实测实例 347 全绿 **4 分 16 秒**（v5/8 节点时实例 346 为 3 分 34 秒）
 - [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
       `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
@@ -338,6 +343,10 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       （per-table 14~138 个），所以盘上比当前快照多出来的 1,787 文件 / ≈12 MB 是**时间旅行副本**、
       不是无主文件。真要回收得删历史 metadata（`write.metadata.previous-versions-max`），
       会缩短回看窗口，不划算。复查命令见 README「湖表快照清理」小节。
+- [x] **巡检台账已进调度** ✅ 2026-10-18 —— `offline_dataware_lake` **v8** 第 10 个节点
+      `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，超时 5 min，
+      前置 = `lake_maintain`）；实测 3 秒、回放实例 349 得一行、`notes` 为空。
+      台账 = `ds/logs/ops/ledger.csv`；「连续 7 天零差异」从 2026-10-19 那跑起算，最早 10-25 出数。
 - [x] 口径已拍板（2026-10-18）：**保留现状** —— 明细层过滤（854,844 = 900,000 − 45,156），
       快照层 / ODS 保留全量（NULL 45,187 / 45,156）；
       判据：`count(*) - count(user_id)` = **0 / 45,187 / 45,156**

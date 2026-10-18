@@ -11,12 +11,12 @@
 **当前架构（2026-10-16 起的湖仓链路）** —— 计算在 Spark + Iceberg（湖），StarRocks 退为服务层：
 
 ```
-                    ┌────────────────────────────────────────────────────────┐
-                    │          DolphinScheduler（调度 · DS 3.2）             │
-                    │  每天 02:00 工作流 offline_dataware_lake（v7 九节点）  │
-                    │  replay → product → dim → dwd → 仓侧物化              │
-                    │        →（订单 DQC ∥ 商品 DQC ∥ 湖↔仓对账）→ 湖表维护  │
-                    └────────────────────────────────────────────────────────┘
+                    ┌───────────────────────────────────────────────────────────────┐
+                    │          DolphinScheduler（调度 · DS 3.2）                    │
+                    │  每天 02:00 工作流 offline_dataware_lake（v8 十节点）         │
+                    │  replay → product → dim → dwd → 仓侧物化                      │
+                    │        →（订单 DQC ∥ 商品 DQC ∥ 湖↔仓对账）→ 湖表维护 → 台账  │
+                    └───────────────────────────────────────────────────────────────┘
                                          │
   ① 模拟上游（不在调度里：由外部系统 / 手工产出）
      gen_mock_orders_snapshot.py ──► Kafka `ods_order`
@@ -94,7 +94,7 @@
 > ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
 > （实测 `t_ds_schedules` id 7）。每天 02:00 这一跑失败会发通知。
 
-**每天 9 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后；9 挂在 6 / 7 / 8 全部结束之后）：
+**每天 10 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后；9 挂在 6 / 7 / 8 全部结束之后；10 挂在 9 之后）：
 
 | # | 节点 | 脚本 | 建议超时 |
 |---|---|---|---|
@@ -107,10 +107,12 @@
 | 7 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
 | 8 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
 | 9 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --expire --keep 5`（脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
+| 10 | `lake_ops_ledger` | `bash scripts/ops/ops_ledger.sh ${system.biz.date}`（每天往 `ds/logs/ops/ledger.csv` 追加一行巡检台账，只记录不判断）| 5 min |
 
 **端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；加维护节点后实例 347
 （v7，2026-10-16 16:55:15 → 16:59:31）**9 个节点全绿、4 分 16 秒**，其中 `lake_maintain` 占 43 秒；
 收尾数据 `dwd_order_detail 854,844` / `dws 18,000` / `ads 90`。
+**v8（10 节点）2026-10-18 上线**：只加了台账节点，实测 3 秒级，总时长基本不变；首个定时运行 10-19 02:00。
 
 > 节点名带前导 Tab 的 4 个（`lake_dim_build` / `lake_dwd_incremental` / `wh_dws_ads_materialize` /
 > `dqc_order_chain`）是 UI 里手误带进去的，纯外观、不影响执行，不建议为它专门改版本。
@@ -206,7 +208,8 @@ offline-dw/
 │   ├── test_recon.sh               对账脚本自测（内存假数据）
 │   ├── dqc_dim_product.sh          商品维度 DQC（已指向湖侧 dim）
 │   ├── dqc_order_chain.sh          订单链路 DQC（可选业务日期参数）
-│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1；⚠️ 对应流程当前离线）
+│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1；DS 流程 routine_load_health v2 每 30 分钟在线）
+│   ├── ops/ops_ledger.sh           ⭐ 每日巡检台账（从 DS 实例日志零开销汇总，写 ds/logs/ops/ledger.csv）
 │   │   ── ⚠️ 已退役：仓侧 ODS→DIM→DWD 那一套（2026-10-16）──
 │   ├── legacy_warehouse/           dim_product_scd2_*.sh / dwd_*.sh / load_product_to_ods.sh
 │   │                                （退役原因与取代关系见该目录 README.md）
@@ -609,14 +612,14 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 健康检查全部 `release_state=0`（离线留档）：
 
 ```
-┌─ ⭐ offline_dataware_lake（当前生产链路，每天 02:00，release_state=1，v7 九节点）┐
+┌─ ⭐ offline_dataware_lake（当前生产链路，每天 02:00，release_state=1，v8 十节点）┐
 │  lake_ods_replay → lake_ods_product → lake_dim_build → lake_dwd_incremental →   │
 │       Shell             Shell            Shell              Shell               │
 │   → wh_dws_ads_materialize → { dqc_order_chain ∥ dqc_dim_product ∥ recon_lake_wh } │
 │          Shell                    Shell              Shell            Shell       │
-│   → lake_maintain                                                               │
-│          Shell                                                                  │
-│  ⚠️ exec_type=1 串行等待；6/7/8 并行挂在 5 之后，9 等它们全部结束（详见「当前生产链路」）│
+│   → lake_maintain → lake_ops_ledger                                             │
+│          Shell             Shell                                                │
+│  ⚠️ exec_type=1 串行等待；6/7/8 并行挂在 5 之后，9 等它们结束、10 挂在 9 之后（详见「当前生产链路」）│
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1102,7 +1105,7 @@ DS 里不再有摄入节点会变红，所以必须补 `routine_load_health` 工
 > —— 第 0 步（修地基）+ 第 1 步（湖层只读旁路）2026-10-14 完成：90 天（2026-09-20 ~ 2026-12-18）
 >   灌湖，湖↔仓逐 key 对账**零差异**；
 > —— 第 2 步（DWD 计算下沉 Spark）、第 3 步（放量 1 万单/天 × 90 天）2026-10-14 完成；
-> —— 第 4 步（调度上线 + 旧链路退役）2026-10-16 完成：`offline_dataware_lake` **v7 九节点**，
+> —— 第 4 步（调度上线 + 旧链路退役）2026-10-16 完成：`offline_dataware_lake` **v8 十节点**（v7 九节点 10-16 → v8 加巡检台账 10-18），
 >   定时 02:00 已上线、失败告警已配。
 > 本节其余实测数据为 2026-10-09 探针所得（那部分确实未改动项目文件）。
 
@@ -1216,6 +1219,7 @@ Kafka (ods_order_event / ods_order)
 | 湖层 DDL | `sql/lake/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
 | 灌数脚本 | `scripts/lake/lake_ods_replay.sh` + `.py` | `bash scripts/lake/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
 | 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
+| 巡检台账 | `scripts/ops/ops_ledger.sh` | 每天往 `ds/logs/ops/ledger.csv` 追加一行：链路状态 / 三个闸门 state / 湖表行数 / 快照数 / Kafka 消息数 / 仓库体积。**从 DS 实例日志解析，不重跑 Spark**（3 秒）；只记录、不判断 |
 | 维护脚本 | `scripts/lake/lake_maintain.py` + `run_maintain.sh` | **自动枚举** `lake.ods/dim/dwd` 全部表（当前 8 张）：只读盘点 / `--expire --keep N` 清历史快照 / `--tables a,b` 限定表。清理后**自验「快照数下降 且 行数不变」**，不达标退出码 1（可直接挂 DS 告警）|
 
 **实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
@@ -1316,6 +1320,52 @@ CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order',
    DS 的 `SERIAL_WAIT` 只约束**定时**排队，管不了手动点「执行」—— 同一条流一天只跑一次即可。
 2. **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`**：快照被清掉后，FE 缓存的元数据仍指向
    已删除的数据文件。两个 DQC 脚本已内置这一步；实测清完快照**立刻**跑，两个 DQC 都 `EXIT=0`。
+
+### ⭐ 巡检台账（2026-10-18 起，每天一行）
+
+链路上的闸门（DQC / 对账 / 维护自验）只能证明**这一次**对不对；要回答「过去 N 天是不是一直对」
+（比如验收清单里的「连续 7 天零差异」），得把每天的结果留痕。`scripts/ops/ops_ledger.sh` 就是这本流水账，
+挂在流程**最后一个节点**（第 10 个），每天往 CSV 追加一行。
+
+**它不判断、不告警、不修复**（只在取不到实例时 `exit 1`）—— 判对错仍是 DQC / 对账 / 维护三个节点的事。
+
+日志在容器内 `/opt/dolphinscheduler/logs/ops/ledger.csv` = 宿主 `ds/logs/ops/ledger.csv`
+（`ds/logs/` 是 rw 挂载、已被 `.gitignore` 忽略）。文件由容器内的 root 写，**宿主直接 `cat` 会 Permission denied**：
+
+```bash
+wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/ops/ledger.csv'
+```
+
+**21 列**（`dt` = 业务日期，`run_date` = 实跑日期 = dt+1）：
+
+| 列 | 含义 / 异常长相 |
+|---|---|
+| `dt` `run_date` `instance_id` | 业务日期 / 实跑日期 / DS 实例号 |
+| `flow_state` `duration_s` `nodes_ok` `nodes_fail` | 链路健康：`7` 成功；耗时突然翻倍 = 性能回归 |
+| `dqc_order_state` `dqc_dim_state` `recon_state` | 三个闸门节点的 state，非 `7` 就是挂了 |
+| `recon_result` `recon_checks` | `OK` / `26`；`checks` 变少 = 有检查被跳过 |
+| `ods_order_rows` `ods_event_rows` `dwd_detail_rows` `dwd_lifecycle_rows` | 湖表行数，某天掉一半 = 丢数 |
+| `snapshots_max` | 8 张表里最多的快照数，常驻 > 10 说明维护没跑成 |
+| `kafka_order_msgs` `kafka_event_msgs` | Kafka 现存消息数（≈ 累计产出），某天不涨 = 生产端停了 |
+| `warehouse_mb` | 湖仓体积，正常缓慢增长 |
+| `notes` | 解析告警：`no-maintain-log` / `recon-log-missing` / `du-failed`；空 = 全部解析正常 |
+
+**不重跑 Spark**：湖表行数直接从当天 `lake_maintain` 节点的日志解析（它本来就打印每张表的
+快照/文件/行数），对账从 `recon_lake_wh` 日志抓 `RECON_RESULT|OK|checks=26` —— 整个节点 **3 秒**
+跑完。实测回放实例 349 得到的一行：
+
+```
+2026-10-17,2026-10-18,349,7,442,9,0,7,7,7,OK,26,900000,3115274,854844,900000,5,910000,3120421,115.0,
+```
+
+**数「连续 N 天零差异」**（第 11 列是 `recon_result`）：
+
+```bash
+docker exec dolphinscheduler awk -F, 'NR>1 && $11=="OK"{n++; last=$1} END{print n" 天 recon=OK，最新 "last}' /opt/dolphinscheduler/logs/ops/ledger.csv
+```
+
+⚠️ 首次生效：v8 于 2026-10-18 上线，**首个定时写入是 2026-10-19 02:00 那一跑**；
+所以「连续 7 天零差异」最早在 **2026-10-25** 出数。
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
 
@@ -1626,6 +1676,11 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 实测实例 347（16:55:15 → 16:59:31）9 节点全绿、**4 分 16 秒**，本节点 **43 秒**、退出码 0
       —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
          `WHERE code = 23385597001344` 返回 `7 / 1`
+- [x] **巡检台账进调度** ✅ **2026-10-18 完成** —— `offline_dataware_lake` **v8** 第 10 个节点
+      `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，
+      超时 5 min，前置 = `lake_maintain`）—— 脚本实测 3 秒、回放实例 349 得一行、`notes` 为空
+      —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
+         `WHERE code = 23385597001344` 返回 `8 / 1`；首个定时写入 2026-10-19 02:00
 - [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
       —— 2026-10-14 补充：湖层已从「只读旁路」扩为 **ODS/DIM/DWD/DWS/ADS 全分层镜像**（见「第 3 步」）
       —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs
@@ -1691,7 +1746,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
          再上一档数据量前必须修
 
 **第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 已完成
-（定时 02:00 已上线、告警已配、湖表维护已作为第 9 个节点进流程）
+（定时 02:00 已上线、告警已配、湖表维护第 9 个节点、巡检台账第 10 个节点）
 
 - [x] **方案 C 落地** —— `run_dwd.sh` / `run_dim.sh` 改为常驻 `docker exec spark`（不再 `docker run`
       临时容器），串行锁移到容器内 `/tmp/.spark_job.lock`
@@ -1704,6 +1759,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       四层；只读），实测自测 **9/9 通过**、全区间 **3.1 秒**，已挂进工作流
 - [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5（8 节点，实例 346 全绿 **3 分 34 秒**）
       → **v7（9 节点，加 `lake_maintain`，实例 347 全绿 **4 分 16 秒**，2026-10-16）**
+      → **v8（10 节点，加 `lake_ops_ledger` 巡检台账，2026-10-18 上线）**
 - [x] **定时上线** ✅ **2026-10-16 完成** —— `t_ds_schedules` id 7 `release_state=1`，
       每天 02:00 会自动跑
       —— 判据：`SELECT release_state FROM t_ds_schedules WHERE id = 7` 返回 1
