@@ -8,62 +8,83 @@
 
 ## 架构
 
-```
-                    ┌──────────────────────────────────────────┐
-                    │         DolphinScheduler (调度)           │
-                    │   定时触发 · 依赖编排 · 失败重试 · 日志    │
-                    └──────────────────────────────────────────┘
-                                        │
-                                        ▼
-  订单链路（DS 工作流 offline_dataware）
-  Python 脚本  ──►  Kafka  ──►  StarRocks Routine Load  ──►  StarRocks
-  模拟订单        消息队列      ⭐ StarRocks 原生消费       ODS → DWD → DWS → ADS
-                              （2026-10-09 起替代 Spark 摄入）
+**当前架构（2026-10-16 起的湖仓链路）** —— 计算在 Spark + Iceberg（湖），StarRocks 退为服务层：
 
-  订单事件 / 累积快照链路（DUPLICATE 事件流 → 累积快照事实表）
-  Python 脚本  ──►  Kafka  ──►  StarRocks Routine Load  ──►  StarRocks
-  模拟事件流       ods_order_event  ⭐ 原生消费（Exactly-Once）  ODS → DWD(累积快照 dwd_order_lifecycle)
-  ⚠️ 与上面一条独立：不同 topic、不同表、不同 Routine Load 作业
-
-  商品 / 维度链路（DS 工作流 dim_product_chain）
-  Python 脚本  ──►  CSV  ──►  Stream Load  ──►  StarRocks
-  模拟商品快照     文件同步     HTTP 导入       ODS → DIM(SCD1/SCD2) → DWD
-  ⚠️ 生成器不在调度里（CSV 视为"上游同步"），调度从 Stream Load 开始
 ```
+                    ┌────────────────────────────────────────────────────────┐
+                    │          DolphinScheduler（调度 · DS 3.2）             │
+                    │  每天 02:00 工作流 offline_dataware_lake（v7 九节点）  │
+                    │  replay → product → dim → dwd → 仓侧物化              │
+                    │        →（订单 DQC ∥ 商品 DQC ∥ 湖↔仓对账）→ 湖表维护  │
+                    └────────────────────────────────────────────────────────┘
+                                         │
+  ① 模拟上游（不在调度里：由外部系统 / 手工产出）
+     gen_mock_orders_snapshot.py ──► Kafka `ods_order`
+     gen_mock_orders.py          ──► Kafka `ods_order_event`
+     gen_mock_products.py        ──► CSV `data/dim/product_snapshot_<date>.csv`
+
+  ② 湖层（Spark 3.5 + Iceberg 1.9，落在本地磁盘 `lake/warehouse`，**真源**）
+     Kafka ──（批式重放，独立消费组）──► lake.ods.ods_order / lake.ods.ods_order_event
+     CSV   ──（解析落地）──────────────► lake.ods.ods_product
+                                        lake.dim.dim_product_scd2（SCD2 拉链）
+                                        lake.dwd.dwd_order_detail / dwd_order_sku_detail /
+                                                 dwd_order_lifecycle
+
+  ③ 服务层（StarRocks 3.5：external catalog `lake` 直读 Iceberg 文件）
+     lake.* ──INSERT OVERWRITE──► dws.dws_user_order_day、ads.ads_daily_sales（对外查询走这两层）
+     ⚠️ 仓侧 ods/dwd/dim 自 2026-10-16 起**冻结**，只做对照与回滚，不要再往上建报表
+
+  ④ 旁路（与湖层无数据流，legacy 但仍在跑）
+     Kafka ──Routine Load（常驻）──► 仓侧 ods.ods_order / ods.ods_order_event
+```
+
+**旧架构（2026-10-09 版，已退役）** —— 留作对照：
+
+```
+  订单 / 订单事件：Python ──► Kafka ──► 仓侧 Routine Load ──► 仓侧 ODS → DWD → DWS → ADS
+  商品：          Python ──► CSV  ──► Stream Load        ──► 仓侧 ODS → DIM(SCD1/SCD2) → DWD
+  调度：offline_dataware / order_event_chain / dim_product_chain（三个工作流，现全部 release_state=0）
+```
+
+> 为什么换：原来 `INSERT OVERWRITE` 逐天重算、DWD 范围 JOIN 和动态分区全压在 3 GB 的 StarRocks
+> 单容器上；拆到湖层后计算交给 Spark（可独立扩），StarRocks 只留 `dws`/`ads` 两张汇总表做服务。
+> 迁移过程、四步实测与验收判据见「湖仓一体（第 0~4 步全部完成）」一节。
 
 **订单的四层视角**（同一实体，四种粒度，不要互相 JOIN 出报表）：
 
-| 表 | 粒度高 | 说明 |
-|---|---|---|
-| `ods.ods_order` | 消息 | 订单快照原始落地（**主键模型** → 重复消息自动折叠）|
-| `dwd.dwd_order_detail` | 订单×天 | 按天 `INSERT OVERWRITE`，同一订单跨天可能多行 |
-| `dwd.dwd_order_lifecycle` | **订单（一行到底）** | **累积快照**：五个里程碑列，每发生一个就回填一列；NULL = 还没发生（卡单就是永远 NULL）|
-| `ods.ods_order_event` | 事件 | 事件流原始落地（**`DUPLICATE KEY`** → 重复消息**原样保留**，见下方"幂等性"）|
+| 粒度 | 湖侧（当前，真源） | 仓侧（2026-10-16 起冻结） | 说明 |
+|---|---|---|---|
+| 消息 | `lake.ods.ods_order` | `ods.ods_order` | 订单快照原始落地（去重语义 → 重复消息折叠）|
+| 订单×天 | `lake.dwd.dwd_order_detail` | `dwd.dwd_order_detail` | 按天 `INSERT OVERWRITE`，同一订单跨天可能多行 |
+| **订单（一行到底）** | `lake.dwd.dwd_order_lifecycle` | `dwd.dwd_order_lifecycle` | **累积快照**：五个里程碑列，每发生一个就回填一列；NULL = 还没发生（卡单就是永远 NULL）|
+| 事件 | `lake.ods.ods_order_event` | `ods.ods_order_event` | 事件流原始落地（**`DUPLICATE KEY`** → 重复消息**原样保留**，见下方"幂等性"）|
 
 **两条链路的差异是刻意的**：
 
 | | 订单链路 | 商品链路 |
 |---|---|---|
 | 数据形态 | **事件流**，一条一条持续产生 | **实体状态**，每天一份全量快照 |
-| 传输方式 | Kafka + Routine Load | CSV 文件 + Stream Load |
+| 传输方式 | Kafka（湖侧 Spark 重放；仓侧另有一条 Routine Load 旁路） | CSV 文件（Spark 解析进 `lake.ods.ods_product`） |
 | 同步节奏 | 按天增量 | 按天全量快照 |
 
 真实业务里商品也是整表导出走 DataX，不走消息队列 —— **事件用流、实体用快照**是通用的分层原则。
 
 | 组件 | 版本 | 职责 | 端口 |
 |---|---|---|---|
-| Kafka | 3.8.1 | 消息队列，数据入口 | 9092 |
-| Spark | 3.5.1 | ⚠️ **当前不承担摄入**（2026-10-09 起 ODS 改由 Routine Load 常驻消费）；后续「湖仓一体」阶段用于直读文件做清洗 | — |
-| StarRocks | 3.5.0 | 存储 + 计算 + 对外查询（allin1 单容器） | 9030 / 8030 / 8040 |
+| Kafka | 3.8.1 | 消息队列，上游数据入口（湖侧重放与仓侧 Routine Load **两个独立消费者**） | 9092 |
+| Spark | 3.5.1 | **湖层计算**：ODS 重放、DIM/DWD 增量、湖表维护；Iceberg 的写入引擎 | — |
+| Iceberg | 1.9.0 | 湖层表格式，数据落在本地目录 `lake/warehouse`（未用对象存储） | — |
+| StarRocks | 3.5.0 | **服务层**：external catalog `lake` 直读 Iceberg + `dws`/`ads` 物化 + 对外查询（allin1 单容器） | 9030 / 8030 / 8040 |
 | MySQL | 8.0 | DolphinScheduler 的元数据库 | 13306 |
 | DolphinScheduler | 3.2.0 | 工作流调度（standalone 模式） | 12345 |
+
 
 ---
 
 ## ⭐ 当前生产链路（2026-10-16 起）
 
-> 上面「架构」图是 **2026-10-09 那版仓侧链路**，作为历史与对照保留。
-> **现在每天真正在跑的是湖侧链路**：计算下沉到 Spark + Iceberg（湖），StarRocks 退化为
+> 「架构」一节画的就是这条链路（2026-10-09 的旧仓侧架构已降级为对照）。
+> **每天真正在跑的是湖侧链路**：计算下沉到 Spark + Iceberg（湖），StarRocks 退化为
 > 查询 / 服务层，只保留 `dws` / `ads` 两层物化结果，仓侧 `ods` / `dwd` / `dim` 不再更新。
 
 **调度**：DolphinScheduler 工作流 **`offline_dataware_lake`** —— 流程已上线
@@ -584,10 +605,25 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 
 ## 调度
 
-**四个工作流**（2026-10-09 现状，以数据库为准）：
+**六个工作流（2026-10-18 现状，以数据库为准）** —— 只有第 1 个在跑，其余 4 个旧流程 + 1 个
+健康检查全部 `release_state=0`（离线留档）：
 
 ```
-┌─ offline_dataware（订单快照链路，每天 02:00，exec_type=1 串行等待）────┐
+┌─ ⭐ offline_dataware_lake（当前生产链路，每天 02:00，release_state=1，v7 九节点）┐
+│  lake_ods_replay → lake_ods_product → lake_dim_build → lake_dwd_incremental →   │
+│       Shell             Shell            Shell              Shell               │
+│   → wh_dws_ads_materialize → { dqc_order_chain ∥ dqc_dim_product ∥ recon_lake_wh } │
+│          Shell                    Shell              Shell            Shell       │
+│   → lake_maintain                                                               │
+│          Shell                                                                  │
+│  ⚠️ exec_type=1 串行等待；6/7/8 并行挂在 5 之后，9 等它们全部结束（详见「当前生产链路」）│
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**旧四流程（全部 `release_state=0`，按决定留档不动）**：
+
+```
+┌─ offline_dataware（订单快照链路，原 02:00，exec_type=1 串行等待）──────┐
 │  dwd_delete → dws_agg → ads_metric → dqc_order_chain                 │
 │    Shell        SQL        SQL          Shell                         │
 │  ⚠️ dwd_delete 名字骗人，真身是 INSERT OVERWRITE ... PARTITION        │
@@ -595,14 +631,14 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 └───────────────────────────────────────────────────────────────────────┘
                                │ 今天成功
                                ▼
-┌─ dim_product_chain（商品链路，每天 03:00，exec_type=2 串行丢弃）──────┐
+┌─ dim_product_chain（商品链路，原 03:00，exec_type=2 串行丢弃）────────┐
 │  wait_order_chain → truncate_and_load_ods → dim_product_load →       │
 │     DEPENDENT            Shell                   Shell                │
 │        → dim_product_scd2_load → dwd_sku_reload → dq_check            │
 │                 Shell                 Shell          Shell            │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─ order_event_chain（订单事件 / 累积快照链路，每天 02:30，END 失败策略）┐
+┌─ order_event_chain（订单事件 / 累积快照链路，原 02:30，END 失败策略）┐
 │  dwd_lifecycle_load                                                  │
 │     Shell(dwd_order_lifecycle_load.sh)                               │
 │  ⚠️ ods_event_spark 节点已删除（2026-10-09 同上）                    │
@@ -611,14 +647,21 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 ┌─ routine_load_health（摄入健康检查，每 30 分钟，END 失败策略）────────┐
 │  check_routine_load                                                  │
 │     Shell(check_routine_load.sh)                                     │
-│  ⚠️ 为什么必须有：摄入改成常驻作业后，DS 里【再没有节点会变红】      │
+│  ⚠️ 为什么必须有：摄入是常驻作业，DS 里【再没有节点会变红】          │
 │     作业挂了数据就静静不进来 → 用这个把"常驻作业死了"翻译成告警       │
+│  ✅ 脚本已于 2026-10-18 修为 v2（OffsetLag + 重复率），流程仍离线     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
 
 > **ODS 摄入已不在 DS 的 DAG 里** —— 它由两条常驻 Routine Load 作业承担
 > （`ods.ods_order_event_load` / `ods.ods_order_load`），见「幂等性」。
 
+
+> **历史说明**：以下三小节是**旧流程时代（仓侧链路，2026-10-16 已停用）**的做法，留作原理对照。
+> 当前湖仓链路只有一个工作流 `offline_dataware_lake`：执行策略是 **`SERIAL_WAIT`（串行等待）**，
+> 幂等由各节点脚本自己保证（`lake_dwd_incremental` 带 `--lookback 3` 按 `dt` 重算），
+> 补数同样走 `bash scripts/lake/run_dwd.sh incremental all --lookback 3`。
 
 ### 商品链路为什么「定时」和「依赖」两个都要
 
@@ -864,15 +907,15 @@ docker compose restart dolphinscheduler
 10. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
 11. **订单快照 / 事件流两个生成器也不在调度里** —— 它们模拟"上游业务系统"。**本项目数据手动添加、将来直接换外源数据集，所以有意不配 cron**。日常顺序：
     ```
-    【手工】gen_mock_orders_snapshot.py --date <业务日期>   → ods_order
-    【手工】gen_mock_orders.py          --date <业务日期>   → ods_order_event
+    【手工】gen_mock_orders_snapshot.py --date <业务日期>   → Kafka `ods_order`
+    【手工】gen_mock_orders.py          --date <业务日期>   → Kafka `ods_order_event`
+    【手工】gen_mock_products.py        --date <业务日期>   → CSV data/dim/product_snapshot_<date>.csv
           ↓
-    【常驻】Routine Load 自动摄入两条链路的 Kafka 消息 → ODS   ← 2026-10-09 起，不再由 DS 触发
+    【DS 02:00】offline_dataware_lake（9 节点，当前唯一在跑的流程）
+                Kafka/CSV ─(Spark)─► lake.* ─(StarRocks 外表)─► dws / ads ─► DQC + 对账 + 湖表维护
           ↓
-    【DS 02:00】offline_dataware  : dwd_delete → dws_agg → ads_metric → dqc
-    【DS 02:30】order_event_chain : dwd_lifecycle_load
-    【DS 03:00】dim_product_chain : wait_order_chain → … → dwd_sku_reload → dq_check
-    【每30分钟】routine_load_health: check_routine_load（摄入健康检查）
+    【常驻】Routine Load → 仓侧 ods.*（legacy 旁路，与湖层无数据流）
+    【每30分钟】routine_load_health: check_routine_load（脚本已修 v2，流程 release_state=0 待上线）
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
 12. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
