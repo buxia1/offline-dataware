@@ -3,7 +3,7 @@
 > 本文对应仓库提交 `d92be7e` 之后的状态，**已于 2026-10-16 更新到「调度已接入并跑通」**。
 > **五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、仓侧 dws/ads 物化（含按天自动增量）
 > 已实现并实测过；DolphinScheduler 接线与可重复执行的对账作业也已完成**（见 §2 步骤 4）。
-> 仍未做：**湖表维护进调度**、**`user_id IS NULL` 口径拍板**（见附录 C）。
+> 仍未做：**`user_id IS NULL` 口径拍板**、**`remove_orphan_files`**（见附录 C）。
 > 失败告警已于 2026-10-16 配好（该定时 `warning_type=2` + 告警组 2）。
 > 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
@@ -210,11 +210,12 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 --    ads:90|90|854844|105680366.50
 ```
 
-### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ✅ 2026-10-16 已完成（维护节点除外）
+### 步骤 4：调度 + 维护 + 对账 接进 DolphinScheduler —— ✅ 2026-10-16 已完成（全部 9 个节点）
 
-**已落地**：工作流 **`offline_dataware_lake`**（v5，`release_state=1`），定时 `0 0 2 * * ? *`
-（每天 02:00，schedule id 7 **已上线**），执行策略「串行等待」。
-**首次端到端实测**：实例 346，8 个节点全绿、**3 分 34 秒**。节点名与命令见 `README.md`
+**已落地**：工作流 **`offline_dataware_lake`**（**v7**，`release_state=1`），定时 `0 0 2 * * ? *`
+（每天 02:00，schedule id 7 **已上线**，失败告警 `warning_type=2` / 告警组 2），执行策略「串行等待」。
+**端到端实测**：实例 346（8 节点）全绿 **3 分 34 秒**；实例 347（v7，9 节点，
+2026-10-16 16:55:15 → 16:59:31）全绿 **4 分 16 秒**。节点名与命令见 `README.md`
 的「⭐ 当前生产链路」。
 
 接线顺序（串行，实测就是这个拓扑；别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
@@ -223,6 +224,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 [lake_ods_replay] → [lake_ods_product] → [lake_dim_build] → [lake_dwd_incremental]
                   → [wh_dws_ads_materialize]
                   → { [dqc_order_chain], [dqc_dim_product], [recon_lake_wh] }
+                  → [lake_maintain]
 ```
 
 - **对账节点已沉淀成脚本**：`scripts/recon_lake_wh.sh`（**只读**；退出码 `0` 全绿 / `2` 对账不一致
@@ -232,7 +234,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   **D 仓侧覆盖 / 硬基线**。参数：`--range D1 D2` / `--fast` / `--strict` / `--allow-lag N` / `--json`。
   自测：`bash scripts/test_recon.sh`（内存假数据，**9/9 通过**）；全区间实测 **3.1 秒**。
   注意：它比的是**仓侧 `dws`/`ads`**（仓侧 `ods`/`dwd`/`dim` 已不再被调度更新，拿它们比没有意义）。
-- **维护节点：脚本已就绪并自验通过，仍未进调度** ⚠️ —— wrapper `scripts/lake/run_maintain.sh`
+- **维护节点：已进调度** ✅（v7 第 9 个节点，2026-10-16）—— wrapper `scripts/lake/run_maintain.sh`
   一条命令，**自动枚举 8 张湖表**
   （不写死表名，以后加表不用改脚本）：
   ```bash
@@ -244,7 +246,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   实测 2026-10-16：8 张表快照 `46/18/12/11/9/7/2/2` → **全部 ≤5**，
   `lake/warehouse` **177 MB → 143 MB**、行数逐表不变、退出码 `0`；
   紧接着 `bash scripts/recon_lake_wh.sh` **26 项全绿 / 5.1 秒**。
-  只剩「挂进 DS」这一步没落 —— 见附录 C。
+  已挂进 DS 当第 9 个节点（前置 = 三个质检/对账节点全部结束），实例 347 里本节点 **43 秒**。
 - **失败告警：已配** ✅（2026-10-16）—— `t_ds_schedules` id 7 `warning_type=2` + 告警组 `2`，
   与四个旧流程一致；每天 02:00 失败会发通知。
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
@@ -311,15 +313,17 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
 - [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
 - [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
-- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` v5，8 节点，
-      流程与定时都已上线；实测实例 346 全绿 **3 分 34 秒**
+- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v7，9 节点**，
+      流程与定时都已上线；实测实例 347 全绿 **4 分 16 秒**（v5/8 节点时实例 346 为 3 分 34 秒）
 - [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
       `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
 - [x] **失败告警已配**（2026-10-16）：该定时 `warning_type=2` / `warning_group_id=2`
       （与四个旧流程同一个告警组）—— 判据：
       `SELECT warning_type, warning_group_id FROM t_ds_schedules WHERE id = 7`
-- [ ] 湖表维护**已进调度** —— `expire_snapshots` 那半已就绪并自验通过（8 张表全覆盖、
-      快照 ≤ 5、行数不变、退出码 0、对账 26 项全绿），**只差挂进 DS**；
+- [x] 湖表维护**已进调度** ✅ 2026-10-16 —— DS 第 9 个节点 `lake_maintain`
+      （`bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`，超时 15 min，
+      前置 = `dqc_order_chain` / `dqc_dim_product` / `recon_lake_wh`；实例 347 里 **43 秒**、退出码 0）。
+      脚本自验通过（8 张表全覆盖、快照 ≤ 5、行数不变、对账 26 项全绿）。
       `remove_orphan_files` 仍**未做**（先证明快照清理安全，再单独评估）
 - [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
 - [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异

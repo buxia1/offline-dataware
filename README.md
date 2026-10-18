@@ -67,13 +67,13 @@
 > 查询 / 服务层，只保留 `dws` / `ads` 两层物化结果，仓侧 `ods` / `dwd` / `dim` 不再更新。
 
 **调度**：DolphinScheduler 工作流 **`offline_dataware_lake`** —— 流程已上线
-（`release_state=1`，version 5），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
+（`release_state=1`，**version 7**），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
 （schedule id 7 `release_state=1`，2026-10-16），执行策略「串行等待」。
 
 > ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
 > （实测 `t_ds_schedules` id 7）。每天 02:00 这一跑失败会发通知。
 
-**每天 8 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后）：
+**每天 9 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后；9 挂在 6 / 7 / 8 全部结束之后）：
 
 | # | 节点 | 脚本 | 建议超时 |
 |---|---|---|---|
@@ -85,9 +85,14 @@
 | 6 | `dqc_order_chain` | `bash scripts/dqc_order_chain.sh ${system.biz.date}` | 10 min |
 | 7 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
 | 8 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
+| 9 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --expire --keep 5`（脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
 
-**首次端到端实测（2026-10-16，实例 346）**：8 个节点全部 `SUCCESS`，**3 分 34 秒**；
+**端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；加维护节点后实例 347
+（v7，2026-10-16 16:55:15 → 16:59:31）**9 个节点全绿、4 分 16 秒**，其中 `lake_maintain` 占 43 秒；
 收尾数据 `dwd_order_detail 854,844` / `dws 18,000` / `ads 90`。
+
+> 节点名带前导 Tab 的 4 个（`lake_dim_build` / `lake_dwd_incremental` / `wh_dws_ads_materialize` /
+> `dqc_order_chain`）是 UI 里手误带进去的，纯外观、不影响执行，不建议为它专门改版本。
 
 **旧链路已退役**（四个旧工作流都还在 DS 里，但 `release_state=0` 全部离线；
 脚本收进 `scripts/legacy_warehouse/`，退役说明见该目录 README）：
@@ -768,6 +773,7 @@ SELECT count(*) AS rows_, sum(is_current) AS cur,
 FROM dim.dim_product_scd2;"
 
 # 【一条命令跑完 5 项数据质量检查】全部通过 = 没有任何输出，退出码 0
+# 脚本会先 REFRESH EXTERNAL TABLE（避免 FE 缓存指向已清掉的旧快照），再查湖表
 bash scripts/dqc_dim_product.sh
 
 # 订单链路 DQC
@@ -1139,6 +1145,7 @@ Kafka (ods_order_event / ods_order)
 | 26 | **`columns` 头用逗号分隔** | 数据用 `column_separator: \t` 时顺手把 `columns` 也写成制表符 → `No viable statement for input 'user_id<TAB>dt'` | `columns` 用逗号，`column_separator` 才是数据分隔符 |
 | 27 | **JDBC 驱动必须挂进 `/opt/spark/jars/`** | 只写 `--jars` 进不了 AppClassLoader → `No suitable driver found`；挂整个目录又会顶掉 launcher | 把单文件挂到 `/opt/spark/jars/xxx.jar` |
 | 28 | **别用 JDBC 写仓** | 实测 9,475 行耗 **467 秒**（≈20 行/秒），90 万行要 ≈13 小时 | 用 Stream Load：854,844 行 **34 秒** |
+| 29 | **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`** | `expire_snapshots` 清掉旧快照后，FE 缓存的元数据仍指向已删除的数据文件 → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`；而下一轮全流程（物化前会 REFRESH）又自愈，看着像「偶发」 | 两个 DQC 脚本已内置 `REFRESH`（`dim_product_scd2` / `dwd_order_sku_detail` / `dwd_order_detail` / `ods_order`）；实测清完快照立刻跑，两个 DQC 都 `EXIT=0` |
 
 ### 湖层已落地的组件
 
@@ -1147,7 +1154,7 @@ Kafka (ods_order_event / ods_order)
 | 湖层 DDL | `sql/lake/lake_ods.sql` | 建 `lake.ods.ods_order` / `lake.ods.ods_order_event`（Iceberg，隐藏分区 `dt`）|
 | 灌数脚本 | `scripts/lake/lake_ods_replay.sh` + `.py` | `bash scripts/lake/lake_ods_replay.sh --date 2026-09-20 [--dry-run]`：按天从 Kafka 重放 → Iceberg，**重跑同一天结果不变** |
 | 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
-| 维护脚本 | `scripts/lake/lake_maintain.py` | **自动枚举** `lake.ods/dim/dwd` 全部表（当前 8 张）：只读盘点 / `--expire --keep N` 清历史快照 / `--tables a,b` 限定表。清理后**自验「快照数下降 且 行数不变」**，不达标退出码 1（可直接挂 DS 告警）|
+| 维护脚本 | `scripts/lake/lake_maintain.py` + `run_maintain.sh` | **自动枚举** `lake.ods/dim/dwd` 全部表（当前 8 张）：只读盘点 / `--expire --keep N` 清历史快照 / `--tables a,b` 限定表。清理后**自验「快照数下降 且 行数不变」**，不达标退出码 1（可直接挂 DS 告警）|
 
 **实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
 `ods_order_event` 2,969,579 行。湖↔仓逐 key 差集**双向为 0**（见下方推进清单第 1 步）。
@@ -1211,6 +1218,15 @@ docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memor
 
 > 快照存活**不影响当前数据**，只影响「时间旅行」能回看多久 —— 所以 `--keep 5` 就够。
 > `remove_orphan_files`（清无主文件）**仍然没做** —— 先证明快照清理安全，再单独评估。
+
+**⚠️ 两条运行时注意（2026-10-18 实测踩到）**
+
+1. **别同时跑两个实例**：维护和重放都会重写湖表，另一个实例的 DQC 若正好读到中间态，会报
+   `[1064] ... File does not exist: .../snap-xxxx.avro`（实测实例 348 失败就是因为它和 349
+   被重复触发、348 的 DQC 撞上 349 的 `lake_dim_build` 正在重写 `dim_product_scd2`）。
+   DS 的 `SERIAL_WAIT` 只约束**定时**排队，管不了手动点「执行」—— 同一条流一天只跑一次即可。
+2. **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`**：快照被清掉后，FE 缓存的元数据仍指向
+   已删除的数据文件。两个 DQC 脚本已内置这一步；实测清完快照**立刻**跑，两个 DQC 都 `EXIT=0`。
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
 
@@ -1509,6 +1525,12 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       清理后自验「快照数下降 且 行数不变」，不达标退出码 1
       —— 实测 2026-10-16：快照 → 全部 ≤ 5；`lake/warehouse` **177 MB → 143 MB**；
       8 张表行数逐表不变、退出码 `0`；随后对账 **26 项全绿 / 5.1 秒**
+- [x] **湖表维护进调度** ✅ **2026-10-16 完成** —— `offline_dataware_lake` **v7** 第 9 个节点
+      `lake_maintain`（`bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`，
+      超时 15 min，前置 = `dqc_order_chain` / `dqc_dim_product` / `recon_lake_wh` 三个都结束）
+      —— 实测实例 347（16:55:15 → 16:59:31）9 节点全绿、**4 分 16 秒**，本节点 **43 秒**、退出码 0
+      —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
+         `WHERE code = 23385597001344` 返回 `7 / 1`
 - [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
       —— 2026-10-14 补充：湖层已从「只读旁路」扩为 **ODS/DIM/DWD/DWS/ADS 全分层镜像**（见「第 3 步」）
       —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs
@@ -1581,7 +1603,8 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 - [x] **DQC 指向湖侧** —— `dqc_order_chain.sh` / `dqc_dim_product.sh` 改为校验 `lake.*`
 - [x] **湖↔仓对账作业** —— `scripts/recon_lake_wh.sh`（水位 / 湖侧闭合 / 整行对称差 / 覆盖与硬基线
       四层；只读），实测自测 **9/9 通过**、全区间 **3.1 秒**，已挂进工作流
-- [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5，8 节点，实例 346 全绿 **3 分 34 秒**
+- [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5（8 节点，实例 346 全绿 **3 分 34 秒**）
+      → **v7（9 节点，加 `lake_maintain`，实例 347 全绿 **4 分 16 秒**，2026-10-16）**
 - [x] **定时上线** ✅ **2026-10-16 完成** —— `t_ds_schedules` id 7 `release_state=1`，
       每天 02:00 会自动跑
       —— 判据：`SELECT release_state FROM t_ds_schedules WHERE id = 7` 返回 1

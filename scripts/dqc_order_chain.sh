@@ -29,6 +29,28 @@ if [ ! -f "$SQL_FILE" ]; then
     exit 1
 fi
 
+# ---- 湖侧外部表：读之前必须先 REFRESH ----
+# StarRocks 读 Iceberg 用的是【FE 缓存的元数据】。湖侧被 Spark 重写、或被维护脚本
+# expire_snapshots 清掉旧快照之后，缓存里的元数据可能仍指向已删除的 snap-*.avro
+# —— 实测 2026-10-18 就报过 `ERROR 1064 ... File does not exist: .../snap-xxx.avro`，
+# 而且不刷新时也可能「对着旧快照假绿灯」。与 run_dws_ads_from_lake.sh / recon_lake_wh.sh 同一套做法。
+for t in lake.dwd.dwd_order_detail lake.ods.ods_order; do
+    ok=0
+    for attempt in 1 2 3; do
+        if docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "REFRESH EXTERNAL TABLE $t" >/dev/null 2>&1; then
+            echo "  REFRESH $t ✅"
+            ok=1
+            break
+        fi
+        echo "  REFRESH $t 第 $attempt 次失败，1 秒后重试…"
+        sleep 1
+    done
+    if [ "$ok" -ne 1 ]; then
+        echo "  REFRESH $t ❌ —— 拒绝在缓存元数据上做校验（否则可能对着旧快照假绿灯）"
+        exit 1
+    fi
+done
+
 echo "=== 当前状态（检查范围 dt <= $AS_OF）==="
 $QUERY "SELECT count(*) AS dwd_rows, count(DISTINCT dt) AS dwd_days,
                COALESCE(sum(amount),0) AS dwd_amount
