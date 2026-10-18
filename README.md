@@ -880,7 +880,7 @@ docker compose restart dolphinscheduler
     BE 常驻 RSS 462 MB）所以没事，**但放大数据量前必须修**，否则容易被 OOM kill。
 19. ⚠️ **`apache/spark:3.5.1` 里没有任何湖仓连接器** —— iceberg/paimon/hudi/hadoop-aws/aws-java-sdk
     全都没有（252 个 jar 里只有 parquet*、Ivy 缓存 0 个）。要用 Iceberg 需自己挂 jar，
-    见「下一阶段：湖仓一体」。
+    见「湖仓一体」。
 20. ⚠️ **Spark 容器以 uid 185 运行，而项目目录属主是 1000** —— 挂载虽是 `RW=true`，
     容器内**仍然写不进去**（`touch` 直接 `Permission denied`）。要让它落文件必须先
     `chown 185:185 <目录>` 或预建目录并放开权限。**这是"湖仓"落本地文件时的第一道坎。**
@@ -910,7 +910,7 @@ docker compose restart dolphinscheduler
       —— 两条常驻作业 `ods_order_event_load` / `ods_order_load`，Exactly-Once；
       退役了位点表 + 199 行 Python + 130 行外壳；新增 `check_routine_load.sh` + DS 工作流 `routine_load_health`。
       详见「幂等性 → ODS 摄入」一节。
-- [x] ⭐ **下一阶段：湖仓一体** —— 第 0 步（修地基）+ 第 1 步（湖层只读旁路）**已完成**；第 2 步 / 第 3 步未开始。见下方「下一阶段：湖仓一体」一节
+- [x] ⭐ **湖仓一体** —— 第 0/1/2/3/4 步**全部完成**（2026-10-14 灌湖 + 放量；2026-10-16 调度上线）。见下方「湖仓一体」一节
       —— 边界已定：**Iceberg + 本地文件系统（MinIO-ready）**；先 1000 单/天跑通、再上 1 万单/天 × 90 天
       —— **这一条正是上方那条被否决待办的"前提条件"**（原文：改数据落点后才该重新评估）
 - [x] `docs/dimension-modeling.md`：维度建模 + SCD2 完整说明
@@ -964,7 +964,7 @@ Spark 几乎不动（固定开销主导：JVM + 全量 JDBC 搬运）。
 
 > ### ⚠️ 这条结论已于 2026-10-14 被推翻 —— 前提条件真的变了
 >
-> 上面说的"什么情况下才该重新评估"，在「下一阶段：湖仓一体」里**已经发生**：
+> 上面说的"什么情况下才该重新评估"，在「湖仓一体」里**已经发生**：
 > 90 天 ODS 已落到 Iceberg（`lake.ods.ods_order` / `ods_order_event`），
 > Spark **直读 parquet，不再 JDBC 抽取**，那 42% 的读开销真的消失了。
 > 于是四条链路（订单明细 / SCD2 时点关联 / 累积快照 / DWS+ADS）全部改走
@@ -1038,11 +1038,14 @@ DS 里不再有摄入节点会变红，所以必须补 `routine_load_health` 工
 
 ---
 
-## 下一阶段：湖仓一体（第 1 步已落地）
+## 湖仓一体（第 0~4 步全部完成，当前生产链路）
 
-> **状态**：**第 0 步（修地基）+ 第 1 步（湖层只读旁路）已完成** —— 2026-10-14 跑通
-> 90 天（2026-09-20 ~ 2026-12-18）灌湖，湖↔仓逐 key 对账**零差异**。
-> 第 2 步（DWD 计算下沉 Spark）、第 3 步（放量）**未开始**。
+> **状态：五步全部完成（当前生产链路）**
+> —— 第 0 步（修地基）+ 第 1 步（湖层只读旁路）2026-10-14 完成：90 天（2026-09-20 ~ 2026-12-18）
+>   灌湖，湖↔仓逐 key 对账**零差异**；
+> —— 第 2 步（DWD 计算下沉 Spark）、第 3 步（放量 1 万单/天 × 90 天）2026-10-14 完成；
+> —— 第 4 步（调度上线 + 旧链路退役）2026-10-16 完成：`offline_dataware_lake` **v7 九节点**，
+>   定时 02:00 已上线、失败告警已配。
 > 本节其余实测数据为 2026-10-09 探针所得（那部分确实未改动项目文件）。
 
 ### 确认的四项边界
@@ -1146,6 +1149,7 @@ Kafka (ods_order_event / ods_order)
 | 27 | **JDBC 驱动必须挂进 `/opt/spark/jars/`** | 只写 `--jars` 进不了 AppClassLoader → `No suitable driver found`；挂整个目录又会顶掉 launcher | 把单文件挂到 `/opt/spark/jars/xxx.jar` |
 | 28 | **别用 JDBC 写仓** | 实测 9,475 行耗 **467 秒**（≈20 行/秒），90 万行要 ≈13 小时 | 用 Stream Load：854,844 行 **34 秒** |
 | 29 | **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`** | `expire_snapshots` 清掉旧快照后，FE 缓存的元数据仍指向已删除的数据文件 → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`；而下一轮全流程（物化前会 REFRESH）又自愈，看着像「偶发」 | 两个 DQC 脚本已内置 `REFRESH`（`dim_product_scd2` / `dwd_order_sku_detail` / `dwd_order_detail` / `ods_order`）；实测清完快照立刻跑，两个 DQC 都 `EXIT=0` |
+| 30 | **`fe.conf` 每次重启都会多一行 `priority_networks`** | FE entrypoint 无条件追加，`git status` 每次多一行 diff；同值重复、后写的生效，**不影响运行** | 提交前 `git checkout -- starrocks/fe/conf/fe.conf` 还原；别为它去改 entrypoint |
 
 ### 湖层已落地的组件
 
@@ -1283,6 +1287,12 @@ docker run --rm --network offline-dw_default --memory 5g \
 | `(dt, order_id)` 重复 | **0** ✅ |
 | 分区 | 95 个（p20260915~p20261218），90 个有数据 |
 | 耗时 | **34.0 秒**（读湖 3.5 s + 清洗 12.0 s + 15 批写入 18.9 s）|
+
+> **`user_id IS NULL` 口径已定（2026-10-18：保留现状）**：明细层按「可归属到用户」过滤 ——
+> 45,156 单（5.02%，与 `NULL_USER_RATE=0.05` 吻合）**不进明细**，所以 `dwd_order_detail` 是 854,844 行；
+> **快照层 `dwd_order_lifecycle` 与 `ods_order` 保留全量** 900,000 行（其中 NULL 45,187 / 45,156）。
+> `dws`/`ads` 跟随明细层 —— **「总订单数」取哪张表必须在报表里说明**：
+> `dwd_order_detail` 是「有用户的订单」，全量订单看 `dwd_order_lifecycle`（差 5.02%，别混用）。
 
 #### 汇总链路：`scripts/legacy_step2/dws_ads_streamload.py`（已废弃）
 
@@ -1581,18 +1591,22 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 实测：仓侧 `dws` / `ads` 仍由 `scripts/run_dws_ads_from_lake.sh` 物化（行数 18,000 / 90
          与迁移前逐行一致），报表 SQL 与下游读取方式零改动；湖侧用 external catalog `lake` 直查
 
-**第 3 步 · 放量**（先 1000 单/天跑通，再上 1 万单/天 × 90 天）
+**第 3 步 · 放量**（2026-10-14）—— ✅ 已完成：跳过 1000 单/天那一档，直接上 1 万单/天 × 90 天
 
-- [ ] **放量到 1000 单/天** —— 改 `NEW_ORDERS_PER_DAY` 与号段
-      —— 判据：链路跑通、对账通过、**仍可重放**（同一天重跑逐字节相同）
-- [ ] **逐天连续推进不漏天** —— 生成器只发"到期日 == `--date`"的事件，跳过某天就永远不补发
-      —— 判据：自带的 `overdue` / `missing_prev` 两种漏发检查均为 0
-- [ ] **重定分区与桶数** —— 现状 `dwd_order_detail` **28 个分区里 20 个是空的**，放量后更浪费
-      —— 判据：无空分区堆积；补数不再需要手工 `ADD PARTITION`
-- [ ] **放量到 1 万单/天 × 90 天**（≈270 万事件）
-      —— 判据：峰值内存不越容器上限（尤其 StarRocks 3 GB）；作业不 OOM
+- [x] **放量到 1 万单/天 × 90 天** —— `scripts/gen/gen_mock_orders.py` 里 `NEW_ORDERS_PER_DAY = 10000`（原 100）
+      —— 实测：湖侧 `ods_order` **900,000** 行、`ods_order_event` **3,118,737** 行（90 天）
+- [x] **逐天连续推进不漏天** —— 生成器只发"到期日 == `--date`"的事件，跳过某天就永远不补发
+      —— 实测：90 天 `dt` 全覆盖（2026-09-20 ~ 2026-12-18，`count(DISTINCT dt) = 90`，无空天）；
+         `dwd_order_detail` 逐日「行数 + `sum(amount)`」对账 **90/90 天一致**
+- [x] **重定分区与桶数** —— 原判据针对**仓侧** `dwd_order_detail`（28 个分区 20 个空）
+      —— 已不适用：湖侧用 Iceberg **隐藏分区 `dt`**，实测 90 个分区、无空分区，补数按 `dt` 自动定位；
+         仓侧老 `dwd` 表已停更（新链路只物化仓侧 `dws/ads`）
+- [x] **峰值内存不越容器上限** —— 放量后实例 346 / 347 / 349 全绿、未 OOM
+      —— ⚠️ 遗留：`fe.conf` 里 `-Xmx8192m` 仍大于容器 `mem_limit: 3g`（坑表第 2 条），
+         再上一档数据量前必须修
 
-**第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 除定时上线外已完成
+**第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 已完成
+（定时 02:00 已上线、告警已配、湖表维护已作为第 9 个节点进流程）
 
 - [x] **方案 C 落地** —— `run_dwd.sh` / `run_dim.sh` 改为常驻 `docker exec spark`（不再 `docker run`
       临时容器），串行锁移到容器内 `/tmp/.spark_job.lock`
@@ -1621,6 +1635,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 | 1 | MinIO 的 `GetObject AccessDenied` | 先用本地文件系统；要切对象存储时可换 **SeaweedFS**（实测可拉取、S3 兼容、活跃维护）|
 | 2 | 双写一致性（Routine Load + 湖层）| 第 1 步**只重放历史**灌湖，暂不双写，避免两份摄入成本与语义分歧 |
 | 4 | ~~**定时作业口径未统一**~~ | ✅ **2026-10-16 已解决**：新流程 `offline_dataware_lake`（湖侧口径）取代旧的 StarRocks SQL 作业链；四个旧流程保持离线（`release_state=0`，按决定先留着不动）。定时已上线（schedule id 7 `release_state=1`）；告警也已配好（`warning_type=2` + 告警组 2）。|
+| 5 | ~~`user_id IS NULL` 的 45,156 行保留还是过滤~~ | ✅ **2026-10-18 已定：保留现状** —— 明细层 `dwd_order_detail` 按"可归属到用户"过滤（854,844 = 900,000 − 45,156），快照层 `dwd_order_lifecycle` / `ods_order` 保留全量（NULL 45,187 / 45,156）。`dws`/`ads` 跟随明细层，所以 `sum(order_cnt) = 854,844` 是"有用户的订单数"，全量订单数查 `dwd_order_lifecycle`。判据：`count(*)-count(user_id)` = **0 / 45,187 / 45,156**。|
 | 3 | 湖层与 StarRocks 的共享目录 | 两者必须挂到同一路径；Spark 用 uid 185、StarRocks BE 用 root，权限需一次配好 |
 
 ### 高危操作：重建容器前的「金丝雀」检查

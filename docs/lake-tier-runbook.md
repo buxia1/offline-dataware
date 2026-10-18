@@ -3,7 +3,7 @@
 > 本文对应仓库提交 `d92be7e` 之后的状态，**已于 2026-10-16 更新到「调度已接入并跑通」**。
 > **五处缺陷已修复并实测过、湖侧按天增量已实现并实测过、仓侧 dws/ads 物化（含按天自动增量）
 > 已实现并实测过；DolphinScheduler 接线与可重复执行的对账作业也已完成**（见 §2 步骤 4）。
-> 仍未做：**`user_id IS NULL` 口径拍板**、**`remove_orphan_files`**（见附录 C）。
+> 仍未做：**`remove_orphan_files`**（见附录 C）；`user_id IS NULL` 的口径已于 2026-10-18 拍板（见 §2 步骤 2 末）。
 > 失败告警已于 2026-10-16 配好（该定时 `warning_type=2` + 告警组 2）。
 > 目标终局：**湖侧 = 唯一计算源，仓侧 dws/ads = 湖侧数据的物化视图。**
 
@@ -134,11 +134,13 @@ bash scripts/lake/run_dwd.sh build dwd_order_lifecycle  "$D1" "$D2"
 # 每条命令的 RESULT 行：before == after（未翻倍）；同区间连跑两遍，逐日数字不变
 ```
 
-**一个你必须拍板的口径问题**：`dwd_order_detail` 里 `user_id IS NULL` 有 **45,156 行**
-（实测）。新加的完整性 gate 只看**非空 `user_id`**，所以这 45,156 行不在校验范围内。
-请确认它们**应该保留**（若是，gate 口径没问题），还是**本就应该被过滤掉**（若是，
-我把它改成 `COUNT(*)`）。顺带：`count(DISTINCT order_id)` 与明细行数不等的问题，
-根因也是这些 NULL 行。
+**`user_id IS NULL` 的口径（2026-10-18 已拍板：保留现状）**：清洗把 `user_id IS NULL` 的
+**45,156 单**挡在明细层之外（`ods_order` 900,000 → `dwd_order_detail` 854,844，占 5.02%，
+与 `NULL_USER_RATE=0.05` 吻合），而**快照层 `dwd_order_lifecycle` 与 `ods_order` 保留全量**
+（实测 NULL 分别 **45,187 / 45,156**）。完整性 gate 只看非空 `user_id` 行 —— 与这个口径一致，
+**不需要改**。下游 `dws`/`ads` 跟随明细层：「总订单数」取哪张表必须在报表里写明，
+`dwd_order_detail` 是「有用户的订单」，全量订单看 `dwd_order_lifecycle`。
+判据：`count(*) - count(user_id)` 明细 **0** / 快照 **45,187** / ODS **45,156**。
 
 ### 步骤 3：仓侧 dws/ads 改成「湖侧物化」 —— ✅ 已完成，默认已按天自动增量
 
@@ -325,8 +327,13 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       前置 = `dqc_order_chain` / `dqc_dim_product` / `recon_lake_wh`；实例 347 里 **43 秒**、退出码 0）。
       脚本自验通过（8 张表全覆盖、快照 ≤ 5、行数不变、对账 26 项全绿）。
       `remove_orphan_files` 仍**未做**（先证明快照清理安全，再单独评估）
-- [ ] ⚠️ 口径待拍板：`dwd_order_detail` 里 `user_id IS NULL` 的 45,156 行保留还是过滤
-- [ ] 湖↔仓对账连续 N 天（建议 7 天）零差异
+- [x] 口径已拍板（2026-10-18）：**保留现状** —— 明细层过滤（854,844 = 900,000 − 45,156），
+      快照层 / ODS 保留全量（NULL 45,187 / 45,156）；
+      判据：`count(*) - count(user_id)` = **0 / 45,187 / 45,156**
+- [ ] 湖↔仓对账**连续 7 天零差异**（日历时间，只能每天定时跑一次）
+      —— 已记：2026-10-16 实例 347（手动）✅ 9/9 绿、4 分 16 秒；recon 26 项 OK
+      —— 已记：2026-10-18 实例 349（手动，与 348 并发）✅ 9/9 绿；recon 26 项 OK
+      —— 待记：2026-10-19 ~ 10-25 定时 02:00 每天一行；满 7 天勾掉本条
 
 > 关于「停更仓侧 ods/dim/dwd」这一条：**2026-10-16 起仓侧 `ods`/`dim`/`dwd` 事实上已经不再被
 > 调度更新**了（新链路只物化仓侧 `dws`/`ads`；仓侧 `ods` 仍由 Routine Load 写入）。
@@ -344,4 +351,6 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - 补分支场景（迟到事件、跨天订单、`user_id IS NULL` 的 45,156 单这类边界）
 - 更新 README / PITFALLS 的对应章节
 
-> 我承诺：从这条消息起，**不再直接执行**湖仓链路的写操作，只给代码与判据。
+> **注（2026-10-16 起）**：早期「只给代码、不执行写操作」的约定已取消 —— 现在 agent 直接执行
+> 并回报实测证据；但凡涉及**数据写入 / 重建 / 清理**的操作（`--truncate`、`build` 重刷、
+> `--expire`），先说明影响面与回滚方式，再执行。
