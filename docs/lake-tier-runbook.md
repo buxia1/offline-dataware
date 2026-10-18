@@ -255,6 +255,12 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
   （实测：Routine Load 那两个作业 `ods_order_load` / `ods_order_event_load` 至今仍在 RUNNING。）
+- **Kafka 保留期 = 重放窗口上限，30 天**（2026-10-18 实测）：broker `log.retention.hours=720`，
+  两个 topic 无覆盖配置；`lake_ods_replay.py` 是 `startingOffsets=earliest` **全量重读**，
+  所以消息一过期就再也补不回来。**按生产时间算**：2026-10-14 一次性回填的 90 天数据
+  会在 ≈2026-11-13 整体过期，此后 `--date` 只对保留期内的数据有效。
+  查窗口：`docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic <topic> --time -2 | -1`
+  （当前两个 topic 最早 offset 均为 `0`，即还没有任何消息被清）。
 
 ---
 

@@ -663,6 +663,15 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 > 幂等由各节点脚本自己保证（`lake_dwd_incremental` 带 `--lookback 3` 按 `dt` 重算），
 > 补数同样走 `bash scripts/lake/run_dwd.sh incremental all --lookback 3`。
 
+> **补数窗口 = 30 天，而且是按「消息生产时间」算，不是事件日期**
+> `lake_ods_replay.py` 用 `startingOffsets=earliest` 全量重读 Kafka
+> （脚本注释原话：「读 Kafka 全量（earliest）」），所以只要消息没过期，任意 `--date` 都能重放。
+> 保留期是 broker 级 `log.retention.hours=720`（compose 里 `KAFKA_LOG_RETENTION_HOURS=720`，
+> 两个 topic 上都没有覆盖配置），超过 30 天的日子**只能靠湖侧 ODS 已有数据**，Kafka 补不回来。
+> 查窗口：`docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic ods_order --time -2`（最早）和 `--time -1`（最新）。
+> 实测 2026-10-18：两个 topic 最早 offset 都是 **0**（一条都没被清过）；
+> 但 90 天历史是**一次性回填**灌进去的，会在「灌入日 + 30 天」（≈ 2026-11-13）整体过期。
+
 ### 商品链路为什么「定时」和「依赖」两个都要
 
 | | 作用 | 缺了会怎样 |
