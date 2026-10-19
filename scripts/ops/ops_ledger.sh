@@ -6,7 +6,7 @@
 #   bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}
 #   手动：bash scripts/ops/ops_ledger.sh 20261018
 #
-# 台账文件：容器内 /opt/dolphinscheduler/logs/ops/ledger.csv
+# 台账文件：容器内 /opt/dolphinscheduler/logs/ops/ledger.csv（26 列，2026-10-19 起含湖侧 ODS 闸门 5 列）
 #          宿主机 ds/logs/ops/ledger.csv（logs 是 rw 挂载，容器重启不丢）
 #
 # 设计约束（DS 容器里只有这些能用）：
@@ -115,6 +115,27 @@ else
   NOTES+=("no-maintain-log")
 fi
 
+# ---------- 2.5) 湖侧 ODS 闸门（dqc_lake_ods 节点日志）----------
+# 日志形如：DQC_RESULT|OK|checks=6|dt=2026-10-18|C1=1|...
+#          ✅ C1 业务日非空  (orders=10000 events=33622)
+#          ✅ C5 事件重复率≤1.10  (ratio=1.0000)
+DQ_ODS_ID="$(ds_sql "SELECT id FROM t_ds_task_instance
+  WHERE process_instance_id=${INST} AND REPLACE(name,'\t','')='dqc_lake_ods' LIMIT 1;")"
+DQ_ODS_STATE="$(node_state dqc_lake_ods)"
+DQ_ODS_RESULT=""; DQ_ODS_CHECKS=""; DQ_ODS_ORDERS=""; DQ_ODS_EVENTS=""; DQ_ODS_DUP=""
+DQ_ODS_LOG="${INST_LOG_DIR}/${DQ_ODS_ID}.log"
+if [[ -n "${INST_LOG_DIR:-}" && -f "${DQ_ODS_LOG}" ]]; then
+  DQ_ODS_RESULT="$(grep -o 'DQC_RESULT|[A-Z]*' "${DQ_ODS_LOG}" | tail -1 | cut -d'|' -f2)"
+  DQ_ODS_CHECKS="$(grep -o 'checks=[0-9]*' "${DQ_ODS_LOG}" | tail -1 | cut -d= -f2)"
+  DQ_ODS_ORDERS="$(grep -o 'orders=[0-9][0-9]*' "${DQ_ODS_LOG}" | head -1 | cut -d= -f2)"
+  DQ_ODS_EVENTS="$(grep -o 'events=[0-9][0-9]*' "${DQ_ODS_LOG}" | head -1 | cut -d= -f2)"
+  DQ_ODS_DUP="$(grep -o 'ratio=[0-9.]*' "${DQ_ODS_LOG}" | tail -1 | cut -d= -f2)"
+fi
+if [[ -z "${DQ_ODS_RESULT}" ]]; then
+  [[ "${DQ_ODS_STATE:-}" == 7 ]] && DQ_ODS_RESULT="OK(from-state)" || DQ_ODS_RESULT="UNKNOWN"
+  NOTES+=("dqc-ods-log-missing")
+fi
+
 # ---------- 3) 对账结果（recon 节点日志里的 RECON_RESULT|OK|checks=26|range=...）----------
 RECON_ID="$(ds_sql "SELECT id FROM t_ds_task_instance
   WHERE process_instance_id=${INST} AND REPLACE(name,'\t','')='recon_lake_wh' LIMIT 1;")"
@@ -139,10 +160,10 @@ WH_MB="$(docker exec "$SPARK_CT" du -sb /opt/offline-dw/lake/warehouse 2>/dev/nu
 # ---------- 5) 追加一行（表头只写一次）----------
 mkdir -p "$OUT_DIR"
 if [[ ! -s "$OUT" ]]; then
-  echo "dt,run_date,instance_id,flow_state,duration_s,nodes_ok,nodes_fail,dqc_order_state,dqc_dim_state,recon_state,recon_result,recon_checks,ods_order_rows,ods_event_rows,dwd_detail_rows,dwd_lifecycle_rows,snapshots_max,kafka_order_msgs,kafka_event_msgs,warehouse_mb,notes" > "$OUT"
+  echo "dt,run_date,instance_id,flow_state,duration_s,nodes_ok,nodes_fail,dqc_order_state,dqc_dim_state,recon_state,recon_result,recon_checks,ods_order_rows,ods_event_rows,dwd_detail_rows,dwd_lifecycle_rows,snapshots_max,kafka_order_msgs,kafka_event_msgs,warehouse_mb,dq_ods_state,dq_ods_result,dq_ods_orders,dq_ods_events,dq_ods_dup,notes" > "$OUT"
 fi
 NOTE_STR="$(IFS=';'; echo "${NOTES[*]:-}")"
-echo "${DT},${RUN_DATE},${INST},${FLOW_STATE},${DUR_S},${NODES_OK},${NODES_FAIL},${DQC_ORDER:-?},${DQC_DIM:-?},${RECON_STATE:-?},${RECON_RESULT},${RECON_CHECKS:-?},${ODS_ORDER},${ODS_EVENT},${DWD_DETAIL},${DWD_LIFECYCLE},${SNAPSHOTS_MAX},${K_ORDER},${K_EVENT},${WH_MB},${NOTE_STR}" >> "$OUT"
+echo "${DT},${RUN_DATE},${INST},${FLOW_STATE},${DUR_S},${NODES_OK},${NODES_FAIL},${DQC_ORDER:-?},${DQC_DIM:-?},${RECON_STATE:-?},${RECON_RESULT},${RECON_CHECKS:-?},${ODS_ORDER},${ODS_EVENT},${DWD_DETAIL},${DWD_LIFECYCLE},${SNAPSHOTS_MAX},${K_ORDER},${K_EVENT},${WH_MB},${DQ_ODS_STATE:-?},${DQ_ODS_RESULT},${DQ_ODS_ORDERS:--},${DQ_ODS_EVENTS:--},${DQ_ODS_DUP:--},${NOTE_STR}" >> "$OUT"
 
 # ---------- 6) 摘要（进 DS 节点日志）----------
 echo "=========================================================================="
@@ -150,6 +171,7 @@ echo "巡检台账 ${DT}  写入 ${OUT}"
 echo "  实例 ${INST}  state=${FLOW_STATE}  耗时 ${DUR_S}s  节点 ${NODES_OK} 绿 / ${NODES_FAIL} 红"
 echo "  DQC 订单=${DQC_ORDER:-?}  商品=${DQC_DIM:-?}   对账=${RECON_STATE:-?} (${RECON_RESULT}, checks=${RECON_CHECKS:-?})   维护=${MAINTAIN_STATE:-?}"
 echo "  湖表行数  ods_order=${ODS_ORDER}  ods_event=${ODS_EVENT}  dwd_detail=${DWD_DETAIL}  lifecycle=${DWD_LIFECYCLE}  最大快照数=${SNAPSHOTS_MAX}"
+echo "  湖侧 ODS 闸门 state=${DQ_ODS_STATE:-?} ${DQ_ODS_RESULT} checks=${DQ_ODS_CHECKS:-?} orders=${DQ_ODS_ORDERS:--} events=${DQ_ODS_EVENTS:--} dup=${DQ_ODS_DUP:--}"
 echo "  Kafka 现存消息 order=${K_ORDER} event=${K_EVENT}   仓库=${WH_MB} MB   备注=${NOTE_STR:-无}"
 echo "--------------------------------------------------------------------------"
 tail -3 "$OUT"

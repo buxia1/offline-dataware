@@ -94,20 +94,21 @@
 > ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
 > （实测 `t_ds_schedules` id 7）。每天 02:00 这一跑失败会发通知。
 
-**每天 10 个节点**（1 → 2 → 3 → 4 → 5 串行；6 / 7 / 8 并行挂在 5 之后；9 挂在 6 / 7 / 8 全部结束之后；10 挂在 9 之后）：
+**每天 11 个节点**（1 → 2 → 3 → 4 → 5 → 6 串行；7 / 8 / 9 并行挂在 6 之后；10 挂在 7 / 8 / 9 全部结束之后；11 挂在 10 之后）：
 
 | # | 节点 | 脚本 | 建议超时 |
 |---|---|---|---|
 | 1 | `lake_ods_replay` | `D="${system.biz.date}"` + `bash scripts/lake/lake_ods_replay.sh --date "${D:0:4}-${D:4:2}-${D:6:2}"` | 30 min |
 | 2 | `lake_ods_product` | `bash scripts/lake/run_ods_product.sh file "/opt/offline-dw/data/dim/product_snapshot_${system.biz.date}.csv"` | 15 min |
-| 3 | `lake_dim_build` | `bash scripts/lake/run_dim.sh build` | 15 min |
-| 4 | `lake_dwd_incremental` | `bash scripts/lake/run_dwd.sh incremental all --lookback 3` | 60 min |
-| 5 | `wh_dws_ads_materialize` | `bash scripts/run_dws_ads_from_lake.sh`（**永不传 `--truncate`**） | 30 min |
-| 6 | `dqc_order_chain` | `bash scripts/dqc_order_chain.sh ${system.biz.date}` | 10 min |
-| 7 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
-| 8 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
-| 9 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --auto`（平时只盘点、**周日**才自动 `--expire --keep 5`；脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
-| 10 | `lake_ops_ledger` | `bash scripts/ops/ops_ledger.sh ${system.biz.date}`（每天往 `ds/logs/ops/ledger.csv` 追加一行巡检台账，只记录不判断）| 5 min |
+| 3 | `dqc_lake_ods` | `bash scripts/dqc_lake_ods.sh ${system.biz.date}`（**湖侧 ODS 闸门**：6 项检查，坏数据就地拦住、不往下游灌）| 10 min |
+| 4 | `lake_dim_build` | `bash scripts/lake/run_dim.sh build` | 15 min |
+| 5 | `lake_dwd_incremental` | `bash scripts/lake/run_dwd.sh incremental all --lookback 3` | 60 min |
+| 6 | `wh_dws_ads_materialize` | `bash scripts/run_dws_ads_from_lake.sh`（**永不传 `--truncate`**） | 30 min |
+| 7 | `dqc_order_chain` | `bash scripts/dqc_order_chain.sh ${system.biz.date}` | 10 min |
+| 8 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
+| 9 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
+| 10 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --auto`（平时只盘点、**周日**才自动 `--expire --keep 5`；脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
+| 11 | `lake_ops_ledger` | `bash scripts/ops/ops_ledger.sh ${system.biz.date}`（每天往 `ds/logs/ops/ledger.csv` 追加一行巡检台账，只记录不判断）| 5 min |
 
 **端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；实例 347（v7，9 节点）**4 分 16 秒**（其中 `lake_maintain` 43 秒）；**v8（10 节点，2026-10-18 上线）**首次全绿 = 实例 398 （2026-10-19 09:55:09 → 09:59:29）**260 秒** —— 这就是性能优化的起点。
 
@@ -120,6 +121,8 @@
 | **W4+W7** | **401** | **117 秒（1 分 57 秒）** | `local[2]`→`local[4]` + `shuffle.partitions` 200→32；`lake_ods_replay.py` 在 filter 后加 `.cache()`（Kafka 从读 5 遍变读 1 遍）|
 
 逐节点（398 → 401）：`replay 85→25` / `product 16→13` / `dim 39→15` / `dwd 59→29` / `maintain 40→13` / `ledger 5→5` / 其余不变。**数据零变化**：湖表 `900,000 / 3,113,577 / 854,844 / 900,000`、对账 26 项 OK、两个 DQC 全通过、台账 9 绿 0 红。
+
+**v10（11 节点，2026-10-19 上线）**：第 3 个节点新增 **`dqc_lake_ods`（湖侧 ODS 闸门）** —— 实例 **403**（17:19:01 → 17:20:55，v10 首跑）11/11 全绿 **114 秒**，闸门节点只花 **1 秒**（6 项检查全 ✅）。
 
 > 剩下约 45 秒是「5 个节点各启动一次 Spark」的固定成本；再压只能合并节点（牺牲失败隔离），建议到此为止。
 
@@ -630,14 +633,16 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 健康检查全部 `release_state=0`（离线留档）：
 
 ```
-┌─ ⭐ offline_dataware_lake（当前生产链路，每天 02:00，release_state=1，v8 十节点）┐
-│  lake_ods_replay → lake_ods_product → lake_dim_build → lake_dwd_incremental →   │
-│       Shell             Shell            Shell              Shell               │
-│   → wh_dws_ads_materialize → { dqc_order_chain ∥ dqc_dim_product ∥ recon_lake_wh } │
-│          Shell                    Shell              Shell            Shell       │
-│   → lake_maintain → lake_ops_ledger                                             │
-│          Shell             Shell                                                │
-│  ⚠️ exec_type=1 串行等待；6/7/8 并行挂在 5 之后，9 等它们结束、10 挂在 9 之后（详见「当前生产链路」）│
+┌─ ⭐ offline_dataware_lake（当前生产链路，每天 02:00，release_state=1，v10 十一节点）┐
+│  lake_ods_replay → lake_ods_product → dqc_lake_ods → lake_dim_build →           │
+│       Shell            Shell              Shell           Shell                 │
+│   → lake_dwd_incremental → wh_dws_ads_materialize →                             │
+│          Shell                    Shell                                         │
+│   → { dqc_order_chain ∥ dqc_dim_product ∥ recon_lake_wh } → lake_maintain →     │
+│         Shell            Shell              Shell            Shell              │
+│   → lake_ops_ledger                                                             │
+│          Shell                                                                  │
+│  ⚠️ exec_type=1 串行等待；7/8/9 并行挂在 6 之后，10 等它们结束、11 挂在 10 之后（详见「当前生产链路」）│
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1232,6 +1237,7 @@ Kafka (ods_order_event / ods_order)
 | 31 | **dim 表每天 `DROP`+`CREATE` 重建会「毒化」StarRocks 的 Iceberg 元数据缓存** | `lake_dim.sql` 重建表后 Iceberg 元数据从 `v1` 重新编号、旧目录被 purge，而 FE 按**路径**缓存元数据（`iceberg_metadata_memory_cache_expiration_seconds` 默认 86500 秒 ≈ 24h）→ 缓存命中重建前的 snapshot → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。**`REFRESH EXTERNAL TABLE` 清不掉这层缓存**（2026-10-19 实测：两个 DQC 都带 REFRESH 仍失败；把 `iceberg_metadata_memory_cache_capacity` 调 0 也排不空已有条目） | `scripts/lake/sr_catalog_reset.sh`：`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），实测 **1 秒**恢复（`dim_product_scd2` 4500 行 / `dim_product` 50 行）；已内置在 `run_dim.sh`：**建表 + 灌数都完成之后**自动跑（`dry` 模式不跑），重置失败则节点失败 |
 | 32 | **Spark 的 Kafka source 每个 action 都会重读全量 topic** | `lake_ods_replay.py` 一次运行有 5 个 action（4 次 `count()` + 1 次 `INSERT OVERWRITE`），每个都会重读一遍 Kafka：310 万条消息解析 5 遍，实测 replay 77 秒里一半以上耗在这 | filter 到目标日之后立刻 `.cache()`（此时只剩 1 天 ≈ 3.5 万行，内存可忽略）→ **77 秒 → 26 秒**，指标逐项不变。自查方法：数同一个 DataFrame 被几个 action 消费 |
 | 33 | **容器 6 核却默认 `local[2]` + `spark.sql.shuffle.partitions=200`** | 一天 1 万单被切成 200 个任务，每个只有几十 KB，调度和产出小文件的开销大于计算本身 | `_spark_lib.sh` 与 `lake_ods_replay.sh` 统一改 `local[4]` + `shuffle.partitions=32`（可用 `SPARK_MASTER` / `SPARK_SHUFFLE` 环境变量覆盖回滚）：dwd 51→30 秒、replay 77→53 秒，内存峰值 <1.1 GiB / 2 GiB。⚠️ **别再加线程**：spark 容器 `mem_limit=2g`，加线程只会 GC 抖动 |
+| 34 | **StarRocks 3.5 读 external catalog 时，标量子查询不匹配任何分区会返回 `NULL` 而不是 `0`** | `SELECT (SELECT count(*) FROM lake.dwd.dwd_order_detail WHERE dt='2026-01-01')` 在该分区不存在时是 `NULL`；DQC 里「等于 0 就通过 / 就失败」的判据会静默失效（`NULL` 与任何值比较都返回 UNKNOWN，判据会整体落空） | 判据统一套 `IFNULL(sub, 0)`；比例类再套 `NULLIF(分母, 0)`。写 `sql/dqc/dqc_lake_ods.sql` 时实测踩到，已全部包 `IFNULL` |
 
 ### 湖层已落地的组件
 
@@ -1363,7 +1369,7 @@ CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order',
 wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/ops/ledger.csv'
 ```
 
-**21 列**（`dt` = 业务日期，`run_date` = 实跑日期 = dt+1）：
+**26 列**（`dt` = 业务日期，`run_date` = 实跑日期 = dt+1；末 5 列 `dq_ods_*` 自 2026-10-19 起记录湖侧 ODS 闸门）：
 
 | 列 | 含义 / 异常长相 |
 |---|---|
@@ -1375,14 +1381,15 @@ wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/o
 | `snapshots_max` | 8 张表里最多的快照数，常驻 > 10 说明维护没跑成 |
 | `kafka_order_msgs` `kafka_event_msgs` | Kafka 现存消息数（≈ 累计产出），某天不涨 = 生产端停了 |
 | `warehouse_mb` | 湖仓体积，正常缓慢增长 |
-| `notes` | 解析告警：`no-maintain-log` / `recon-log-missing` / `du-failed`；空 = 全部解析正常 |
+| `notes` | 解析告警：`no-maintain-log` / `recon-log-missing` / `du-failed` / `dqc-ods-log-missing`；空 = 全部解析正常 |
+| `dq_ods_state` `dq_ods_result` `dq_ods_orders` `dq_ods_events` `dq_ods_dup` | 湖侧 ODS 闸门（第 3 个节点）的 state / `OK`·`FAIL` / 订单数 / 事件数 / 重复率；解析不到时记 `-`，并在 `notes` 写 `dqc-ods-log-missing` |
 
 **不重跑 Spark**：湖表行数直接从当天 `lake_maintain` 节点的日志解析（它本来就打印每张表的
 快照/文件/行数），对账从 `recon_lake_wh` 日志抓 `RECON_RESULT|OK|checks=26` —— 整个节点 **3 秒**
-跑完。实测回放实例 349 得到的一行：
+跑完。实测（实例 403，26 列）：
 
 ```
-2026-10-17,2026-10-18,349,7,442,9,0,7,7,7,OK,26,900000,3115274,854844,900000,5,910000,3120421,115.0,
+2026-10-18,2026-10-19,403,7,108,10,0,7,7,7,OK,26,900000,3113577,854844,900000,15,910000,3120421,134.2,7,OK,10000,33622,1.0000,
 ```
 
 **数「连续 N 天零差异」**（第 11 列是 `recon_result`）：
@@ -1773,7 +1780,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
          再上一档数据量前必须修
 
 **第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 已完成
-（定时 02:00 已上线、告警已配、湖表维护第 9 个节点、巡检台账第 10 个节点）
+（定时 02:00 已上线、告警已配、湖侧 ODS 闸门第 3 个节点、湖表维护第 10 个节点、巡检台账第 11 个节点）
 
 - [x] **方案 C 落地** —— `run_dwd.sh` / `run_dim.sh` 改为常驻 `docker exec spark`（不再 `docker run`
       临时容器），串行锁移到容器内 `/tmp/.spark_job.lock`
@@ -1782,11 +1789,16 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 - [x] **商品快照进湖** —— `scripts/lake/run_ods_product.sh`（CSV → `lake.ods.ods_product`，
       `snapshot_date` 由文件名解析，`DELETE + append` 幂等）；短期继续吃 CSV，不改成实时流
 - [x] **DQC 指向湖侧** —— `dqc_order_chain.sh` / `dqc_dim_product.sh` 改为校验 `lake.*`
+- [x] **湖侧 ODS 闸门** ✅ **2026-10-19 完成** —— 新增 `scripts/dqc_lake_ods.sh` + `sql/dqc/dqc_lake_ods.sql`
+      （6 项：订单行数下界 / 订单主键重复 / 事件去重对数 / 事件行数下界 / 数值合法性 / 覆盖日期下界），
+      插在 `lake_ods_product` 之后、`lake_dim_build` 之前 —— **坏数据就地拦住，不往湖里灌**；
+      实测实例 403 本节点 **1 秒**、6/6 通过（`DQC_RESULT|OK|checks=6|dt=2026-10-18|C1=1|...`）
 - [x] **湖↔仓对账作业** —— `scripts/recon_lake_wh.sh`（水位 / 湖侧闭合 / 整行对称差 / 覆盖与硬基线
       四层；只读），实测自测 **9/9 通过**、全区间 **3.1 秒**，已挂进工作流
 - [x] **新工作流建成并端到端跑通** —— `offline_dataware_lake` v5（8 节点，实例 346 全绿 **3 分 34 秒**）
       → **v7（9 节点，加 `lake_maintain`，实例 347 全绿 **4 分 16 秒**，2026-10-16）**
       → **v8（10 节点，加 `lake_ops_ledger` 巡检台账，2026-10-18 上线）**
+      → **v10（11 节点，加 `dqc_lake_ods` 湖侧 ODS 闸门，2026-10-19 上线）**
 - [x] **StarRocks 元数据缓存重置** ✅ 2026-10-19 —— 新增 `scripts/lake/sr_catalog_reset.sh`
       （`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`，实测 1 秒恢复），
       并内置进 `run_dim.sh`（建表+灌数后自动跑）；根因见坑表第 31 条 —— dim 表每天 `DROP`+`CREATE`，
