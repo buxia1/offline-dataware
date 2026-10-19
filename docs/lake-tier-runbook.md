@@ -265,7 +265,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   `lake.dim.*` 的查询会命中**重建前的旧 snapshot** → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。
   `REFRESH EXTERNAL TABLE` 清不掉这层缓存（2026-10-19 实测两次均失败），要把 catalog 重建一次：
   `scripts/lake/sr_catalog_reset.sh`（`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`，
-  只重建定义、不动湖数据，实测 1 秒恢复 4500/50 行）。已内置在 `run_dim.sh` 的 `build`/`ddl` 分支，
+  只重建定义、不动湖数据，实测 1 秒恢复 4500/50 行）。已内置在 `run_dim.sh`（建表+灌数完成后自动跑，`dry` 不跑），
   DS 节点不用改命令；重置失败会直接让节点失败（不会带着坏缓存往下跑）。
 - **Kafka 保留期 = 重放窗口上限，30 天**（2026-10-18 实测）：broker `log.retention.hours=720`，
   两个 topic 无覆盖配置；`lake_ods_replay.py` 是 `startingOffsets=earliest` **全量重读**，
@@ -356,7 +356,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       台账 = `ds/logs/ops/ledger.csv`；「连续 7 天零差异」从 2026-10-19 那跑起算，最早 10-25 出数。
 - [x] **StarRocks 元数据缓存有解药** ✅ 2026-10-19 —— `scripts/lake/sr_catalog_reset.sh`
       （`DROP CATALOG` + `CREATE CATALOG`，实测 1 秒、`dim_product_scd2` 4500 行 / `dim_product` 50 行），
-      已内置进 `run_dim.sh` 的 `build`/`ddl`；原因是 dim 表每天 `DROP`+`CREATE` 会让 FE 缓存命中
+      已内置进 `run_dim.sh`（建表+灌数后自动跑）；原因是 dim 表每天 `DROP`+`CREATE` 会让 FE 缓存命中
       已 purge 的旧 snapshot，`REFRESH EXTERNAL TABLE` 对此无效（实例 379 失败即此）
 - [x] 口径已拍板（2026-10-18）：**保留现状** —— 明细层过滤（854,844 = 900,000 − 45,156），
       快照层 / ODS 保留全量（NULL 45,187 / 45,156）；

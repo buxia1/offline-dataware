@@ -62,6 +62,15 @@ if [ "$MODE" = "build" ] || [ "$MODE" = "dry" ]; then
     | grep -vE "$FILTER" || { echo "!!! dim build FAILED"; exit 1; }
 fi
 
+# ★ 放在「建表 + 灌数」都完成之后、且在串行锁内：dim 表是 DROP+CREATE 重建的，
+#   写完数据再清 StarRocks 的元数据缓存，之后任何读取（行数校验 / DQC）拿到的都是最新元数据；
+#   重置失败直接让节点失败，绝不带着坏缓存往下跑。
+if [ "$MODE" != "dry" ]; then
+  echo "########## 清理 StarRocks 侧元数据缓存（重建完成后，锁内） ##########"
+  bash "$HERE/sr_catalog_reset.sh" \
+    || { echo "!!! StarRocks catalog 重置失败（不带着坏缓存往下跑）" >&2; exit 1; }
+fi
+
 echo "########## 湖侧维度层行数 ##########"
 docker exec "$SPARK_CT" "${SPARK_SQL[@]}" -e "
   SELECT 'scd2' t, count(*) n FROM lake.dim.dim_product_scd2

@@ -1211,7 +1211,7 @@ Kafka (ods_order_event / ods_order)
 | 28 | **别用 JDBC 写仓** | 实测 9,475 行耗 **467 秒**（≈20 行/秒），90 万行要 ≈13 小时 | 用 Stream Load：854,844 行 **34 秒** |
 | 29 | **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`** | `expire_snapshots` 清掉旧快照后，FE 缓存的元数据仍指向已删除的数据文件 → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`；而下一轮全流程（物化前会 REFRESH）又自愈，看着像「偶发」 | 两个 DQC 脚本已内置 `REFRESH`（`dim_product_scd2` / `dwd_order_sku_detail` / `dwd_order_detail` / `ods_order`）；实测清完快照立刻跑，两个 DQC 都 `EXIT=0`。⚠️ 只治「快照被 expire」这一类；**表被 `DROP`+`CREATE` 重建**造成的缓存中毒它清不掉（2026-10-19 实测两次均失败），见第 31 条 |
 | 30 | **`fe.conf` 每次重启都会多一行 `priority_networks`** | FE entrypoint 无条件追加，`git status` 每次多一行 diff；同值重复、后写的生效，**不影响运行** | 提交前 `git checkout -- starrocks/fe/conf/fe.conf` 还原；别为它去改 entrypoint |
-| 31 | **dim 表每天 `DROP`+`CREATE` 重建会「毒化」StarRocks 的 Iceberg 元数据缓存** | `lake_dim.sql` 重建表后 Iceberg 元数据从 `v1` 重新编号、旧目录被 purge，而 FE 按**路径**缓存元数据（`iceberg_metadata_memory_cache_expiration_seconds` 默认 86500 秒 ≈ 24h）→ 缓存命中重建前的 snapshot → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。**`REFRESH EXTERNAL TABLE` 清不掉这层缓存**（2026-10-19 实测：两个 DQC 都带 REFRESH 仍失败；把 `iceberg_metadata_memory_cache_capacity` 调 0 也排不空已有条目） | `scripts/lake/sr_catalog_reset.sh`：`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），实测 **1 秒**恢复（`dim_product_scd2` 4500 行 / `dim_product` 50 行）；已内置在 `run_dim.sh` 的 `build` / `ddl` 分支（重置失败则节点失败，绝不带着坏缓存往下跑） |
+| 31 | **dim 表每天 `DROP`+`CREATE` 重建会「毒化」StarRocks 的 Iceberg 元数据缓存** | `lake_dim.sql` 重建表后 Iceberg 元数据从 `v1` 重新编号、旧目录被 purge，而 FE 按**路径**缓存元数据（`iceberg_metadata_memory_cache_expiration_seconds` 默认 86500 秒 ≈ 24h）→ 缓存命中重建前的 snapshot → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。**`REFRESH EXTERNAL TABLE` 清不掉这层缓存**（2026-10-19 实测：两个 DQC 都带 REFRESH 仍失败；把 `iceberg_metadata_memory_cache_capacity` 调 0 也排不空已有条目） | `scripts/lake/sr_catalog_reset.sh`：`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），实测 **1 秒**恢复（`dim_product_scd2` 4500 行 / `dim_product` 50 行）；已内置在 `run_dim.sh`：**建表 + 灌数都完成之后**自动跑（`dry` 模式不跑），重置失败则节点失败 |
 
 ### 湖层已落地的组件
 
@@ -1222,7 +1222,7 @@ Kafka (ods_order_event / ods_order)
 | 湖层表 | `lake/warehouse/ods/` | `file:///opt/offline-dw/lake/warehouse`，StarRocks 用 external catalog `lake` 直读 |
 | 巡检台账 | `scripts/ops/ops_ledger.sh` | 每天往 `ds/logs/ops/ledger.csv` 追加一行：链路状态 / 三个闸门 state / 湖表行数 / 快照数 / Kafka 消息数 / 仓库体积。**从 DS 实例日志解析，不重跑 Spark**（3 秒）；只记录、不判断 |
 | 维护脚本 | `scripts/lake/lake_maintain.py` + `run_maintain.sh` | **自动枚举** `lake.ods/dim/dwd` 全部表（当前 8 张）：只读盘点 / `--expire --keep N` 清历史快照 / `--tables a,b` 限定表。清理后**自验「快照数下降 且 行数不变」**，不达标退出码 1（可直接挂 DS 告警）|
-| StarRocks 元数据缓存 | `scripts/lake/sr_catalog_reset.sh` | `DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），清掉 FE 里按路径缓存的 Iceberg 元数据。**dim 表每天 `DROP`+`CREATE` 重建后必须清**，否则 FE 缓存命中已 purge 的旧 snapshot → `[1064] ... File does not exist`；已内置在 `run_dim.sh` 的 `build`/`ddl` 分支（实测 1 秒）|
+| StarRocks 元数据缓存 | `scripts/lake/sr_catalog_reset.sh` | `DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），清掉 FE 里按路径缓存的 Iceberg 元数据。**dim 表每天 `DROP`+`CREATE` 重建后必须清**，否则 FE 缓存命中已 purge 的旧 snapshot → `[1064] ... File does not exist`；已内置在 `run_dim.sh`（`build`/`ddl` 跑完自动清，实测 1 秒）|
 
 **实测（2026-10-14，90 天全量）**：`ods_order` 90 个 dt 分区 / 900,000 行；
 `ods_order_event` 2,969,579 行。湖↔仓逐 key 差集**双向为 0**（见下方推进清单第 1 步）。
@@ -1768,7 +1768,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       → **v8（10 节点，加 `lake_ops_ledger` 巡检台账，2026-10-18 上线）**
 - [x] **StarRocks 元数据缓存重置** ✅ 2026-10-19 —— 新增 `scripts/lake/sr_catalog_reset.sh`
       （`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`，实测 1 秒恢复），
-      并内置进 `run_dim.sh` 的 `build`/`ddl` 分支；根因见坑表第 31 条 —— dim 表每天 `DROP`+`CREATE`，
+      并内置进 `run_dim.sh`（建表+灌数后自动跑）；根因见坑表第 31 条 —— dim 表每天 `DROP`+`CREATE`，
       FE 按路径缓存的 Iceberg 元数据会命中已 purge 的旧 snapshot，`REFRESH` 治不了
 - [x] **定时上线** ✅ **2026-10-16 完成** —— `t_ds_schedules` id 7 `release_state=1`，
       每天 02:00 会自动跑
