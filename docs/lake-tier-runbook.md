@@ -353,7 +353,9 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] **巡检台账已进调度** ✅ 2026-10-18 —— `offline_dataware_lake` **v8** 第 10 个节点
       `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，超时 5 min，
       前置 = `lake_maintain`）；实测 3 秒、回放实例 349 得一行、`notes` 为空。
-      台账 = `ds/logs/ops/ledger.csv`；「连续 7 天零差异」从 2026-10-19 那跑起算，最早 10-25 出数。
+      台账 = `ds/logs/ops/ledger.csv`；**首次真实写入 = 实例 398**（2026-10-19 09:59，`dt=2026-10-18`、`flow_state=7`、260 秒、`recon OK` / 26 项、`notes` 空）。
+      「连续 7 天零差异」按 `dt` 数：从 `dt=2026-10-18` 这行起算，凑满 7 行最早要 10-25。
+      ⚠️ 台账读的时候流程自己还在 `RUNNING`，所以 `flow_state` 是用其余 9 个节点推断的、`duration_s` 是「启动至今」（比最终值少约 5 秒）、`nodes_*` 不含台账自己。
 - [x] **StarRocks 元数据缓存有解药** ✅ 2026-10-19 —— `scripts/lake/sr_catalog_reset.sh`
       （`DROP CATALOG` + `CREATE CATALOG`，实测 1 秒、`dim_product_scd2` 4500 行 / `dim_product` 50 行），
       已内置进 `run_dim.sh`（建表+灌数后自动跑）；原因是 dim 表每天 `DROP`+`CREATE` 会让 FE 缓存命中

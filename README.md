@@ -112,7 +112,7 @@
 **端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；加维护节点后实例 347
 （v7，2026-10-16 16:55:15 → 16:59:31）**9 个节点全绿、4 分 16 秒**，其中 `lake_maintain` 占 43 秒；
 收尾数据 `dwd_order_detail 854,844` / `dws 18,000` / `ads 90`。
-**v8（10 节点）2026-10-18 上线**：只加了台账节点，实测 3 秒级，总时长基本不变；首个定时运行 10-19 02:00。
+**v8（10 节点）2026-10-18 上线**：只加了台账节点，实测 5 秒、总时长基本不变。**首次全绿 = 实例 398（2026-10-19 09:55:09 → 09:59:29，10 个节点全绿 / 260 秒）**；10-19 02:00 那次定时因容器 08:47 才启动而没触发，首次真实运行是手动触发这一次。
 
 > 节点名带前导 Tab 的 4 个（`lake_dim_build` / `lake_dwd_incremental` / `wh_dws_ads_materialize` /
 > `dqc_order_chain`）是 UI 里手误带进去的，纯外观、不影响执行，不建议为它专门改版本。
@@ -1347,7 +1347,7 @@ wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/o
 | 列 | 含义 / 异常长相 |
 |---|---|
 | `dt` `run_date` `instance_id` | 业务日期 / 实跑日期 / DS 实例号 |
-| `flow_state` `duration_s` `nodes_ok` `nodes_fail` | 链路健康：`7` 成功；耗时突然翻倍 = 性能回归 |
+| `flow_state` `duration_s` `nodes_ok` `nodes_fail` | 链路健康：`7` 成功；耗时突然翻倍 = 性能回归。⚠️ 台账是**最后一个节点**，读的时候流程自己还在 `RUNNING`（`end_time` 为空）—— 所以 `flow_state` 用**其余 9 个节点是否全绿**推断（全绿记 `7`）、`duration_s` 取「启动至今」（比最终值少约 5 秒）、`nodes_ok`/`nodes_fail` **不含台账自己** |
 | `dqc_order_state` `dqc_dim_state` `recon_state` | 三个闸门节点的 state，非 `7` 就是挂了 |
 | `recon_result` `recon_checks` | `OK` / `26`；`checks` 变少 = 有检查被跳过 |
 | `ods_order_rows` `ods_event_rows` `dwd_detail_rows` `dwd_lifecycle_rows` | 湖表行数，某天掉一半 = 丢数 |
@@ -1684,9 +1684,9 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
          `WHERE code = 23385597001344` 返回 `7 / 1`
 - [x] **巡检台账进调度** ✅ **2026-10-18 完成** —— `offline_dataware_lake` **v8** 第 10 个节点
       `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，
-      超时 5 min，前置 = `lake_maintain`）—— 脚本实测 3 秒、回放实例 349 得一行、`notes` 为空
+      超时 5 min，前置 = `lake_maintain`）—— 脚本实测 5 秒、回放实例 349 得一行、`notes` 为空；**首次真实写入 = 实例 398**（`dt=2026-10-18`，`recon OK` / 26 项，`notes` 空）
       —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
-         `WHERE code = 23385597001344` 返回 `8 / 1`；首个定时写入 2026-10-19 02:00
+         `WHERE code = 23385597001344` 返回 `8 / 1`；首个定时写入原定 2026-10-19 02:00（容器 08:47 才启动、未触发），首次实际写入 2026-10-19 09:59（实例 398）
 - [ ] **双写（Routine Load + 湖层）** —— **有意不做**：湖层是**离线重放**，避免两份摄入成本与语义分歧
       —— 2026-10-14 补充：湖层已从「只读旁路」扩为 **ODS/DIM/DWD/DWS/ADS 全分层镜像**（见「第 3 步」）
       —— 代价：湖层**不是**仓库的实时镜像。实测 2026-10-14 仓侧 raw 3,120,421 行 vs

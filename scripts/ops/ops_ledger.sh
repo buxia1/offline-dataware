@@ -12,6 +12,10 @@
 # 设计约束（DS 容器里只有这些能用）：
 #   · 只有 docker.sock（可 docker exec），没有挂载湖仓盘 → 湖表行数/快照数
 #     从【本实例 lake_maintain 节点的日志】解析，不重跑 Spark、零额外开销
+#   · 节点统计**排除台账节点自己**：它是流程最后一个节点，读的时候自己还在 RUNNING，
+#     否则会被算成 nodes_fail=1（2026-10-19 实例 398 实测踩到）
+#   · 读的时候流程本身也还在 RUNNING（end_time 为空）→ flow_state 用「其余节点是否全绿」
+#     推断（全绿=7 / 否则=6），duration 取「启动至今」
 #   · 退出码：0 写入成功；1 取不到实例（流程没跑 / DS 元数据库连不上）
 # ============================================================================
 set -uo pipefail
@@ -29,7 +33,7 @@ KAFKA_CT="kafka"
 SPARK_CT="spark"
 LOG_ROOT="/opt/dolphinscheduler/logs"
 OUT_DIR="${LOG_ROOT}/ops"
-OUT="${OUT_DIR}/ledger.csv"
+OUT="${LEDGER_OUT:-${OUT_DIR}/ledger.csv}"   # 可用 LEDGER_OUT 覆盖（自测/回放用）
 
 ds_sql() { docker exec "$MYSQL_CT" mysql -uroot -proot123 -N -B dolphinscheduler -e "$1" 2>/dev/null; }
 kafka_msgs() {  # $1=topic → 各分区 latest offset 之和（= 主题里现存消息条数）
@@ -60,8 +64,20 @@ read -r FLOW_STATE DUR_S RUN_DATE < <(ds_sql "SELECT state,
     COALESCE(TIMESTAMPDIFF(SECOND, start_time, end_time), -1),
     DATE_FORMAT(start_time, '%Y-%m-%d')
   FROM t_ds_process_instance WHERE id=${INST};" | awk '{print $1, $2, $3}')
+# 节点统计排除台账节点自己（它读的时候还在 RUNNING），否则会误报 nodes_fail=1
 read -r NODES_OK NODES_FAIL < <(ds_sql "SELECT COALESCE(SUM(state=7),0), COALESCE(SUM(state<>7),0)
-  FROM t_ds_task_instance WHERE process_instance_id=${INST};" | awk '{print $1, $2}')
+  FROM t_ds_task_instance WHERE process_instance_id=${INST}
+    AND REPLACE(name,'\t','') <> 'lake_ops_ledger';" | awk '{print $1, $2}')
+
+# 台账是流程最后一个节点 → 流程本身还在 RUNNING、end_time 为空：
+#   flow_state 用「其余节点是否全绿」推断；duration 取「启动至今」
+[[ "${LEDGER_FORCE_RUNNING:-0}" == "1" ]] && DUR_S="-1"   # 自测：模拟「流程还在跑」
+if [[ "${DUR_S}" == "-1" ]]; then
+  DUR_S="$(ds_sql "SELECT TIMESTAMPDIFF(SECOND, start_time, NOW())
+    FROM t_ds_process_instance WHERE id=${INST};")"
+  DUR_S="${DUR_S:-0}"
+  if [[ "${NODES_FAIL}" == "0" ]]; then FLOW_STATE=7; else FLOW_STATE=6; fi
+fi
 
 # 节点名去前导 Tab 后建 name=state 字典
 NODE_STATES="$(ds_sql "SELECT REPLACE(name, '\t', ''), state FROM t_ds_task_instance
