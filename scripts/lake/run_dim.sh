@@ -47,18 +47,19 @@ echo "  SPARK_CT=$SPARK_CT"
 
 spark_acquire_lock
 
-if [ "$MODE" = "ddl" ] || [ "$MODE" = "build" ]; then
+if [ "$MODE" = "ddl" ]; then
   echo "########## 建表：sql/lake/lake_dim.sql（DROP + CREATE 两张 lake.dim 表） ##########"
   docker exec "$SPARK_CT" "${SPARK_SQL[@]}" -f /opt/offline-dw/sql/lake/lake_dim.sql 2>&1 \
     | grep -vE "$FILTER" | grep -E "Time taken|Error" || true
 fi
 
 if [ "$MODE" = "build" ] || [ "$MODE" = "dry" ]; then
-  DRY=""
+  DRY=""; DDL_FLAG=""
   [ "$MODE" = "dry" ] && DRY="--mode dry"
-  echo "########## 构建维度（--table all $DRY） ##########"
+  [ "$MODE" = "build" ] && DDL_FLAG="--ddl"
+  echo "########## 构建维度（--table all $DRY $DDL_FLAG） ##########"
   docker exec "$SPARK_CT" "${SPARK_SUBMIT[@]}" \
-    /opt/offline-dw/scripts/lake/lake_dim_build.py --table all $DRY 2>&1 \
+    /opt/offline-dw/scripts/lake/lake_dim_build.py --table all $DRY $DDL_FLAG 2>&1 \
     | grep -vE "$FILTER" || { echo "!!! dim build FAILED"; exit 1; }
 fi
 
@@ -71,10 +72,9 @@ if [ "$MODE" != "dry" ]; then
     || { echo "!!! StarRocks catalog 重置失败（不带着坏缓存往下跑）" >&2; exit 1; }
 fi
 
-echo "########## 湖侧维度层行数 ##########"
-docker exec "$SPARK_CT" "${SPARK_SQL[@]}" -e "
-  SELECT 'scd2' t, count(*) n FROM lake.dim.dim_product_scd2
-  UNION ALL SELECT 'current', count(*) FROM lake.dim.dim_product;" \
-  2>&1 | grep -vE "$FILTER" || true
+echo "########## 湖侧维度层行数（走 StarRocks，省一次 Spark 启动） ##########"
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot --batch --raw --skip-column-names -e "
+  SELECT 'scd2', count(*) FROM lake.dim.dim_product_scd2
+  UNION ALL SELECT 'current', count(*) FROM lake.dim.dim_product;" 2>&1 || true
 
 echo "########## DONE ##########"

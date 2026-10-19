@@ -26,6 +26,8 @@ SRC = "lake.ods.ods_product"
 T_SCD2 = "lake.dim.dim_product_scd2"
 T_CUR = "lake.dim.dim_product"
 
+DDL_SQL = "/opt/offline-dw/sql/lake/lake_dim.sql"
+
 SENTINEL = "9999-12-31"
 
 # 快照表里参与"变更判定"的属性（与 sql/dim_product_scd2_load.sql 一致）
@@ -90,10 +92,19 @@ def build_current(spark):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--table", default="all", choices=["scd2", "current", "all"])
+    ap.add_argument("--ddl", action="store_true",
+                    help="先执行 sql/lake/lake_dim.sql（DROP+CREATE 两张 dim 表）再构建")
     ap.add_argument("--mode", default="rebuild", choices=["rebuild", "dry"])
     args = ap.parse_args()
 
     spark = build_spark()
+    if args.ddl and args.mode != "dry":
+        with open(DDL_SQL, encoding="utf-8") as f:
+            text = f.read()
+        stmts = [s.strip() for s in text.split(";") if s.strip()]
+        for i, s in enumerate(stmts, 1):
+            spark.sql(s)
+            print("DDL %d/%d 完成" % (i, len(stmts)))
     if args.table in ("scd2", "all"):
         df = build_scd2(spark).cache()
         n = df.count()

@@ -62,15 +62,23 @@ spark_acquire_lock() {
 }
 
 # ---- 容器内标准参数 ----
-# ★ 脚本 / SQL 一律用【容器内路径】：仓库的 scripts/ sql/ lake/ 都已挂进 spark 容器，
-#   所以不再需要 docker cp，也不再受「宿主路径 vs 容器路径」困扰。
-SPARK_SQL=(/opt/spark/bin/spark-sql --master local[2] --driver-memory "${DRIVER_MEM:-1g}" \
+# ★ 并行度（2026-10-19 实测）：容器 6 核；local[2] → local[4] + shuffle 分区 200 → 32
+#   dwd 51s → 30s、replay 77s → 53s，内存峰值 <1.1GiB / 2GiB，无 OOM。
+#   回滚：SPARK_MASTER=local[2] SPARK_SHUFFLE=200 bash scripts/lake/run_dwd.sh ...
+SPARK_MASTER="${SPARK_MASTER:-local[4]}"
+SPARK_SHUFFLE="${SPARK_SHUFFLE:-32}"
+SPARK_TUNE=(--conf "spark.sql.shuffle.partitions=${SPARK_SHUFFLE}"
+            --conf "spark.default.parallelism=${SPARK_SHUFFLE}")
+
+SPARK_SQL=(/opt/spark/bin/spark-sql --master "$SPARK_MASTER" --driver-memory "${DRIVER_MEM:-1g}" \
+  "${SPARK_TUNE[@]}" \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
   --conf spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog \
   --conf spark.sql.catalog.lake.type=hadoop \
   --conf spark.sql.catalog.lake.warehouse=file:///opt/offline-dw/lake/warehouse)
 
-SPARK_SUBMIT=(/opt/spark/bin/spark-submit --master 'local[2]' --driver-memory "${DRIVER_MEM:-1g}" \
+SPARK_SUBMIT=(/opt/spark/bin/spark-submit --master "$SPARK_MASTER" --driver-memory "${DRIVER_MEM:-1g}" \
+  "${SPARK_TUNE[@]}" \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar)
 

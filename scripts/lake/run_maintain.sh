@@ -10,6 +10,7 @@
 #
 # 用法：
 #   bash scripts/lake/run_maintain.sh                       # 只读盘点，零写入（约 15s）
+#   bash scripts/lake/run_maintain.sh --auto        	    # 日常用：只盘点；周日自动加 --expire --keep 5
 #   bash scripts/lake/run_maintain.sh --expire              # 真清理，默认每表保留 5 个快照
 #   bash scripts/lake/run_maintain.sh --expire --keep 3     # 换保留个数
 #   bash scripts/lake/run_maintain.sh --tables dwd_order_detail,ods_product --expire
@@ -42,12 +43,27 @@ echo "########## 湖表维护：$* ##########"
 echo "  PROJ=$PROJ"
 echo "  SPARK_CT=$SPARK_CT"
 
+ARGS=()
+AUTO=0
+for a in "$@"; do
+  if [ "$a" = "--auto" ]; then AUTO=1; else ARGS+=("$a"); fi
+done
+if [ "$AUTO" = "1" ]; then
+  DOW="$(date +%u)"
+  if [ "$DOW" = "7" ]; then
+    echo "  今天周日 → 执行快照清理（--expire --keep 5）"
+    ARGS+=(--expire --keep 5)
+  else
+    echo "  今天是周${DOW} → 只盘点，不清理（周日才清理）"
+  fi
+fi
+
 spark_acquire_lock
 
 # py 的退出码要原样传出去，所以这里临时关掉 -e / pipefail
 set +e
 docker exec "$SPARK_CT" "${SPARK_SUBMIT[@]}" \
-  /opt/offline-dw/scripts/lake/lake_maintain.py "$@" 2>&1 \
+  /opt/offline-dw/scripts/lake/lake_maintain.py ${ARGS[@]+"${ARGS[@]}"} 2>&1 \
   | grep -vE "$FILTER"
 rc=${PIPESTATUS[0]}
 set -e

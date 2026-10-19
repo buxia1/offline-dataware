@@ -93,12 +93,15 @@ else
 fi
 
 echo ""
-echo "########## 湖侧 DWD 行数 + 水位（水位 = 增量下次从这里往后算） ##########"
-docker exec "$SPARK_CT" "${SPARK_SQL[@]}" \
-  -e "SELECT 'dwd_order_detail' t, count(*) n, cast(max(dt) as string) watermark FROM lake.dwd.dwd_order_detail
-      UNION ALL SELECT 'dwd_order_sku_detail', count(*), cast(max(dt) as string) FROM lake.dwd.dwd_order_sku_detail
-      UNION ALL SELECT 'dwd_order_lifecycle', count(*),
-        (SELECT cast(max(dt) as string) FROM lake.ods.ods_order_event) FROM lake.dwd.dwd_order_lifecycle;" \
-  2>&1 | grep -vE "$FILTER" || true
+echo "########## 湖侧 DWD 行数 + 水位（走 StarRocks，省一次 Spark 启动） ##########"
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot --batch --raw --skip-column-names -e "
+  REFRESH EXTERNAL TABLE lake.dwd.dwd_order_detail;
+  REFRESH EXTERNAL TABLE lake.dwd.dwd_order_sku_detail;
+  REFRESH EXTERNAL TABLE lake.dwd.dwd_order_lifecycle;
+  REFRESH EXTERNAL TABLE lake.ods.ods_order_event;
+  SELECT 'dwd_order_detail', count(*), date_format(max(dt),'%Y-%m-%d') FROM lake.dwd.dwd_order_detail
+  UNION ALL SELECT 'dwd_order_sku_detail', count(*), date_format(max(dt),'%Y-%m-%d') FROM lake.dwd.dwd_order_sku_detail
+  UNION ALL SELECT 'dwd_order_lifecycle', count(*),
+      (SELECT date_format(max(dt),'%Y-%m-%d') FROM lake.ods.ods_order_event) FROM lake.dwd.dwd_order_lifecycle;" 2>&1 || true
 
 echo "########## DONE ##########"

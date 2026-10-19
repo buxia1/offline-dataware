@@ -98,7 +98,7 @@ SNAPSHOTS_MAX=0; ODS_ORDER=0; ODS_EVENT=0; DWD_DETAIL=0; DWD_LIFECYCLE=0
 MAINTAIN_LOG="${INST_LOG_DIR}/${MAINTAIN_ID}.log"
 if [[ -n "${INST_LOG_DIR:-}" && -f "${MAINTAIN_LOG}" ]]; then
   # 每行形如：lake.ods.ods_order   快照 5  数据文件 90 (7.8 MB)  清单 12 (0.1 MB)  行数 900000
-  INV="$(sed -n '/维护后/,$p' "${MAINTAIN_LOG}" | grep -E '^[[:space:]]+lake\.' | tail -8 |
+  INV="$(sed -n '/维护前/,$p' "${MAINTAIN_LOG}" | grep -E '^[[:space:]]+lake\.' | tail -8 |
          awk '{snap=0;rows=0; for(i=2;i<=NF;i++){if($i=="快照")snap=$(i+1); if($i=="行数")rows=$(i+1)} print $1, snap, rows}')"
   while read -r TBL SNAP ROWS; do
     [[ -z "${TBL:-}" ]] && continue

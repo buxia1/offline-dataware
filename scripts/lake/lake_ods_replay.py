@@ -92,7 +92,7 @@ def main():
              .withColumn("order_time", F.col("order_time").cast("timestamp_ntz"))
              .withColumn("dt", F.to_date("order_time"))
              .filter(F.col("dt") == F.lit(target).cast("date")))
-
+    order = order.cache()   # ★ 必须缓存：Kafka source 每个 action 都会重读全量 topic
     # ---------- 事件 ----------
     ev = read_topic(spark, TOPIC_EVENT, SCHEMA_EVENT)
     ev = (ev
@@ -100,7 +100,7 @@ def main():
           .withColumn("event_time", F.col("event_time").cast("timestamp_ntz"))
           .withColumn("dt", F.to_date("event_time"))
           .filter(F.col("dt") == F.lit(target).cast("date")))
-
+    ev = ev.cache()   # ★ 同上：后面还有 4 个 action，不缓存就要再读 4 遍 Kafka（实测 77s→26s）
     # 去重口径：按 (dt, order_id, event_type) —— 每天每个 key 只留一行。
     # 【为什么不是 dropDuplicates(["order_id","event_type"])】
     #   那是「整表按 key 去重」，在本进程内（已 filter 到 target 一天）看似等价，

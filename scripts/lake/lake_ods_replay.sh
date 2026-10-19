@@ -47,8 +47,10 @@ done
 JARS="${JARS#,}"
 
 SPARK_ARGS=(
-  --master "local[2]"
+  --master "${SPARK_MASTER:-local[4]}"
   --driver-memory 1g
+  --conf "spark.sql.shuffle.partitions=${SPARK_SHUFFLE:-32}"
+  --conf "spark.default.parallelism=${SPARK_SHUFFLE:-32}"
   --jars "${JARS}"
 )
 
