@@ -260,6 +260,13 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
   （实测：Routine Load 那两个作业 `ods_order_load` / `ods_order_event_load` 至今仍在 RUNNING。）
+- **⚠️ dim 表重建后必须清 StarRocks 元数据缓存**：`sql/lake/lake_dim.sql` 每天 `DROP`+`CREATE`，
+  Iceberg 元数据从头编号、旧目录被 purge；而 FE 按**路径**缓存元数据（默认 ~24h），于是一段时间内
+  `lake.dim.*` 的查询会命中**重建前的旧 snapshot** → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。
+  `REFRESH EXTERNAL TABLE` 清不掉这层缓存（2026-10-19 实测两次均失败），要把 catalog 重建一次：
+  `scripts/lake/sr_catalog_reset.sh`（`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`，
+  只重建定义、不动湖数据，实测 1 秒恢复 4500/50 行）。已内置在 `run_dim.sh` 的 `build`/`ddl` 分支，
+  DS 节点不用改命令；重置失败会直接让节点失败（不会带着坏缓存往下跑）。
 - **Kafka 保留期 = 重放窗口上限，30 天**（2026-10-18 实测）：broker `log.retention.hours=720`，
   两个 topic 无覆盖配置；`lake_ods_replay.py` 是 `startingOffsets=earliest` **全量重读**，
   所以消息一过期就再也补不回来。**按生产时间算**：2026-10-14 一次性回填的 90 天数据
@@ -347,6 +354,10 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，超时 5 min，
       前置 = `lake_maintain`）；实测 3 秒、回放实例 349 得一行、`notes` 为空。
       台账 = `ds/logs/ops/ledger.csv`；「连续 7 天零差异」从 2026-10-19 那跑起算，最早 10-25 出数。
+- [x] **StarRocks 元数据缓存有解药** ✅ 2026-10-19 —— `scripts/lake/sr_catalog_reset.sh`
+      （`DROP CATALOG` + `CREATE CATALOG`，实测 1 秒、`dim_product_scd2` 4500 行 / `dim_product` 50 行），
+      已内置进 `run_dim.sh` 的 `build`/`ddl`；原因是 dim 表每天 `DROP`+`CREATE` 会让 FE 缓存命中
+      已 purge 的旧 snapshot，`REFRESH EXTERNAL TABLE` 对此无效（实例 379 失败即此）
 - [x] 口径已拍板（2026-10-18）：**保留现状** —— 明细层过滤（854,844 = 900,000 − 45,156），
       快照层 / ODS 保留全量（NULL 45,187 / 45,156）；
       判据：`count(*) - count(user_id)` = **0 / 45,187 / 45,156**
