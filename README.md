@@ -106,13 +106,24 @@
 | 6 | `dqc_order_chain` | `bash scripts/dqc_order_chain.sh ${system.biz.date}` | 10 min |
 | 7 | `dqc_dim_product` | `bash scripts/dqc_dim_product.sh` | 10 min |
 | 8 | `recon_lake_wh` | `bash scripts/recon_lake_wh.sh`（退出码 2 = 不一致） | 30 min |
-| 9 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --expire --keep 5`（脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
+| 9 | `lake_maintain` | `bash scripts/lake/run_maintain.sh --auto`（平时只盘点、**周日**才自动 `--expire --keep 5`；脚本自验：快照数下降 且 行数不变，不达标退出码 1）| 15 min |
 | 10 | `lake_ops_ledger` | `bash scripts/ops/ops_ledger.sh ${system.biz.date}`（每天往 `ds/logs/ops/ledger.csv` 追加一行巡检台账，只记录不判断）| 5 min |
 
-**端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；加维护节点后实例 347
-（v7，2026-10-16 16:55:15 → 16:59:31）**9 个节点全绿、4 分 16 秒**，其中 `lake_maintain` 占 43 秒；
-收尾数据 `dwd_order_detail 854,844` / `dws 18,000` / `ads 90`。
-**v8（10 节点）2026-10-18 上线**：只加了台账节点，实测 5 秒、总时长基本不变。**首次全绿 = 实例 398（2026-10-19 09:55:09 → 09:59:29，10 个节点全绿 / 260 秒）**；10-19 02:00 那次定时因容器 08:47 才启动而没触发，首次真实运行是手动触发这一次。
+**端到端实测**：实例 346（2026-10-16，8 节点）全绿 **3 分 34 秒**；实例 347（v7，9 节点）**4 分 16 秒**（其中 `lake_maintain` 43 秒）；**v8（10 节点，2026-10-18 上线）**首次全绿 = 实例 398 （2026-10-19 09:55:09 → 09:59:29）**260 秒** —— 这就是性能优化的起点。
+
+**性能优化三档（2026-10-19，数据零变化）**：
+
+| 档 | 实例 | 总时长 | 关键改动 |
+|---|---|---|---|
+| 起点 | 398（v8） | 260 秒 | — |
+| W1+W2+W3 | 400 | **217 秒** | 少起 Spark（dim 3→1、dwd 2→1，报告查询改走 StarRocks 直读 Iceberg）；快照 expire 由每天改周日（平时只盘点）|
+| **W4+W7** | **401** | **117 秒（1 分 57 秒）** | `local[2]`→`local[4]` + `shuffle.partitions` 200→32；`lake_ods_replay.py` 在 filter 后加 `.cache()`（Kafka 从读 5 遍变读 1 遍）|
+
+逐节点（398 → 401）：`replay 85→25` / `product 16→13` / `dim 39→15` / `dwd 59→29` / `maintain 40→13` / `ledger 5→5` / 其余不变。**数据零变化**：湖表 `900,000 / 3,113,577 / 854,844 / 900,000`、对账 26 项 OK、两个 DQC 全通过、台账 9 绿 0 红。
+
+> 剩下约 45 秒是「5 个节点各启动一次 Spark」的固定成本；再压只能合并节点（牺牲失败隔离），建议到此为止。
+
+**首次真实定时**仍待 2026-10-20 02:00 自动触发（10-19 02:00 那次因六个容器 08:47 才启动而没触发）。
 
 > 节点名带前导 Tab 的 4 个（`lake_dim_build` / `lake_dwd_incremental` / `wh_dws_ads_materialize` /
 > `dqc_order_chain`）是 UI 里手误带进去的，纯外观、不影响执行，不建议为它专门改版本。
@@ -1219,6 +1230,8 @@ Kafka (ods_order_event / ods_order)
 | 29 | **DQC 读湖表前必须先 `REFRESH EXTERNAL TABLE`** | `expire_snapshots` 清掉旧快照后，FE 缓存的元数据仍指向已删除的数据文件 → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`；而下一轮全流程（物化前会 REFRESH）又自愈，看着像「偶发」 | 两个 DQC 脚本已内置 `REFRESH`（`dim_product_scd2` / `dwd_order_sku_detail` / `dwd_order_detail` / `ods_order`）；实测清完快照立刻跑，两个 DQC 都 `EXIT=0`。⚠️ 只治「快照被 expire」这一类；**表被 `DROP`+`CREATE` 重建**造成的缓存中毒它清不掉（2026-10-19 实测两次均失败），见第 31 条 |
 | 30 | **`fe.conf` 每次重启都会多一行 `priority_networks`** | FE entrypoint 无条件追加，`git status` 每次多一行 diff；同值重复、后写的生效，**不影响运行** | 提交前 `git checkout -- starrocks/fe/conf/fe.conf` 还原；别为它去改 entrypoint |
 | 31 | **dim 表每天 `DROP`+`CREATE` 重建会「毒化」StarRocks 的 Iceberg 元数据缓存** | `lake_dim.sql` 重建表后 Iceberg 元数据从 `v1` 重新编号、旧目录被 purge，而 FE 按**路径**缓存元数据（`iceberg_metadata_memory_cache_expiration_seconds` 默认 86500 秒 ≈ 24h）→ 缓存命中重建前的 snapshot → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。**`REFRESH EXTERNAL TABLE` 清不掉这层缓存**（2026-10-19 实测：两个 DQC 都带 REFRESH 仍失败；把 `iceberg_metadata_memory_cache_capacity` 调 0 也排不空已有条目） | `scripts/lake/sr_catalog_reset.sh`：`DROP CATALOG IF EXISTS lake` + `CREATE EXTERNAL CATALOG lake`（只重建 catalog 定义、不动湖数据），实测 **1 秒**恢复（`dim_product_scd2` 4500 行 / `dim_product` 50 行）；已内置在 `run_dim.sh`：**建表 + 灌数都完成之后**自动跑（`dry` 模式不跑），重置失败则节点失败 |
+| 32 | **Spark 的 Kafka source 每个 action 都会重读全量 topic** | `lake_ods_replay.py` 一次运行有 5 个 action（4 次 `count()` + 1 次 `INSERT OVERWRITE`），每个都会重读一遍 Kafka：310 万条消息解析 5 遍，实测 replay 77 秒里一半以上耗在这 | filter 到目标日之后立刻 `.cache()`（此时只剩 1 天 ≈ 3.5 万行，内存可忽略）→ **77 秒 → 26 秒**，指标逐项不变。自查方法：数同一个 DataFrame 被几个 action 消费 |
+| 33 | **容器 6 核却默认 `local[2]` + `spark.sql.shuffle.partitions=200`** | 一天 1 万单被切成 200 个任务，每个只有几十 KB，调度和产出小文件的开销大于计算本身 | `_spark_lib.sh` 与 `lake_ods_replay.sh` 统一改 `local[4]` + `shuffle.partitions=32`（可用 `SPARK_MASTER` / `SPARK_SHUFFLE` 环境变量覆盖回滚）：dwd 51→30 秒、replay 77→53 秒，内存峰值 <1.1 GiB / 2 GiB。⚠️ **别再加线程**：spark 容器 `mem_limit=2g`，加线程只会 GC 抖动 |
 
 ### 湖层已落地的组件
 
@@ -1261,13 +1274,14 @@ bash scripts/lake/run_maintain.sh --tables dwd_order_detail,ods_product --expire
 **DS 维护节点（第 9 个）就填这一行**：
 
 ```
-bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5
+bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5   # 立即清理一次
+bash /opt/offline-dw/scripts/lake/run_maintain.sh --auto             # DS 节点日常用法：周日才清理
 ```
 
 **等价的手工命令**（不想用 wrapper 时；`--expire` 去掉就是只读盘点）：
 
 ```bash
-docker exec spark /opt/spark/bin/spark-submit --master 'local[2]' --driver-memory 1g \
+docker exec spark /opt/spark/bin/spark-submit --master 'local[4]' --driver-memory 1g \
   --jars /opt/offline-dw/jars/iceberg-spark-runtime-3.5_2.12-1.9.0.jar \
   /opt/offline-dw/scripts/lake/lake_maintain.py --expire --keep 5
 ```

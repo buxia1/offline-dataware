@@ -217,8 +217,9 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 **已落地**：工作流 **`offline_dataware_lake`**（**v8**，`release_state=1`；v7 九节点 10-16 → v8 于 10-18 补第 10 个节点「巡检台账」），定时 `0 0 2 * * ? *`
 （每天 02:00，schedule id 7 **已上线**，失败告警 `warning_type=2` / 告警组 2），执行策略「串行等待」。
 **端到端实测**：实例 346（8 节点）全绿 **3 分 34 秒**；实例 347（v7，9 节点，
-2026-10-16 16:55:15 → 16:59:31）全绿 **4 分 16 秒**。节点名与命令见 `README.md`
-的「⭐ 当前生产链路」。
+2026-10-16 16:55:15 → 16:59:31）全绿 **4 分 16 秒**；**v8 实例 398 = 260 秒**（优化起点）。
+**性能优化（2026-10-19）**：实例 **401 全绿 117 秒（1 分 57 秒）** —— replay 85→25、dim 39→15、dwd 59→29、maintain 40→13；三档改动 = 少起 Spark（W1/W2）+ 快照 expire 改周更（W3）+ `local[4]`/shuffle 32（W4）+ replay 加 `.cache()` 让 Kafka 只读一遍（W7）。数据零变化（对账 26 项 OK / 两个 DQC 通过 / 湖表行数不变）。剩下 ~45 秒是 5 次 Spark 启动的固定成本，不建议再压。
+节点名与命令见 `README.md` 的「⭐ 当前生产链路」。
 
 接线顺序（串行，实测就是这个拓扑；别并行 —— 湖侧写同一批 Iceberg 快照会冲突）：
 
@@ -241,8 +242,9 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
   （不写死表名，以后加表不用改脚本）：
   ```bash
   bash scripts/lake/run_maintain.sh --expire --keep 5     # wrapper：容器检查 + 串行锁 + 退出码透传
+  bash scripts/lake/run_maintain.sh --auto               # DS 日常用法：平时只盘点，周日才 expire
   ```
-  DS 维护节点（第 9 个）填 `bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`。
+  DS 维护节点（第 9 个）填 `bash /opt/offline-dw/scripts/lake/run_maintain.sh --auto`（2026-10-19 起；平时只盘点约 13 秒、周日才 expire 约 40 秒）。
   `--tables a,b` 可限定表；**不加 `--expire` 就是只读盘点**（零写入，15 秒）。
   **脚本自己验收**：快照数下降 且 行数不变，不达标退出码 `1`（可直接挂进 DS 当告警用）。
   实测 2026-10-16：8 张表快照 `46/18/12/11/9/7/2/2` → **全部 ≤5**，
@@ -335,14 +337,14 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
 - [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
 - [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v8，10 节点**，
-      流程与定时都已上线；实测实例 347 全绿 **4 分 16 秒**（v5/8 节点时实例 346 为 3 分 34 秒）
+      流程与定时都已上线；实测实例 347 全绿 **4 分 16 秒**（v5/8 节点时实例 346 为 3 分 34 秒）；**优化后实例 401 = 117 秒**
 - [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
       `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
 - [x] **失败告警已配**（2026-10-16）：该定时 `warning_type=2` / `warning_group_id=2`
       （与四个旧流程同一个告警组）—— 判据：
       `SELECT warning_type, warning_group_id FROM t_ds_schedules WHERE id = 7`
 - [x] 湖表维护**已进调度** ✅ 2026-10-16 —— DS 第 9 个节点 `lake_maintain`
-      （`bash /opt/offline-dw/scripts/lake/run_maintain.sh --expire --keep 5`，超时 15 min，
+      （`bash /opt/offline-dw/scripts/lake/run_maintain.sh --auto`，超时 15 min，
       前置 = `dqc_order_chain` / `dqc_dim_product` / `recon_lake_wh`；实例 347 里 **43 秒**、退出码 0）。
       脚本自验通过（8 张表全覆盖、快照 ≤ 5、行数不变、对账 26 项全绿）。
       `remove_orphan_files` **已定论：不用做**（2026-10-18）。8 张表逐个
@@ -367,6 +369,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [ ] 湖↔仓对账**连续 7 天零差异**（日历时间，只能每天定时跑一次）
       —— 已记：2026-10-16 实例 347（手动）✅ 9/9 绿、4 分 16 秒；recon 26 项 OK
       —— 已记：2026-10-18 实例 349（手动，与 348 并发）✅ 9/9 绿；recon 26 项 OK
+      —— 已记：2026-10-19 实例 400（W1~W3 后）✅ 10/10 绿、217 秒；实例 401（W4+W7 后）✅ 10/10 绿、117 秒；recon 26 项 OK
       —— 待记：2026-10-19 ~ 10-25 定时 02:00 每天一行；满 7 天勾掉本条
 
 > 关于「停更仓侧 ods/dim/dwd」这一条：**2026-10-16 起仓侧 `ods`/`dim`/`dwd` 已不再被调度更新**
