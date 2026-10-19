@@ -34,8 +34,8 @@
      lake.* ──INSERT OVERWRITE──► dws.dws_user_order_day、ads.ads_daily_sales（对外查询走这两层）
      ⚠️ 仓侧 ods/dwd/dim 自 2026-10-16 起**冻结**，只做对照与回滚，不要再往上建报表
 
-  ④ 旁路（与湖层无数据流，legacy 但仍在跑）
-     Kafka ──Routine Load（常驻）──► 仓侧 ods.ods_order / ods.ods_order_event
+  ④ 旁路（⛔ 2026-10-19 退役：两个 Routine Load 已 PAUSE，仓侧 ods 不再更新）
+     Kafka ──Routine Load（已 PAUSE）──× 仓侧 ods.ods_order / ods.ods_order_event
 ```
 
 **旧架构（2026-10-09 版，已退役）** —— 留作对照：
@@ -64,14 +64,14 @@
 | | 订单链路 | 商品链路 |
 |---|---|---|
 | 数据形态 | **事件流**，一条一条持续产生 | **实体状态**，每天一份全量快照 |
-| 传输方式 | Kafka（湖侧 Spark 重放；仓侧另有一条 Routine Load 旁路） | CSV 文件（Spark 解析进 `lake.ods.ods_product`） |
+| 传输方式 | Kafka（湖侧 Spark 重放；仓侧 Routine Load 旁路已于 2026-10-19 `PAUSE`） | CSV 文件（Spark 解析进 `lake.ods.ods_product`） |
 | 同步节奏 | 按天增量 | 按天全量快照 |
 
 真实业务里商品也是整表导出走 DataX，不走消息队列 —— **事件用流、实体用快照**是通用的分层原则。
 
 | 组件 | 版本 | 职责 | 端口 |
 |---|---|---|---|
-| Kafka | 3.8.1 | 消息队列，上游数据入口（湖侧重放与仓侧 Routine Load **两个独立消费者**） | 9092 |
+| Kafka | 3.8.1 | 消息队列，上游数据入口（湖侧重放；仓侧 Routine Load 已于 2026-10-19 `PAUSE`） | 9092 |
 | Spark | 3.5.1 | **湖层计算**：ODS 重放、DIM/DWD 增量、湖表维护；Iceberg 的写入引擎 | — |
 | Iceberg | 1.9.0 | 湖层表格式，数据落在本地目录 `lake/warehouse`（未用对象存储） | — |
 | StarRocks | 3.5.0 | **服务层**：external catalog `lake` 直读 Iceberg + `dws`/`ads` 物化 + 对外查询（allin1 单容器） | 9030 / 8030 / 8040 |
@@ -120,15 +120,21 @@
 **旧链路已退役**（四个旧工作流都还在 DS 里，但 `release_state=0` 全部离线；
 脚本收进 `scripts/legacy_warehouse/`，退役说明见该目录 README）：
 
+> ⛔ **2026-10-19 彻底退役**：两个 Routine Load（`ods_order_load` / `ods_order_event_load`）
+> 已 `PAUSE`（偏移量保留、可 `RESUME`），观察 2 天后 `STOP` + `DELETE`；
+> 仓侧 `ods`/`dwd`/`dim` 自此**完全冻结**（最后构建 2026-10-14 08:51），只作对照与回滚。
+> `routine_load_health` 的监控对象一并消失 → 它的定时与流程也随之下线。
+
 | 旧工作流 | 原职责 | 现在由谁取代 |
 |---|---|---|
 | `offline_dataware` | 仓侧 `dwd → dws → ads` SQL 作业链 | 节点 4 + 5 |
 | `dim_product_chain` | 仓侧 ODS → DIM(SCD2) → SKU 宽表 | 节点 2 + 3 + 4 |
 | `order_event_chain` | 仓侧累积快照 `dwd_order_lifecycle` | 节点 4（`lake.dwd.dwd_order_lifecycle`） |
-| `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⚠️ 无人取代**且已离线** —— 要继续收告警就得单独把它上线 |
+| `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⛔ **2026-10-19 一并退役**：监控对象已 PAUSE，无替代（`check_routine_load.sh` v2 留仓库当历史） |
 
-> **关于 Routine Load（2026-10-16 实测）**：`ods_order_load`（→ `ods.ods_order`）与
-> `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**都还在 RUNNING**，
+> **关于 Routine Load（2026-10-16 实测，2026-10-19 已停）**：`ods_order_load`（→ `ods.ods_order`）与
+> `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**已于 2026-10-19 `PAUSE`**
+> （PAUSE 前最后一次实测都是 `RUNNING`、`OffsetLag=1`、`ErrorLogUrls` 空；恢复用 `RESUME`），
 > 方向是 **Kafka → 仓侧 `ods.*`**，与湖侧**没有任何数据流**（湖侧是
 > `scripts/lake/lake_ods_replay.py` 独立批式读同一批 topic 重放进 Iceberg）。
 > ✅ **`scripts/check_routine_load.sh` 已于 2026-10-18 修为 v2，可直接上线**（只差在 DS 里建
@@ -142,8 +148,9 @@
 >   实测成立）。
 > 实测：正常 `EXIT=0`（宿主与 DS 容器内各跑一次）；`LAG_MAX=0` / `DUP_MAX=100` 都能卡出 `EXIT=1`。
 
-> ⚠️ 仓侧 `ods.*` / `dwd.*` / `dim.*` 这几张表**从 2026-10-16 起不再被调度更新**
-> （只有 Routine Load 还在往仓侧 `ods` 写）。保留它们是为了对照与回滚，**不要再往上建报表**。
+> ⚠️ 仓侧 `ods.*` / `dwd.*` / `dim.*` 这几张表**从 2026-10-16 起不再被调度更新**，
+> Routine Load 自 2026-10-19 `PAUSE` 后**也不再写入** → 整层完全冻结。
+> 保留它们是为了对照与回滚，**不要再往上建报表**。
 
 ---
 
@@ -208,7 +215,7 @@ offline-dw/
 │   ├── test_recon.sh               对账脚本自测（内存假数据）
 │   ├── dqc_dim_product.sh          商品维度 DQC（已指向湖侧 dim）
 │   ├── dqc_order_chain.sh          订单链路 DQC（可选业务日期参数）
-│   ├── check_routine_load.sh       Routine Load 健康检查（异常 exit 1；DS 流程 routine_load_health v2 每 30 分钟在线）
+│   ├── check_routine_load.sh       ⚠️ 历史：Routine Load 健康检查 v2（随旧链路 2026-10-19 退役，不再调度）
 │   ├── ops/ops_ledger.sh           ⭐ 每日巡检台账（从 DS 实例日志零开销汇总，写 ds/logs/ops/ledger.csv）
 │   │   ── ⚠️ 已退役：仓侧 ODS→DIM→DWD 那一套（2026-10-16）──
 │   ├── legacy_warehouse/           dim_product_scd2_*.sh / dwd_*.sh / load_product_to_ods.sh
@@ -853,7 +860,7 @@ docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT dt, count(*) AS rows_, count(DISTINCT concat(order_id,'-',event_type)) AS pairs
 FROM ods.ods_order_event GROUP BY dt ORDER BY dt;"
 
-# ⭐ Routine Load 状态（ODS 摄入，2026-10-09 起）
+# ⭐ Routine Load 状态（ODS 摄入；2026-10-09 起 → 2026-10-19 退役，现在应为 PAUSED）
 docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G"
 # 关注：State=RUNNING / Progress / ErrorLogUrls 空
 
@@ -926,15 +933,15 @@ docker compose restart dolphinscheduler
     【DS 02:00】offline_dataware_lake（9 节点，当前唯一在跑的流程）
                 Kafka/CSV ─(Spark)─► lake.* ─(StarRocks 外表)─► dws / ads ─► DQC + 对账 + 湖表维护
           ↓
-    【常驻】Routine Load → 仓侧 ods.*（legacy 旁路，与湖层无数据流）
-    【每30分钟】routine_load_health: check_routine_load（脚本已修 v2，流程 release_state=0 待上线）
+    【⛔ 已退役 2026-10-19】Routine Load → 仓侧 ods.*（两个作业已 PAUSE，10-21 后 STOP+DELETE）
+    【⛔ 已退役 2026-10-19】routine_load_health 每 30 分钟（监控对象消失，定时与流程一起下线）
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
 12. **`dwd_order_sku_detail` 的范围 JOIN 每天付一次代价** —— 这是"物化换查询速度"的必然代价。
 13. **补数要手工补分区** —— `dwd_order_sku_detail` 缺 `p20260915`~`p20260919` 等分区；动态分区**只创建"未来"，不创建历史**（`history_partition_num=0`）。补数进来的新日期，必须先照 `sql/dwd/dwd_order_sku_detail_add_partitions.sql` 手工 `ADD PARTITION`（且**必须先 `dynamic_partition.enable=false`**，理由见 PITFALLS §3.3）。**这是动态分区的固有行为、属运维常规动作**；想省掉它可改表达式分区，见「后续方向 → 可选架构改进」。
 14. **`wait_order_chain` 依赖的是"今天"的实例** —— 跨天补数时，依赖检查会对不上，需要单独手工执行。
-15. ⭐ **常驻 Routine Load 的新运维负担** —— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
-16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`** —— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
+15. ⭐ **常驻 Routine Load 的新运维负担**（⛔ 2026-10-19 作业退役，本条留作历史）—— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
+16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`**（⛔ 2026-10-19 作业退役，本条留作历史）—— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
 17. **不要用裸的 `docker cp` 往项目里放文件，也不要直接 `chown` 改属主** —— 见 PITFALLS §6.4。
 18. ⚠️ **StarRocks FE 的堆（8G）大于容器上限（3G）** —— `fe.conf` 里 `JAVA_OPTS` 写 `-Xmx8192m`，
     但 `docker-compose.yml` 是 `mem_limit: 3g`。当前数据小（`ods_order_event` 数据文件 42.4 KB、

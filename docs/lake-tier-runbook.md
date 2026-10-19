@@ -259,7 +259,8 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - **⚠️ 别把 ODS 纳入「湖侧增量」**：`lake.ods.*` 是从 **Kafka 重放**来的，不是从仓侧 ODS 拷贝。
   如果你要「仓侧 ODS 也从湖侧来」，那是**另一件事**，得先决定 Routine Load 是否停 ——
   停了就没有实时摄入了，湖侧重放是全量批处理，延时以小时计。
-  （实测：Routine Load 那两个作业 `ods_order_load` / `ods_order_event_load` 至今仍在 RUNNING。）
+  （⛔ 2026-10-19 已退役：`ods_order_load` / `ods_order_event_load` 两个作业都已 `PAUSE`，
+   仓侧 `ods` 不再更新；湖侧重放读的是同一批 Kafka topic，与它们无关。）
 - **⚠️ dim 表重建后必须清 StarRocks 元数据缓存**：`sql/lake/lake_dim.sql` 每天 `DROP`+`CREATE`，
   Iceberg 元数据从头编号、旧目录被 purge；而 FE 按**路径**缓存元数据（默认 ~24h），于是一段时间内
   `lake.dim.*` 的查询会命中**重建前的旧 snapshot** → DQC 报 `[1064] ... File does not exist: .../snap-xxxx.avro`。
@@ -368,11 +369,13 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
       —— 已记：2026-10-18 实例 349（手动，与 348 并发）✅ 9/9 绿；recon 26 项 OK
       —— 待记：2026-10-19 ~ 10-25 定时 02:00 每天一行；满 7 天勾掉本条
 
-> 关于「停更仓侧 ods/dim/dwd」这一条：**2026-10-16 起仓侧 `ods`/`dim`/`dwd` 事实上已经不再被
-> 调度更新**了（新链路只物化仓侧 `dws`/`ads`；仓侧 `ods` 仍由 Routine Load 写入）。
-> 但**仓侧 ODS 停更 = Routine Load 停 = 失去实时摄入** —— 湖侧目前只有离线重放能力
-> （`scripts/lake/lake_ods_replay.py` 直读 Kafka），延时以小时计，所以这个决定仍建议放到最后、
-> 并且先并行跑 1~2 个月看差异。
+> 关于「停更仓侧 ods/dim/dwd」这一条：**2026-10-16 起仓侧 `ods`/`dim`/`dwd` 已不再被调度更新**
+> （新链路只物化仓侧 `dws`/`ads`）；**2026-10-19 两个 Routine Load 也已 `PAUSE`**，
+> 仓侧这一层自此完全冻结（最后构建 2026-10-14 08:51），只作对照与回滚。
+> ⚠️ 代价：**失去实时摄入** —— 湖侧只有离线重放（`scripts/lake/lake_ods_replay.py` 直读 Kafka，
+> 从 `earliest` 全量重读、按 dt 覆盖写），延时以小时计；Kafka 只保 30 天（`log.retention.hours=720`），
+> 超出窗口的日期得重新灌。恢复办法：`RESUME ROUTINE LOAD FOR ods.ods_order_load;`
+> （PAUSE 不丢偏移量），或按 `sql/ods/ods_routine_load.sql` 重建作业。
 
 ---
 
