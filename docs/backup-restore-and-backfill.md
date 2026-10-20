@@ -187,7 +187,21 @@ sha256sum -c manifest.sha256
 
 ## 6. 操作 SOP
 
-### 6.1 备份（每日 / 每周）
+### 6.1 编排：两个 DS 工作流（2026-10-20 起）
+
+| 工作流 | 定时 | 节点 | 实测耗时 / 产出 |
+|---|---|---|---|
+| `offline_dataware_backup` | 每天 03:00 | `backup_daily` → `verify_daily --deep` | 80~100 s / 332 KB |
+| `offline_dataware_backup_weekly` | 周日 03:30 | `backup_weekly` → `verify_weekly` | ~16 s / 189 MB |
+
+- **运行位置**：DS standalone 容器（root）。节点命令：`export ROOT=/opt/offline-dw; bash /opt/offline-dw/scripts/backup/backup_daily.sh`。
+- **前提**：`docker-compose.yml` 里 DS 必须有 `- ./:/opt/offline-dw` 挂载（`./scripts`、`./sql` 是更深的子挂载，仍为只读）。**重建 DS 容器前确认这条还在**，否则节点找不到 `lake/`、`backups/`、`ds/logs/`。
+- **产物归属**：脚本末尾 `chown -R 1000:1000 "$OUT"`，宿主上还是 `l` 的文件；`/backups/` 已在 `.gitignore`。
+- **为什么不用 cron**：WSL 的 cron 不随开机自启、需要宿主路径与权限、没有告警/历史/重试；DS 里跑顺带白拿告警组 2 和运行历史。cron 只作为"DS 长期不跑"时的兜底（可选）。
+- **为什么"备份 DS 自己的元库"不算循环依赖**：DS 停着时元库不会变化，最后一份 dump 仍代表最新状态；需要保护的是"运行中产生的变更"，那时 DS 一定在跑。
+- **导入方式**：项目管理 → 工作流定义 → **导入工作流** → 选 `dolphin/offline_dataware_backup.json` / `dolphin/offline_dataware_backup_weekly.json` → 导入后**手工点「上线」**（DS 导出/导入的 `releaseState` 恒为 OFFLINE）。
+
+手工等价命令（在宿主或 DS 容器里都能跑）：
 
 ```bash
 # 每日 03:00 —— 实测 332 KB / 78 s（其中 ~76 s 在等 FE checkpoint）

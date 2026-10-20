@@ -168,6 +168,24 @@
 
 ---
 
+## 备份与恢复（2026-10-20 起）
+
+**编排在 DS 里**：两个独立工作流，与 02:00 批量解耦（不挤进 11 节点，避免污染耗时口径与台账）。
+
+| 工作流 | 定时 | 节点 | 产物 |
+|---|---|---|---|
+| `offline_dataware_backup` | 每天 03:00 | `backup_daily` → `verify_daily --deep` | `backups/daily/<dt>/` ≈332 KB |
+| `offline_dataware_backup_weekly` | 周日 03:30 | `backup_weekly` → `verify_weekly` | `backups/weekly/<dt>/` ≈189 MB |
+
+- **导入**：`dolphin/offline_dataware_backup.json`、`dolphin/offline_dataware_backup_weekly.json` → 项目管理 → 工作流定义 → **导入工作流** → 再**手工点「上线」**（DS 导出的 `releaseState` 恒为 OFFLINE）。
+- 两个工作流都带失败告警（`warning_type=FAILURE` + 告警组 2），失败走现有通知通道。
+- 节点跑在 DS 容器内（root），因此 compose 里必须有 `- ./:/opt/offline-dw`（`./scripts`、`./sql` 是更深的只读子挂载）。**重建 DS 容器前确认这条还在。**
+- 备份产物不进 git（`.gitignore` 的 `/backups/`）；保留：日报 7 天、周报 28 天；`MIRROR=1` 时另同步一份到 `/mnt/d/offline-dw-backups`。
+- 恢复/补数：`scripts/backup/restore_{ds,fe,lake}.sh`、`scripts/backfill.sh`；口径、场景矩阵与验收基线见 `docs/backup-restore-and-backfill.md`。
+- **为什么不用 cron**：WSL 的 cron 不随开机自启、命令要宿主路径与权限、且没有告警/历史/重试；DS 已具备告警组与运行历史。
+
+---
+
 ## 目录结构
 
 ```

@@ -80,14 +80,14 @@
 |---|---|---|
 | ① 性能与资源 | ✅ 已完成：260s→217s→117s，v10 十一节点 114s（W1~W4+W7，`cb120ec`/`36bfa34`）；余量问题归 A1 | 不再单列 |
 | ② 质量闸门升级 | ✅ 主体完成：湖侧 ODS 闸门 6 项（v10 第 3 节点）、湖↔仓对账 26 项、台账 26 列、DQC 自检+告警；**尾巴**：ad-hoc 隔离、DQC 失败是否阻塞下游 未验收 | A3 少量 + 遗留项 |
-| ③ **冷备与补数** | 🔄 **进行中**：规范/场景矩阵/演练模板已成文 `docs/backup-restore-and-backfill.md`；`scripts/backup/*` 由用户落地 | **A2 + A6** |
+| ③ **冷备与补数** | ✅ **规范/脚本/DS 编排就绪（2026-10-20）**：`docs/backup-restore-and-backfill.md` + `scripts/backup/*` + 两个 DS 工作流 JSON（每天 03:00 / 周日 03:30）；**待做** = 真做一次 S4/S6 恢复演练并留记录 | **A2 + A6** |
 | ④ 对象存储 MinIO/S3 | ⬜ 未开工：仍是本地文件系统（MinIO-ready）；MinIO `GetObject AccessDenied` 未解，备选 SeaweedFS | 新增 **A8** |
 | ⑤ 实时化 | ⬜ 未开工：现在只有 T+1；10-21 STOP 旧 RL 后连分钟级热层也没了 | **C1** |
 
 ### 包 A｜生产化与容量（建议先做，1~2 周）
 
 - **A1 容量与资源基线（1 天）**：现在可行但余量薄 —— WSL 可用 6.4Gi，starrocks 76%、DS 70%，容器 limit 之和 ≈19GB（严重超卖，靠空闲才没炸）。产出 `docs/capacity.md`：每天 1 万单的实测画像、10x（10 万单/天）需要的内存/磁盘/Kafka 分区、16GB 宿主下的上限结论。
-- **A2 备份与恢复（2 天，当前完全空白）**：DS 元库 `mysqldump` 每日保留 7 天；StarRocks 数据卷快照；湖 warehouse + `data/` 备份；脚本 `scripts/ops/backup.sh`。**验收 = 真做一次恢复演练**（从 dump 恢复出流程定义与 schedule、台账不断档），写 `docs/backup-restore.md`。
+- **A2 备份与恢复（规范/脚本/编排已完成，剩演练）**：DS 元库 + FE image + warehouse + data + Kafka 元数据，日报 7 天 / 周报 28 天，DS 两个工作流每天 03:00 / 周日 03:30 编排，校验 `verify_backup.sh --deep`（含 DS dump 导入 scratch 库）。**剩余验收 = 真做一次 S4/S6 恢复演练并写记录**（手册 §7.2 模板）。
 - **A3 监控告警扩展（2 天）**：现在只有"流程实例失败"告警。补三类：容器存活（6 个 up）、磁盘水位（>80%）、**今日台账缺行/失败**（防"凌晨关机缺跑"的唯一可靠手段）——`scripts/ops/ops_health.sh` 返回非 0 即告警；台账顺带加 3 列（host_free_gb / containers_ok / fe_heap_mb）。**验收 = 人为制造 3 种故障各触发一次告警**。
 - **A4 10x 放量压测（3 天，旁路）**：100k 单/天 × 90 天 = 900 万单 / ~3100 万事件。风险点：Kafka 3 分区要加、Kafka 盘 710MB×10、Spark `local[4]` 2g 上限、allin1 3g。**验收 = 旁路 catalog 上跑通 10 天 100k/天**，记录各节点耗时与内存峰值，给 **go / no-go**（no-go 就扩宿主内存或转生产部署，见 C3）。
 - **A5 表达式分区改造（1 天）**：README 唯一未做的"可选架构改进"——`dwd_order_sku_detail` 动态分区改表达式分区，消除"关开关→逐条 ADD→开开关"以及漏跑 `Insert has filtered data` 硬失败。**验收 = 补历史分区无需手工 ALTER，90 天行数/对账不变**。

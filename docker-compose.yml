@@ -150,4 +150,7 @@ services:
       - ./sql:/opt/offline-dw/sql:ro
       - ./scripts:/opt/offline-dw/scripts:ro
       - ./ds/alerts:/opt/ds-alerts
+      # 备份/校验脚本由 DS 工作流直接调用（ROOT=/opt/offline-dw），故把项目根以 rw 挂入；
+      # 上面的 ./scripts、./sql 是更深的子挂载，仍然是只读。
+      - ./:/opt/offline-dw
 
