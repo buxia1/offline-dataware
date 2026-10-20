@@ -13,7 +13,7 @@
 ```
                     ┌───────────────────────────────────────────────────────────────┐
                     │          DolphinScheduler（调度 · DS 3.2）                    │
-                    │  每天 02:00 工作流 offline_dataware_lake（v8 十节点）         │
+                    │  每天 02:00 工作流 offline_dataware_lake（v10 十一节点）       │
                     │  replay → product → dim → dwd → 仓侧物化                      │
                     │        →（订单 DQC ∥ 商品 DQC ∥ 湖↔仓对账）→ 湖表维护 → 台账  │
                     └───────────────────────────────────────────────────────────────┘
@@ -88,7 +88,7 @@
 > 查询 / 服务层，只保留 `dws` / `ads` 两层物化结果，仓侧 `ods` / `dwd` / `dim` 不再更新。
 
 **调度**：DolphinScheduler 工作流 **`offline_dataware_lake`** —— 流程已上线
-（`release_state=1`，**version 7**），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
+（`release_state=1`，**version 10，十一节点**），定时 `0 0 2 * * ? *`（每天 02:00）也**已上线**
 （schedule id 7 `release_state=1`，2026-10-16），执行策略「串行等待」。
 
 > ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
@@ -241,7 +241,7 @@ offline-dw/
 │   └── legacy_step2/               dwd_*_streamload.py / dws_ads_streamload.py / run_*.sh
 │                                    （保留原因与坑见 scripts/legacy_step2/README.md）
 ├── dolphin/                        DS 工作流导出（可重新导入覆盖；⚠️ 见「重要提醒」的两条不可信）
-├── kafka/                          空目录（Kafka 数据不挂载）
+├── kafka/                          Kafka 数据（./kafka/logs，2026-10-10 起挂载）
 ├── starrocks/
 │   ├── fe/{conf,log,meta}          meta 挂载用于持久化
 │   └── be/{conf,log,storage}
@@ -936,7 +936,7 @@ docker compose restart dolphinscheduler
 4. **装载脚本的防线有"口径"** —— 局部范围的检查**证明不了全表**。事件表重复那次，三条防线（值级 `EXCEPT`、快照表行数、`DISTINCT order_id`）全部报绿，是因为它们都没问过"这张表自己的原始行数对不对"。见 PITFALLS §3.17。
 5. **DWD 去重只在单天内生效** —— 同一 `order_id` 跨天出现会在两个分区各留一份。增量处理的固有边界。
 6. **StarRocks 用的是 allin1 单容器**（FE + BE 合一），仅供开发验证，不能上生产。
-7. **Kafka 数据未挂载**（放在容器内 `/tmp`），容器重建即丢失。ODS 层靠工作流重跑重建。
+7. ✅ **Kafka 数据已挂载（2026-10-10 起）** —— `./kafka/logs → /tmp/kafka-logs`，容器重建不再丢 topic（挂载前放在容器 `/tmp`，重建即丢）；本条保留作历史。
 8. **Spark 依赖缓存也在容器内**（`/tmp/.ivy2`），容器重建要重新下载 30MB。
 9. **SCD2 是全量重建**（`TRUNCATE` + 从 ODS 完整重推）—— 快照天数一多会变慢，增量维护尚未实现。
 10. **商品快照的生成不在调度里** —— CSV 由 `gen_mock_products.py` 手工产出（视为"上游同步"）。调度只负责"CSV → 数仓"这一段，所以**快照不会自己每天长出来**。
@@ -946,7 +946,7 @@ docker compose restart dolphinscheduler
     【手工】gen_mock_orders.py          --date <业务日期>   → Kafka `ods_order_event`
     【手工】gen_mock_products.py        --date <业务日期>   → CSV data/dim/product_snapshot_<date>.csv
           ↓
-    【DS 02:00】offline_dataware_lake（9 节点，当前唯一在跑的流程）
+    【DS 02:00】offline_dataware_lake（11 节点，当前唯一在跑的流程）
                 Kafka/CSV ─(Spark)─► lake.* ─(StarRocks 外表)─► dws / ads ─► DQC + 对账 + 湖表维护
           ↓
     【⛔ 已退役 2026-10-19】Routine Load → 仓侧 ods.*（两个作业已 PAUSE，10-21 后 STOP+DELETE）
@@ -959,9 +959,9 @@ docker compose restart dolphinscheduler
 15. ⭐ **常驻 Routine Load 的新运维负担**（⛔ 2026-10-19 作业退役，本条留作历史）—— 作业挂了**DS 里没有任何节点会变红**，数据静静不进来。靠 `routine_load_health` 每 30 分钟检查兜底。**这是"常驻作业"相对"每天跑一次的节点"唯一新增的成本。**
 16. ⭐ **Routine Load 的 `max_filter_ratio` 已设为 `0`**（⛔ 2026-10-19 作业退役，本条留作历史）—— 一条坏数据就把作业**暂停**（而不是静默过滤）。这是有意为之（宁停不脏），但意味着**暂停后需要人去 `RESUME`**。
 17. **不要用裸的 `docker cp` 往项目里放文件，也不要直接 `chown` 改属主** —— 见 PITFALLS §6.4。
-18. ⚠️ **StarRocks FE 的堆（8G）大于容器上限（3G）** —— `fe.conf` 里 `JAVA_OPTS` 写 `-Xmx8192m`，
-    但 `docker-compose.yml` 是 `mem_limit: 3g`。当前数据小（`ods_order_event` 数据文件 42.4 KB、
-    BE 常驻 RSS 462 MB）所以没事，**但放大数据量前必须修**，否则容易被 OOM kill。
+18. ✅ **StarRocks FE 的堆与容器上限的矛盾已修（2026-10-10，commit `4e60bb3`）** ——
+    `fe.conf` 的 `JAVA_OPTS` 现为 `-Xmx1024m -Xms1024m`，与 `mem_limit: 3g` 匹配。
+    本条保留作历史：当时写的是 `-Xmx8192m`，数据一大就会被 OOM kill。
 19. ⚠️ **`apache/spark:3.5.1` 里没有任何湖仓连接器** —— iceberg/paimon/hudi/hadoop-aws/aws-java-sdk
     全都没有（252 个 jar 里只有 parquet*、Ivy 缓存 0 个）。要用 Iceberg 需自己挂 jar，
     见「湖仓一体」。
@@ -1205,7 +1205,7 @@ Kafka (ods_order_event / ods_order)
 | # | 坑 | 现象 | 解法 |
 |---|---|---|---|
 | 1 | **Spark 容器 uid 185 ≠ 项目目录属主 1000** | 挂载是 `RW=true` 却 `Permission denied`，Iceberg 报 `Mkdirs failed to create` | 预建湖目录并放开权限（需 `docker exec -u 0`；普通 `docker exec` 也是 uid 185，**改不动**）|
-| 2 | **StarRocks FE 堆 8G vs 容器上限 3G** | `fe.conf` 写 `-Xmx8192m`，`mem_limit: 3g` | 现在数据小（`ods_order_event` 42.4 KB）撑着，**放量前必须修** |
+| 2 | **StarRocks FE 堆 8G vs 容器上限 3G** ✅ 2026-10-10 已修（commit `4e60bb3`）| 当时 `fe.conf` 写 `-Xmx8192m`、`mem_limit: 3g`；现为 `-Xmx1024m -Xms1024m` | 保留作历史；放大数据量前仍要盯容器 3g 上限与宿主内存 |
 | 3 | **MinIO 已改变分发方式** | `minio/minio` 从 Docker Hub 下架；`dl.min.io` 的 server/mc 二进制均 **410 Gone**；`quay.io`/`bitnami` 全不可用 | 免费路径只剩 `cgr.dev/chainguard/minio`（实测可拉取）。**故本阶段先用本地文件系统** |
 | 4 | Chainguard MinIO 数据目录属主必须是 **uid 65532** | 否则后台扫描报 `Prefix access is denied: .minio.sys/buckets/.bloomcycle.bin`，表现为**桶建了却读不到** | `chown 65532:65532` |
 | 5 | Chainguard MinIO 的 `GetObject` 返回 `AccessDenied` | `CreateBucket`/`ListBuckets`/`PutObject` 都成功、对象确实落盘（`xl.meta`），**但读不回来** | **未解决**，这也是暂缓对象存储的原因 |
@@ -1358,7 +1358,7 @@ CALL lake.system.remove_orphan_files(table => 'lake.ods.ods_order',
 
 链路上的闸门（DQC / 对账 / 维护自验）只能证明**这一次**对不对；要回答「过去 N 天是不是一直对」
 （比如验收清单里的「连续 7 天零差异」），得把每天的结果留痕。`scripts/ops/ops_ledger.sh` 就是这本流水账，
-挂在流程**最后一个节点**（第 10 个），每天往 CSV 追加一行。
+挂在流程**最后一个节点**（第 11 个），每天往 CSV 追加一行。
 
 **它不判断、不告警、不修复**（只在取不到实例时 `exit 1`）—— 判对错仍是 DQC / 对账 / 维护三个节点的事。
 
@@ -1395,10 +1395,11 @@ wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/o
 **数「连续 N 天零差异」**（第 11 列是 `recon_result`）：
 
 ```bash
-docker exec dolphinscheduler awk -F, 'NR>1 && $11=="OK"{n++; last=$1} END{print n" 天 recon=OK，最新 "last}' /opt/dolphinscheduler/logs/ops/ledger.csv
+# ⚠️ 必须按 dt 去重：手动重放会在同一 dt 下多写行，直接数行会把 4 天误算成 7 天
+docker exec dolphinscheduler awk -F, 'NR>1 && $11=="OK" && $26=="" && !seen[$1]++ {n++; last=$1} END{print n" 天 recon=OK（去重），最新 "last}' /opt/dolphinscheduler/logs/ops/ledger.csv
 ```
 
-⚠️ 首次生效：v8 于 2026-10-18 上线，**首个定时写入是 2026-10-19 02:00 那一跑**；
+⚠️ 首次生效：v8 于 2026-10-18 上线。**原定首个定时写入 2026-10-19 02:00，但 10-19 / 10-20 凌晨容器未启动、均未触发**；首次实际写入是 10-19 09:59（实例 398），首次真实自动跑待 **2026-10-21 02:00**；
 所以「连续 7 天零差异」最早在 **2026-10-25** 出数。
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
@@ -1622,7 +1623,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
 | 湖侧表 | 行数 | 备注 |
 |---|---|---|
 | `lake.ods.ods_order` | 900,000 | 90 个 dt 分区 |
-| `lake.ods.ods_order_event` | 3,120,421 | 93 个 dt 分区（含迟到 09-17/18/19）|
+| `lake.ods.ods_order_event` | 3,111,841（2026-10-20 复核；10-14 首次实测 3,120,421）| 93 个 dt 分区（含迟到 09-17/18/19）|
 | `lake.ods.ods_product` | 4,500 | 90 天 × 50 商品 |
 | `lake.dim.dim_product_scd2` | 4,500 | 50 商品 / `valid_from` 2026-09-20 ~ 2026-12-18 / `is_current` 50 |
 | `lake.dim.dim_product` | 50 | 当前版 |
@@ -1710,7 +1711,7 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 实测实例 347（16:55:15 → 16:59:31）9 节点全绿、**4 分 16 秒**，本节点 **43 秒**、退出码 0
       —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
          `WHERE code = 23385597001344` 返回 `7 / 1`
-- [x] **巡检台账进调度** ✅ **2026-10-18 完成** —— `offline_dataware_lake` **v8** 第 10 个节点
+- [x] **巡检台账进调度** ✅ **2026-10-18 完成** —— `offline_dataware_lake` **v8** 第 10 个节点（v10 起为第 11 个节点）
       `lake_ops_ledger`（`bash /opt/offline-dw/scripts/ops/ops_ledger.sh ${system.biz.date}`，
       超时 5 min，前置 = `lake_maintain`）—— 脚本实测 5 秒、回放实例 349 得一行、`notes` 为空；**首次真实写入 = 实例 398**（`dt=2026-10-18`，`recon OK` / 26 项，`notes` 空）
       —— 判据：`SELECT version, release_state FROM t_ds_process_definition`
@@ -1776,8 +1777,8 @@ bash scripts/legacy_step2/run_lifecycle.sh dry
       —— 已不适用：湖侧用 Iceberg **隐藏分区 `dt`**，实测 90 个分区、无空分区，补数按 `dt` 自动定位；
          仓侧老 `dwd` 表已停更（新链路只物化仓侧 `dws/ads`）
 - [x] **峰值内存不越容器上限** —— 放量后实例 346 / 347 / 349 全绿、未 OOM
-      —— ⚠️ 遗留：`fe.conf` 里 `-Xmx8192m` 仍大于容器 `mem_limit: 3g`（坑表第 2 条），
-         再上一档数据量前必须修
+      —— ✅ 已于 2026-10-10 修正（commit `4e60bb3`）：`fe.conf` 现为 `-Xmx1024m -Xms1024m`，
+         与容器 `mem_limit: 3g` 匹配（坑表第 2 条已归档）
 
 **第 4 步 · 调度上线与旧链路退役**（湖仓阶段收尾，2026-10-16）—— ✅ 已完成
 （定时 02:00 已上线、告警已配、湖侧 ODS 闸门第 3 个节点、湖表维护第 10 个节点、巡检台账第 11 个节点）

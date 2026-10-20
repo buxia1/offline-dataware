@@ -336,7 +336,7 @@ SELECT (SELECT sum(order_cnt) FROM dws.dws_user_order_day) dws_oc,
 - [x] 湖侧每次写入后**自检**（行数 + 金额 + 去重主键）并失败即退出
 - [x] 仓侧 `dws`/`ads` 由**湖侧物化**（来源 = `lake.dwd.*`），逐日与湖侧相等
 - [x] 仓侧物化**默认按天自动增量**（`--truncate` 才全量）
-- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v8，10 节点**，
+- [x] DolphinScheduler 里全链路**串行**接入 —— `offline_dataware_lake` **v10，11 节点**，
       流程与定时都已上线；实测实例 347 全绿 **4 分 16 秒**（v5/8 节点时实例 346 为 3 分 34 秒）；**优化后实例 401 = 117 秒**；**v10（11 节点）实例 403 = 114 秒**
 - [x] 对账作业可重复执行（不是一次性人工核对）：`scripts/recon_lake_wh.sh`，执行前对湖侧表
       `REFRESH EXTERNAL TABLE` —— 自测 `scripts/test_recon.sh` **9/9 通过**，全区间实测 3.1 秒
