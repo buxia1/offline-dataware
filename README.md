@@ -126,7 +126,7 @@
 
 > 剩下约 45 秒是「5 个节点各启动一次 Spark」的固定成本；再压只能合并节点（牺牲失败隔离），建议到此为止。
 
-**首次真实定时**仍待 2026-10-20 02:00 自动触发（10-19 02:00 那次因六个容器 08:47 才启动而没触发）。
+**首次真实定时**仍未触发：10-19 02:00（容器 08:47 才启动）与 10-20 02:00（容器 09:49 才启动）两次都因关机错过；下一次机会 **2026-10-21 02:00**（要求 6 个容器夜间保持 Up、Windows 不休眠/关机）。
 
 > 节点名带前导 Tab 的 4 个（`lake_dim_build` / `lake_dwd_incremental` / `wh_dws_ads_materialize` /
 > `dqc_order_chain`）是 UI 里手误带进去的，纯外观、不影响执行，不建议为它专门改版本。
@@ -1841,13 +1841,17 @@ docker run -d --name sr_canary \
 sleep 3
 docker exec sr_canary bash -c '
   grep clusterId /data/deploy/starrocks/fe/meta/image/VERSION   # 期望 938046516
-  ls /data/deploy/starrocks/fe/meta/image/v2/ | wc -l           # 期望 2
-  ls /data/deploy/starrocks/fe/meta/bdb | wc -l                 # 期望 33
+  ls /data/deploy/starrocks/fe/meta/image/v2/ | wc -l           # 期望 2（image.<id> + checksum.<id>；偶尔 4 也正常）
+  ls /data/deploy/starrocks/fe/meta/bdb | wc -l                 # 非空即可（2026-10-20 实测 46，会随 journal 轮转增长，别比固定数字）
   cat /data/deploy/starrocks/be/storage/cluster_id              # 期望 938046516-3.5.0'
 docker rm -f sr_canary >/dev/null 2>&1
 ```
 
 四项都符合期望 → 可以安全重建。**任何一项不符，先别动。**
+
+> 注：`image/v2` 与 `bdb` 的条目数会浮动（每天轮转），这两个数字只作"挂载能读到东西"的旁证；
+> 硬判据是 `clusterId=938046516` 与 `be/storage/cluster_id=938046516-3.5.0`。
+> 恢复 FE 元数据时**必须先把 `meta/bdb` 改名移走**，否则 journal 重放会让回滚"没生效"（详见 `docs/backup-restore-and-backfill.md` §2.2）。
 
 ### Kafka 数据持久化（2026-10-10 起）
 
@@ -1934,6 +1938,13 @@ dolphin/
 其中 5 处缺陷（旧 `run_lake_dwd.sh` 用 `append` 重复追加、runner 写死 `/mnt/d/...` 路径、
 SKU 关联用 `inner` 静默丢单、lifecycle 增量语义不完整、湖侧写入无自检）**已于 2026-10-14 全部修复**
 （见手册附录 A 的逐条验收判据）。
+
+#### 📘 冷备与补数手册（2026-10-20）
+
+`docs/backup-restore-and-backfill.md` —— **什么要备 / 怎么备 / 坏了怎么恢复 / 补数边界**：
+资产清单（谁可重建、谁不可）、S1~S7 恢复场景矩阵、每日/每周备份 SOP、恢复演练模板与验收基线、
+Kafka 30 天窗口外怎么补、以及三条硬约束（`--databases` 禁用、热备 Kafka 不一致、FE 恢复必须先移走 `bdb`）。
+配套代码 `scripts/backup/*.sh` + `scripts/backfill.sh`（待落地，规范以本文为准）。
 
 #### 📘 DS 调度接线规格
 
