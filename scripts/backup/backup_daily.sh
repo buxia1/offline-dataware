@@ -67,9 +67,17 @@ mv "$DEST/tmp"/* "$DEST"/; rmdir "$DEST/tmp"
     | sort | xargs -r sha256sum > manifest.sha256 && sha256sum -c manifest.sha256 >/dev/null )
 log "完成: $DEST ($(du -sh "$DEST" | cut -f1))"
 
-if [ -d "$MIRROR_DIR" ] && [ -n "${MIRROR:-0}" ]; then
-  mkdir -p "$MIRROR_DIR/daily"; rm -rf "$MIRROR_DIR/daily/$DAY"
-  cp -a "$DEST" "$MIRROR_DIR/daily/"; log "已镜像到 $MIRROR_DIR/daily/$DAY"
+if [ -n "${MIRROR:-0}" ]; then
+  # /mnt/d 是 9p 文件系统：cp -a 保留属主/时间戳会 "Operation not permitted"（exit 1），
+  # 内容本身能复制成功，所以这里用 cp -r 且不把失败当致命错误。
+  if mkdir -p "$MIRROR_DIR/daily" 2>/dev/null; then
+    rm -rf "$MIRROR_DIR/daily/$DAY"
+    cp -r --no-preserve=ownership,timestamps "$DEST" "$MIRROR_DIR/daily/" 2>/dev/null \
+      || log "⚠️ 镜像复制有告警（9p 不支持保留属主/时间戳）；主份不受影响"
+    log "已镜像到 $MIRROR_DIR/daily/$DAY"
+  else
+    log "⚠️ 镜像目录不可用，跳过 $MIRROR_DIR（主份已生成本地备份）"
+  fi
 fi
 find "$OUT/daily" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETAIN_DAYS" -exec rm -rf {} + 2>/dev/null || true
 log "保留策略: 现有 $(find "$OUT/daily" -mindepth 1 -maxdepth 1 -type d | wc -l) 份 / >${RETAIN_DAYS} 天已清理"
