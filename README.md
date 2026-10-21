@@ -2000,7 +2000,7 @@ Kafka 30 天窗口外怎么补、以及三条硬约束（`--databases` 禁用、
 配套代码 `scripts/backup/*.sh` + `scripts/backfill.sh` 已落地；每天 03:00 / 每周日 03:30 由 DS 两个工作流编排。
 **2026-10-21 已完成首次恢复演练**（S1/S3-a/S4/S5/S6 实测通过，记录见手册 §10）。
 
-#### 📘 实时化设计草案（2026-10-21，待拍板）
+#### 📘 实时化设计文档（2026-10-21，A0 已上线）
 
 `docs/realtime-stage-design.md` —— 方向 5「实时链路」的选型对比、硬约束与 PoC 清单：
 三案对比（Flink / Routine Load / Structured Streaming）、推荐 A′（独立 RT 表 + 独立 `spark-rt` 容器）、零内存备选 A0（5 分钟幂等覆盖）、以及 **3 个待拍板点**（形态、内存从哪挤、热层对外边界）。
@@ -2011,7 +2011,13 @@ PoC 代码/命令骨架见 §5（容器、RT 表 DDL、`rt_ingest.py`、观测�
 `docs/d1-real-data-ingestion-plan.md` —— 数据集选型（dunnhumby Complete Journey 为主 / NYC TLC 做规模校验 /
 Yelp、Stack Exchange 备选）、8 表 ODS→DIM→DWD→DWS→ADS 设计、7 节点 DS 工作流、DQC 10 条与验收 7 条、
 双数据集边界（mock 保规模与实时，retail 保建模深度）。
-**注意**：retail 数据集与现有 mock 链路隔离（`lake.retail.*`），是回填型工作流，不写主台账、不接 02:00 日更。
+**2026-10-21 定稿（用户拍板）**：主链路改为 **dunnhumby 日回放**（`retail_init` 一次性初始化 + `retail_daily` 每天一个 DAY，02:00，切换 gate 通过后替换 mock 的 02:00 定时；水位表 `lake.retail.etl_watermark`，水位 = 已装载最大 `DAY`，与墙钟日期解耦，补数 = 按天回放窗口）、mock 链路降级为 **测试资产**（Kafka 规模压测 / 迟到重复乱序 / 故障演练 / 回归，手工触发）。retail 数据隔离在 `lake.retail.*`，接入期不写主台账。
+
+#### 📘 交接文档（2026-10-21）
+
+`docs/handoff-2026-10-21.md` —— 写给下一个接手的智能体：一页速览、环境与访问、代码/文档地图、
+调度与定时清单（实测 def/schedule id）、数据资产现状、已完成里程碑、**未闭环事项表**、红线与 15 条坑、
+常用命令速查、交接后第一批动作、行为约定。
 
 #### 📘 DS 调度接线规格
 
