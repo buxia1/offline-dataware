@@ -178,6 +178,7 @@
 | `offline_dataware_backup_weekly` | 周日 03:30 | `backup_weekly` → `verify_weekly` | `backups/weekly/<dt>/` ≈189 MB |
 
 - **导入**：`dolphin/offline_dataware_backup.json`、`dolphin/offline_dataware_backup_weekly.json` → 项目管理 → 工作流定义 → **导入工作流** → 再**手工点「上线」**（DS 导出的 `releaseState` 恒为 OFFLINE）。
+  ✅ **2026-10-21 已导入并上线**（实测）：导入后 DS 会把工作流名加后缀 `_import_<时间戳>`，需改回原名；定义 `offline_dataware_backup` code `23438712655360`（定时 id 8，`0 0 3 * * ? *`）、`offline_dataware_backup_weekly` code `23438712670080`（定时 id 9，`0 30 3 ? * SUN`），均已 `release_state=1`；试跑实例 408：`backup_daily` 100 秒 + `verify_daily` 11 秒，双双成功、产物 `backups/daily/2026-10-21` 336K、`verify --deep` PASS=8。
 - 两个工作流都带失败告警（`warning_type=FAILURE` + 告警组 2），失败走现有通知通道。
 - 节点跑在 DS 容器内（root），因此 compose 里必须有 `- ./:/opt/offline-dw`（`./scripts`、`./sql` 是更深的只读子挂载）。**重建 DS 容器前确认这条还在。**
 - 备份产物不进 git（`.gitignore` 的 `/backups/`）；保留：日报 7 天、周报 28 天；`MIRROR=1` 时另同步一份到 `/mnt/d/offline-dw-backups`。

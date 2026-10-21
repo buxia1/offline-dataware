@@ -70,9 +70,15 @@ if [ "$DEEP" = "1" ]; then
   sched=$(q "SELECT COUNT(*) FROM ds_restore_probe.t_ds_schedules;")
   online=$(q "SELECT COUNT(*) FROM ds_restore_probe.t_ds_schedules WHERE release_state=1;")
   cron=$(q "SELECT crontab FROM ds_restore_probe.t_ds_schedules WHERE release_state=1;" | tr '\n' ' ')
-  echo "tables=$tables (期望 65)  process_defs=$defs  schedules=$sched  上线=$online (期望 1)  crontab=[$cron]"
+  echo "tables=$tables (期望 65)  process_defs=$defs (期望>=5)  schedules=$sched (期望>=5)  上线=$online (期望>=1)  crontab=[$cron]"
   [ "$tables" = "65" ] || fail "DS 表数 $tables != 65"
-  [ "$online" = "1" ] || fail "上线定时数 $online != 1"
+  [ "${defs:-0}" -ge 5 ] || fail "流程定义数 $defs < 5"
+  [ "${sched:-0}" -ge 5 ] || fail "定时数 $sched < 5"
+  [ "${online:-0}" -ge 1 ] || fail "上线定时数 $online < 1"
+  case "$cron" in
+    *"0 0 2 * * ? *"*) ;;
+    *) fail "主链路 02:00 定时不在上线列表里: $cron" ;;
+  esac
   docker exec mysql mysql -uroot -proot123 -e 'DROP DATABASE ds_restore_probe;'
 fi
 echo "== 结果: PASS=$ok FAIL=$bad =="

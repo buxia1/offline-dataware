@@ -58,7 +58,18 @@ tar -tzf "$DEST/tmp/data.tar.gz" >/dev/null || die "data tar 校验失败"
 
 # 5. git 指纹
 log "5/6 git 指纹 -> git.txt"
-{ git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "no-git"; git -C "$ROOT" status --short 2>/dev/null || true; } > "$DEST/tmp/git.txt"
+{
+  if git -C "$ROOT" rev-parse HEAD 2>/dev/null; then
+    :
+  elif [ -r "$ROOT/.git/refs/heads/main" ]; then
+    echo "$(cat "$ROOT/.git/refs/heads/main")  (.git/refs/heads/main, 无 git 二进制)"
+  elif [ -r "$ROOT/.git/HEAD" ]; then
+    echo "HEAD=$(cat "$ROOT/.git/HEAD")  (无 git 二进制)"
+  else
+    echo "no-git"
+  fi
+  git -C "$ROOT" status --short 2>/dev/null || true
+} > "$DEST/tmp/git.txt"
 
 # 6. 归档 + manifest
 log "6/6 归档 + manifest"
