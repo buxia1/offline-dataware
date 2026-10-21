@@ -96,7 +96,10 @@
   不接日更调度、不写主台账（单独 `retail_ledger.csv`），保住 7 天对账判据不被污染。
 - **交付**：`docs/d1-real-data-ingestion-plan.md`（选型对比 + 8 表 ODS/DIM/DWD/DWS/ADS 设计 + 7 节点 DAG +
   DQC 10 条 + 验收 7 条 + 内存耗时预算 + 风险 8 条 + 命令清单）。
-- **状态**：文档已起草并入库；待你回家确认数据集与下载渠道后，我补精确 schema 与 D2 建模文档，你落地 `scripts/retail/*` 与 DS 工作流。
+- **状态（2026-10-21 定稿）**：**主链路 = dunnhumby 真实零售数据**（`retail_init` 一次 + `retail_daily` 每天 02:00 日回放一个 DAY，711 天 ≈ 2 年）；
+  **mock 降级为测试资产**——只用于 Kafka 压测、迟到/重复/乱序事件、故障演练、回归测试，切换后手工触发。
+  切换 gate：并行跑 7 个 DAY 对账零差异 + DQC 全绿 + 资源水位无异常 → 一条 SQL 下线 mock 定时、上线 retail 定时（5 分钟可回滚）。
+- **分工**：文档/设计（我，已交付）→ 你落 `scripts/retail/*` + DS 工作流 → 我给 8 表精确 schema 校验与验收命令。
 - **工作量**：3~5 天（每天 1~2 小时），Step 2（ODS schema）与 Step 4（事实粒度）最费时。
 
 ### 包 A｜生产化与容量（建议先做，1~2 周）

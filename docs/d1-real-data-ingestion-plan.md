@@ -15,6 +15,17 @@
 - **备选**：想练半结构化 JSON + 文本 → Yelp Open Dataset（约 8.6GB）；想练 XML + 强关系 → Stack Exchange 数据转储（先裁一个小站点）。
 - **不选 Olist**：9.9 万单、约 100MB、全网教程泛滥；虽真实但"关系浅、字段少、无营销侧"，补不上你要的深度。
 
+### 0.1 决策（2026-10-21，已定）
+
+> 你的原话：**「主链路：dunnhumby 真实零售数据。保留 mock 数据：只用于 Kafka 压测、迟到/重复/乱序事件、故障演练和回归测试。」**
+
+由此确定：
+
+1. **retail 为主链路**：新增 `retail_init`（一次）+ `retail_daily`（每天 02:00 日回放一个 DAY）两个 DS 工作流；711 个 DAY ≈ 2 年，天然模拟"每天新增一批真实数据"。
+2. **mock 降级为测试资产**：`offline_dataware_lake`、Kafka 两个 topic、`rt_refresh_5m`（A0）全部保留、**切换后只按需手工触发**，用于压测/乱序/故障/回归；不再承担日常生产。
+3. **切换有 gate**：并行期先跑 7 个 DAY 的 retail 对账零差异 + DQC 全绿 + 资源无 OOM，再一条 SQL 把 mock 定时下线、retail 定时上线（可 5 分钟回滚，见 §5.10）。
+4. **不丢已有资产**：mock 的 11 节点工作流、Kafka 生成器、对账/台账脚本、备份编排全部保留，作为测试与演练工具。
+
 ## 1. 为什么换数据集（现状痛点）
 
 | 现状 | 问题 |
@@ -165,21 +176,31 @@ head -1 transaction_data.csv product.csv hh_demographic.csv causal_data.csv
 
 ### 5.6 Step 6：调度（DS 工作流）
 
-**性质：回填型（一次性 + 手动重跑），不是日更型。** 建议单独工作流，不与 `offline_dataware_lake` 混：
+**性质：主链路，日回放型**（2026-10-21 决策，见 §0.1）。两个新工作流，不与 `offline_dataware_lake` 混：
+
+#### A. `retail_init`（一次性初始化，手动触发一次）
+
+1. `retail_ods_load_all`：8 表全量入 ODS（causal 按 week 分批）
+2. `retail_dim_build`：dim_date（DAY 1..711 → 2013-01-01 起，可用 `RETAIL_BASE_DATE` 覆盖）、dim_household、dim_product、dim_campaign、dim_coupon、dim_store
+3. `retail_src_expect`：扫源 CSV 生成"每天/每表期望行数"表 `retail.src_day_expect`（对账基线）
+4. `retail_dqc_all`：10 条 DQC 全量跑一遍
+
+#### B. `retail_daily`（主链路，每天 02:00，推进一个 DAY）
 
 ```
-retail_backfill (手动触发 / 数据更新时触发)
-  1 retail_ods_load     : bash scripts/retail/run_retail.sh ods     (60min 超时)
-  2 retail_dqc_ods      : bash scripts/retail/dqc_retail.sh ods     (10min)
-  3 retail_dim_build    : bash scripts/retail/run_retail.sh dim     (30min)
-  4 retail_fct_build    : bash scripts/retail/run_retail.sh fct     (60min)
-  5 retail_agg_build    : bash scripts/retail/run_retail.sh agg     (30min)
-  6 retail_dqc_all      : bash scripts/retail/dqc_retail.sh all     (10min)
-  7 retail_recon        : bash scripts/retail/recon_retail.sh       (10min，退出码 2=不一致)
+retail_daily（cron 0 0 2 * * ? *，切换 gate 通过后才上线）
+  1 retail_ingest_day : bash scripts/retail/run_retail.sh ingest --day ${day}
+  2 retail_dqc_day    : bash scripts/retail/dqc_retail.sh day
+  3 retail_fct_day    : bash scripts/retail/run_retail.sh fct --day ${day}
+  4 retail_dws_day    : bash scripts/retail/run_retail.sh dws --day ${day}
+  5 retail_ads_day    : bash scripts/retail/run_retail.sh ads --day ${day}
+  6 retail_recon_day  : bash scripts/retail/recon_retail.sh --day ${day}   （退出码 2=不一致）
 ```
 
-- 复用现有 Spark 容器与串行锁 `/tmp/.spark_job.lock`（`_spark_lib.sh`），与 02:00 主链路互斥；
-- 幂等：所有写入按分区 `INSERT OVERWRITE`（week_no / 快照），重跑不产生重复；
+- **水位表**：`lake.retail.etl_watermark(day_no int, run_date date, updated_at timestamp)`；`retail_daily` 先取 `max(day_no)+1`，成功才写回；**同一天重跑幂等**（按 DAY 分区 `INSERT OVERWRITE`）。
+- **规模**：DAY 1..711，每天约 3.6k 交易行 / 约 5 万曝光行，单跑 <30s；711 天跑完可重置水位或改成一天推进 2 个 DAY。
+- **补数**：`retail_backfill` 用同一批脚本的参数化版本（`--from-day N --to-day M`），台账标 `run_mode=backfill`，不污染日常行。
+- 复用 Spark 容器与串行锁 `/tmp/.spark_job.lock`（`_spark_lib.sh`），与手工重放互斥。
 - 脚本全放 `scripts/retail/`，DS 里以 `bash /opt/offline-dw/scripts/retail/...` 调用（沿用现有挂载）。
 
 ### 5.7 Step 7：DQC 与对账（10 条必须）
@@ -217,6 +238,20 @@ retail_backfill (手动触发 / 数据更新时触发)
 | 单次回填总耗时 | 约 5~10 分钟 | 按 week_no 分批处理 causal；transaction 一次读完 |
 | 内存峰值 | < 1.5GB（driver+executor 同 JVM） | 分批 + 不 cache 大表 |
 
+### 5.10 主链路切换 gate（mock → retail）
+
+并行期（D1 验收后约 1 周）：
+
+1. `retail_daily` 手动连跑 **7 个 DAY**：DQC 全绿、recon 零差异、台账 7 行；
+2. 与 mock 链路同时在线：串行锁不互撞、StarRocks/DS 内存水位记录在案（切换前后各一份）；
+3. **切换动作（一条 SQL + 一次 DS 重载）**：
+   ```sql
+   UPDATE t_ds_schedules SET release_state=0 WHERE id=7;   -- mock 主定时下线（定义保留）
+   UPDATE t_ds_schedules SET release_state=1 WHERE id=<retail_daily_schedule_id>;  -- retail 上线
+   ```
+4. **回滚**：反向 UPDATE，5 分钟内恢复 mock 主链路（工作流定义、脚本、Kafka 数据全在）；
+5. 切换后 mock 的用途固定为：Kafka 压测、迟到/重复/乱序事件、故障演练、回归测试（手工/按需触发）。
+
 ## 6. 与现有链路的集成
 
 | 对象 | 处理 |
@@ -241,15 +276,15 @@ retail_backfill (手动触发 / 数据更新时触发)
 | 7 | 8 表字段与文档估算有出入 | §5.1 先实测；以 `head -1` 与 `_inventory.txt` 为准，schema 在 Step 2 定稿 |
 | 8 | 若改选 Yelp，JSON 嵌套展开工作量大 | 先只展开 review/business 核心字段，attributes 字典按需拍平，不追求一次到底 |
 
-## 8. 双数据集边界（写进 README）
+## 8. 双链路边界（写进 README）：retail = 主链路，mock = 测试资产
 
-| 维度 | mock（现有） | retail（D1 新增） |
+| 维度 | mock（降级为测试资产） | retail（主链路） |
 |---|---|---|
-| 用途 | 规模、性能、实时（A0 5 分钟）、7 天对账、运维演练 | 真实关系、维度建模深度、营销归因 |
+| 定位 | 测试床：Kafka 压测、迟到/重复/乱序事件、故障演练、回归测试 | 生产主链路：真实零售数据、维度建模深度、营销归因 |
 | 规模 | 90 万单 / 312 万事件 | 约 4,000 万行 / 8 表 |
-| 更新 | 每天 02:00 自动（云侧 T+1）+ 每 5 分钟实时 ODS | 手动/数据更新时回填 |
+| 触发 | 手工/按需（切换时定时下线，定义保留） | 每天 02:00 日回放一个 DAY + 手工补数 |
 | 湖库 | `lake.ods/dim/dwd/dws/ads` | `lake.retail.*` |
-| 台账 | `ds/logs/ops/ledger.csv`（26 列，7 天对账用） | `ds/logs/ops/retail_ledger.csv` |
+| 台账 | `ds/logs/ops/ledger.csv`（26 列，7 天对账历史） | `ds/logs/ops/retail_ledger.csv` |
 | 备份 | daily/weekly 已覆盖 | weekly lake tar 自动覆盖 |
 
 ## 9. 备选：规模数据集 TLC 轻量方案（可选）
