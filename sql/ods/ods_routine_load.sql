@@ -163,3 +163,14 @@ FROM KAFKA(
 --   TRUNCATE TABLE ods.ods_order_event;
 --   TRUNCATE TABLE ods.ods_kafka_offset;
 --   bash scripts/ods_legacy/ods_order_event_ingest.sh --reset     -- 用旧 Spark 路径重建
+
+-- =============================================================================
+-- 2026-10-21 10:57 UTC+8：A 方案（STOP 退役）已执行
+-- =============================================================================
+-- 两个作业均已 STOP：
+--   ods_order_event_load  id=57367  STOPPED  EndTime=2026-10-21 02:57:39(UTC)
+--   ods_order_load        id=57380  STOPPED  EndTime=2026-10-21 02:57:39(UTC)
+-- 复核（注意必须加 ALL，普通 SHOW ROUTINE LOAD 不显示已 STOP 的作业）：
+--   SHOW ALL ROUTINE LOAD FROM ods\G
+-- 本文件仅作定义留档；STOP 不可恢复（STOPPED + EndTime 已写）。实时摄入需求见
+-- docs/realtime-stage-design.md 的 A0/A1，不要再 RESUME 旧作业。

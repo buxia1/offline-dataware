@@ -37,9 +37,11 @@
 ### W2 旧链路正式退场（10-21）
 
 - ⚠️ **实测纠正**：StarRocks 3.5 **没有** `DROP/DELETE ROUTINE LOAD`（`DROP ROUTINE LOAD FOR ...` → `ERROR 1064` syntax error；`information_schema.routine_loads` 也不存在 → `ERROR 5502`）。所以"STOP + DELETE"里的 DELETE 不可执行；**"定义留档"就是 `sql/ods/ods_routine_load.sql` 留在仓库**，STOP 后作业会以 `State=STOPPED` 永久留在 FE 里（不可恢复）。
-- **执行**：`STOP ROUTINE LOAD FOR ods.ods_order_load;` / `STOP ROUTINE LOAD FOR ods.ods_order_event_load;`，并在 `sql/ods/ods_routine_load.sql` 末尾追加"A 方案已执行"注记。
+- ✅ **已执行（2026-10-21 10:57）**：`STOP ROUTINE LOAD FOR ods.ods_order_load;` 与 `ods.ods_order_event_load;` 均成功 → `SHOW ALL ROUTINE LOAD FROM ods` 显示两条 `State=STOPPED`、`EndTime=2026-10-21 02:57:39`（UTC）。
+- **踩坑**：STOP 后**普通 `SHOW ROUTINE LOAD FROM ods` 返回 `Empty set`**（已停止作业被过滤），必须 `SHOW ALL ROUTINE LOAD`；错误提示原文 `Please use another one: show all routine load job for job_name`。三条核对命令里的第 1 条需加 `ALL`。
+- `sql/ods/ods_routine_load.sql` 末尾已追加"A 方案已执行"注记。
 - **三条核对命令**：
-  1. `docker exec starrocks mysql -h 127.0.0.1 -P9030 -uroot -e "SHOW ROUTINE LOAD FROM ods\G" | grep -E 'Name:|State:'` → 两个 `STOPPED`（不再有 RUNNING/PAUSED）。
+  1. `docker exec starrocks mysql -h 127.0.0.1 -P9030 -uroot -e "SHOW ALL ROUTINE LOAD FROM ods\G" | grep -E 'Name:|State:|EndTime'` → 两个 `STOPPED`、`EndTime` 非空（普通 `SHOW` 看不到已 STOP 作业）。
   2. Kafka 位点不再前进：`kafka-get-offsets.sh` 记录此时位点，5 分钟后再跑一次，与作业 `Progress` 比对（STOPPED 后不会再提交）。
   3. 行数冻结：`SELECT count(*) FROM ods.ods_order;` = 900,000、`ods.ods_order_event` = 3,120,421，隔天不变；DS 里 `routine_load_health` 保持 release_state=0。
 - 做完这一步，README「实时摄入 = 无」的结论才算真正落地（同步到 W4 文档）。

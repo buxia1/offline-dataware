@@ -134,8 +134,10 @@
 **旧链路已退役**（四个旧工作流都还在 DS 里，但 `release_state=0` 全部离线；
 脚本收进 `scripts/legacy_warehouse/`，退役说明见该目录 README）：
 
-> ⛔ **2026-10-19 彻底退役**：两个 Routine Load（`ods_order_load` / `ods_order_event_load`）
-> 已 `PAUSE`（偏移量保留、可 `RESUME`），观察 2 天后 `STOP` + `DELETE`；
+> ⛔ **2026-10-21 彻底退役**：两个 Routine Load（`ods_order_load` / `ods_order_event_load`）
+> 2026-10-19 `PAUSE` 观察 2 天后，**2026-10-21 10:57 已 `STOP`**（`SHOW ALL ROUTINE LOAD FROM ods` 可见
+> `State=STOPPED`、`EndTime=2026-10-21 02:57:39` UTC；StarRocks 3.5 无 `DROP ROUTINE LOAD`，
+> STOP 不可恢复，作业定义永久留在 FE；"定义留档" = `sql/ods/ods_routine_load.sql`）；
 > 仓侧 `ods`/`dwd`/`dim` 自此**完全冻结**（最后构建 2026-10-14 08:51），只作对照与回滚。
 > `routine_load_health` 的监控对象一并消失 → 它的定时与流程也随之下线。
 
@@ -144,11 +146,12 @@
 | `offline_dataware` | 仓侧 `dwd → dws → ads` SQL 作业链 | 节点 4 + 5 |
 | `dim_product_chain` | 仓侧 ODS → DIM(SCD2) → SKU 宽表 | 节点 2 + 3 + 4 |
 | `order_event_chain` | 仓侧累积快照 `dwd_order_lifecycle` | 节点 4（`lake.dwd.dwd_order_lifecycle`） |
-| `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⛔ **2026-10-19 一并退役**：监控对象已 PAUSE，无替代（`check_routine_load.sh` v2 留仓库当历史） |
+| `routine_load_health` | Routine Load 健康检查（Kafka → **仓侧 ODS**） | ⛔ **2026-10-21 一并退役**：监控对象已 `STOP`，无替代（`check_routine_load.sh` v2 留仓库当历史） |
 
 > **关于 Routine Load（2026-10-16 实测，2026-10-19 已停）**：`ods_order_load`（→ `ods.ods_order`）与
-> `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**已于 2026-10-19 `PAUSE`**
-> （PAUSE 前最后一次实测都是 `RUNNING`、`OffsetLag=1`、`ErrorLogUrls` 空；恢复用 `RESUME`），
+> `ods_order_event_load`（→ `ods.ods_order_event`）两个常驻作业**2026-10-19 `PAUSE`、2026-10-21 `STOP`**
+> （STOP 前最后一次实测 `CurrentTaskNum=0`、`ErrorLogUrls` 空；**STOP 后不可 `RESUME`**，
+> 普通 `SHOW ROUTINE LOAD` 不再显示它们，必须 `SHOW ALL ROUTINE LOAD FROM ods` 才看得到 `State=STOPPED`），
 > 方向是 **Kafka → 仓侧 `ods.*`**，与湖侧**没有任何数据流**（湖侧是
 > `scripts/lake/lake_ods_replay.py` 独立批式读同一批 topic 重放进 Iceberg）。
 > ✅ **`scripts/check_routine_load.sh` 已于 2026-10-18 修为 v2，可直接上线**（只差在 DS 里建
@@ -700,8 +703,9 @@ SELECT * FROM dwd.dwd_order_lifecycle WHERE order_id = 20260920000;
 ```
 
 
-> **ODS 摄入已不在 DS 的 DAG 里** —— 它由两条常驻 Routine Load 作业承担
-> （`ods.ods_order_event_load` / `ods.ods_order_load`），见「幂等性」。
+> **ODS 摄入已不在 DS 的 DAG 里** —— 2026-10-21 前由两条常驻 Routine Load 承担
+> （`ods.ods_order_event_load` / `ods.ods_order_load`，**现已 `STOP` 退役**）；当前湖侧 ODS 由
+> `lake_ods_replay` 节点从 Kafka 批式重放（见「⭐ 当前生产链路」）。
 
 
 > **历史说明**：以下三小节是**旧流程时代（仓侧链路，2026-10-16 已停用）**的做法，留作原理对照。
@@ -896,9 +900,9 @@ docker compose exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "
 SELECT dt, count(*) AS rows_, count(DISTINCT concat(order_id,'-',event_type)) AS pairs
 FROM ods.ods_order_event GROUP BY dt ORDER BY dt;"
 
-# ⭐ Routine Load 状态（ODS 摄入；2026-10-09 起 → 2026-10-19 退役，现在应为 PAUSED）
-docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G"
-# 关注：State=RUNNING / Progress / ErrorLogUrls 空
+# ⭐ Routine Load 状态（2026-10-21 已 STOP 退役：普通 SHOW 不显示，必须加 ALL）
+docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ALL ROUTINE LOAD FROM ods\G"
+# 关注：State=STOPPED / EndTime 非空（历史：PauseTime 2026-10-20 01:50:36、EndTime 2026-10-21 02:57:39，UTC）
 
 # ⭐ 摄入健康检查（异常 exit 1；--list 只列状态）
 bash scripts/check_routine_load.sh;  echo "EXIT=$?"
@@ -969,7 +973,7 @@ docker compose restart dolphinscheduler
     【DS 02:00】offline_dataware_lake（11 节点，当前唯一在跑的流程）
                 Kafka/CSV ─(Spark)─► lake.* ─(StarRocks 外表)─► dws / ads ─► DQC + 对账 + 湖表维护
           ↓
-    【⛔ 已退役 2026-10-19】Routine Load → 仓侧 ods.*（两个作业已 PAUSE，10-21 后 STOP+DELETE）
+    【⛔ 已退役 2026-10-21】Routine Load → 仓侧 ods.*（两个作业已 STOP，不可恢复；定义留档 `sql/ods/ods_routine_load.sql`）
     【⛔ 已退役 2026-10-19】routine_load_health 每 30 分钟（监控对象消失，定时与流程一起下线）
     ```
     ⚠️ **事件生成器有状态**（读 `ods_order_event` 判断该发什么），**必须逐天按顺序跑，跳过某天就永远不补发**。
@@ -1916,7 +1920,10 @@ diff /tmp/before.txt /tmp/after.txt && echo "✅ 持久化成功"
 ReasonOfStateChanged: errCode = 2, msg='... Connect to ipv4#172.18.0.3:29092 failed: Connection refused'
 ```
 
-**这不是数据问题，也不是消息过期 —— 是连接失败。** `PAUSED` 不会自愈，需要手工恢复：
+**这不是数据问题，也不是消息过期 —— 是连接失败。** `PAUSED` 不会自愈，需要手工恢复（仅 2026-10-21 前有效）：
+
+> ⚠️ **2026-10-21 10:57 起本节仅作历史记录**：两个作业已 `STOP`（`EndTime` 已写，**不可 `RESUME`**）。
+> 需要实时摄入时走 `docs/realtime-stage-design.md` 的 A0（Iceberg 侧）/ A1（仓侧热层），不要再 RESUME 旧作业。
 
 ```bash
 docker exec starrocks mysql -P9030 -h127.0.0.1 -uroot -e "SHOW ROUTINE LOAD FROM ods\G" | grep -E "Name:|State:|ReasonOfStateChanged"
