@@ -1974,7 +1974,14 @@ SKU 关联用 `inner` 静默丢单、lifecycle 增量语义不完整、湖侧写
 `docs/backup-restore-and-backfill.md` —— **什么要备 / 怎么备 / 坏了怎么恢复 / 补数边界**：
 资产清单（谁可重建、谁不可）、S1~S7 恢复场景矩阵、每日/每周备份 SOP、恢复演练模板与验收基线、
 Kafka 30 天窗口外怎么补、以及三条硬约束（`--databases` 禁用、热备 Kafka 不一致、FE 恢复必须先移走 `bdb`）。
-配套代码 `scripts/backup/*.sh` + `scripts/backfill.sh`（待落地，规范以本文为准）。
+配套代码 `scripts/backup/*.sh` + `scripts/backfill.sh` 已落地；每天 03:00 / 每周日 03:30 由 DS 两个工作流编排。
+**2026-10-21 已完成首次恢复演练**（S1/S3-a/S4/S5/S6 实测通过，记录见手册 §10）。
+
+#### 📘 实时化设计草案（2026-10-21，待拍板）
+
+`docs/realtime-stage-design.md` —— 方向 5「实时链路」的选型对比、硬约束与 PoC 清单：
+三案对比（Flink / Routine Load / Structured Streaming）、推荐 A′（独立 RT 表 + 独立 `spark-rt` 容器）、零内存备选 A0（5 分钟幂等覆盖）、以及 **3 个待拍板点**（形态、内存从哪挤、热层对外边界）。
+PoC 代码/命令骨架见 §5（容器、RT 表 DDL、`rt_ingest.py`、观测与 DQC 判据）。
 
 #### 📘 DS 调度接线规格
 
