@@ -86,6 +86,19 @@
 | ④ 对象存储 MinIO/S3 | ⬜ 未开工：仍是本地文件系统（MinIO-ready）；MinIO `GetObject AccessDenied` 未解，备选 SeaweedFS | 新增 **A8** |
 | ⑤ 实时化 | ✅ **A0 已上线并验收（2026-10-21 13:25 起）**：DS 工作流 `rt_refresh_5m`（定义 id 57，cron `0 0/5 * * * ? *`），单次 25~30s、幂等、与 02:00 共用串行锁，只让湖 ODS 当日分区 5 分钟新鲜；落地记录见 `docs/realtime-stage-design.md` §5.9。**A1（独立 spark-rt 容器 +1.2g）留二期** | **C1** |
 
+### 2.1 D1 真实数据接入（深化主线，2026-10-21 立项，进行中）
+
+> 来源：10-21 你定的深化方向（更多技术栈 / 更复杂表关系 / 更多字段 / 真实数据来源），并明确"先做 D1、要更大的数据集、不要 Olist 那种同质化的"。
+
+- **选型**：主 = dunnhumby《The Complete Journey》（8 表 / 约 4,000 万行 / 约 2.5GB / 营销触达 + 优惠券 + 曝光因果，同质化低）；
+  规模校验 = NYC TLC 2022–2024（约 1.2~1.3 亿行 parquet）；备选 = Yelp 8.6GB（JSON/文本）、Stack Exchange（XML/强关系）。
+- **边界**：`lake.retail.*` 与现有 mock 的 `lake.ods/dim/dwd/dws/ads` 隔离；retail 是**回填型**工作流（手动/数据更新时触发），
+  不接日更调度、不写主台账（单独 `retail_ledger.csv`），保住 7 天对账判据不被污染。
+- **交付**：`docs/d1-real-data-ingestion-plan.md`（选型对比 + 8 表 ODS/DIM/DWD/DWS/ADS 设计 + 7 节点 DAG +
+  DQC 10 条 + 验收 7 条 + 内存耗时预算 + 风险 8 条 + 命令清单）。
+- **状态**：文档已起草并入库；待你回家确认数据集与下载渠道后，我补精确 schema 与 D2 建模文档，你落地 `scripts/retail/*` 与 DS 工作流。
+- **工作量**：3~5 天（每天 1~2 小时），Step 2（ODS schema）与 Step 4（事实粒度）最费时。
+
 ### 包 A｜生产化与容量（建议先做，1~2 周）
 
 - **A1 容量与资源基线（1 天）**：现在可行但余量薄 —— WSL 可用 6.4Gi，starrocks 76%、DS 70%，容器 limit 之和 ≈19GB（严重超卖，靠空闲才没炸）。产出 `docs/capacity.md`：每天 1 万单的实测画像、10x（10 万单/天）需要的内存/磁盘/Kafka 分区、16GB 宿主下的上限结论。
