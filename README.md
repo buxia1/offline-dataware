@@ -183,6 +183,7 @@
 - 节点跑在 DS 容器内（root），因此 compose 里必须有 `- ./:/opt/offline-dw`（`./scripts`、`./sql` 是更深的只读子挂载）。**重建 DS 容器前确认这条还在。**
 - 备份产物不进 git（`.gitignore` 的 `/backups/`）；保留：日报 7 天、周报 28 天；`MIRROR=1` 时另同步一份到 `/mnt/d/offline-dw-backups`。
 - 恢复/补数：`scripts/backup/restore_{ds,fe,lake}.sh`、`scripts/backfill.sh`；口径、场景矩阵与验收基线见 `docs/backup-restore-and-backfill.md`。
+- **恢复演练（2026-10-21 实测）**：S1 仓侧重建 **5 s**、S3-a 窗口内重放 30 s 幂等、S4 DS 元库恢复 **60 s**、S5 FE image 恢复 **2 min**（FE 起 16 s，需 `start_with_incomplete_meta`）、S6 warehouse 解包校验 2 s；S7 整机重装为桌面推演。记录见手册 §10。
 - **为什么不用 cron**：WSL 的 cron 不随开机自启、命令要宿主路径与权限、且没有告警/历史/重试；DS 已具备告警组与运行历史。
 
 ---

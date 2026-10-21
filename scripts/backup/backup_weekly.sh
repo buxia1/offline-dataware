@@ -63,7 +63,9 @@ mv "$DEST/tmp"/* "$DEST"/; rmdir "$DEST/tmp"
 log "完成: $DEST ($(du -sh "$DEST" | cut -f1))"
 if [ -d "$MIRROR_DIR" ] && [ -n "${MIRROR:-0}" ]; then
   mkdir -p "$MIRROR_DIR/weekly"; rm -rf "$MIRROR_DIR/weekly/$DAY"
-  cp -a "$DEST" "$MIRROR_DIR/weekly/"; log "已镜像到 $MIRROR_DIR/weekly/$DAY（9p 丢 owner/mode，仅副本）"
+  cp -r --no-preserve=ownership,timestamps "$DEST" "$MIRROR_DIR/weekly/" 2>/dev/null \
+    && log "已镜像到 $MIRROR_DIR/weekly/$DAY（9p 丢 owner/mode，仅副本）" \
+    || log "⚠️ 镜像失败（主份已生成本地备份）"
 fi
 find "$OUT/weekly" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETAIN_DAYS" -exec rm -rf {} + 2>/dev/null || true
 

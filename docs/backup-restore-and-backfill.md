@@ -55,6 +55,9 @@
 - 正确姿势：`ALTER SYSTEM CREATE IMAGE`（强制落一个新 image）→ 打包 `meta/image` → 恢复时停 FE、**先把 `meta/bdb` 改名移走**、替换 `meta/image`、起 FE。
 - ⚠️ **不移走 bdb 是最隐蔽的错**：bdb 是 image 之后的 redo journal（`CheckpointController.deleteOldJournals` 只清 image 之前的），不移走 FE 会把更新的 journal 重放回来，看起来"恢复没生效"。
 - 代价：image 里的 `bdb` 需要回放到最新（丢掉"上次 image 之后"的增量，通常只有几分钟的 catalog 变更）—— 对每天 02:00 跑一次批量的系统可接受。
+- ⚠️ **2026-10-21 演练实测（关键）**：只放 image、把 `bdb` 整体移走后，FE **拒绝启动**，日志原文：
+  `MetaHelper.checkMetaDir(): image exists, but bdb dir is empty, set start_with_incomplete_meta to true if you want to forcefully recover from image data`。
+  所以恢复流程必须**临时**在 `starrocks/fe/conf/fe.conf` 追加 `start_with_incomplete_meta = true`；恢复成功后再删掉该行重启一次（实测 12 s 正常起），否则以后每次启动都会跳过元数据一致性检查。`scripts/backup/restore_fe.sh` 已内置这两步。
 
 ### 2.3 被 `.gitignore` 排除、必须由备份兜住的对象（2026-10-20 实测核对）
 
@@ -132,12 +135,12 @@ sha256sum -c manifest.sha256
 
 | # | 场景 | 典型触发 | 影响面 | 恢复动作 | 预计 RTO | 数据损失 |
 |---|---|---|---|---|---|---|
-| **S1** | 仓侧 dws/ads 数据错/缺失 | 物化失败、口径改错 | 报表数字错 | 从湖侧重物化 + 对账（`bash scripts/run_dws_ads_from_lake.sh --date <dt>` 幂等，可回填） | 10~20 min | 无（湖在） |
+| **S1** | 仓侧 dws/ads 数据错/缺失 | 物化失败、口径改错 | 报表数字错 | 从湖侧重物化 + 对账（`bash scripts/run_dws_ads_from_lake.sh --date <dt>` 幂等，可回填） | **实测 5 s**（--truncate 全量重灌 + 自检） | 无（湖在） |
 | **S2** | 湖侧 `dwd/ads/dws` 某天算错 | 逻辑 bug、脏数据已进湖 | 加工层错 | 修逻辑 → 单天重算（`run_dwd.sh incremental all --lookback N` 或按天重跑）→ 物化 → 对账 | 20~40 min | 无（lake.ods 在） |
-| **S3** | 湖侧 `lake.ods` 某 dt 缺/坏 | replay 静默 0 条、重放写坏 | **真源缺失** | ① ≤30 天：Kafka 重放该天（`lake_ods_replay.sh --date`）→ 下游重算；② >30 天：找 warehouse 备份恢复该表目录；③ 两者都无：数据永久丢失（这就是要备份的理由） | 30~60 min | ≤1 个 dt |
-| **S4** | DS 元库损坏/误删 | 误 `DROP DATABASE`、磁盘坏 | 调度瘫痪 | 停 DS → 导入最近 dump → 起 DS → 核对流程/定时/告警 → 重导 `dolphin/*.json` 比对 | 15~30 min | 上次 dump 后新增的实例历史 |
-| **S5** | FE 元数据损坏 | 升级失败、误删 `meta/` | 仓侧不可查 | 停 starrocks → 用最近 `fe_image.tar.gz` 还原 `meta/image` → 起 → 跑 `scripts/lake/sr_catalog_reset.sh`（external catalog 缓存必须重建）→ 若 BE 也丢，走 S6 重建内部表 | 20~40 min | 上次 image 后的 catalog 变更 |
-| **S6** | Iceberg warehouse 损坏/误删 | `rm -rf` 误伤、磁盘坏 | **湖全没了** | 停 spark/starrocks 对湖的写入 → 还原 `lake_warehouse.tar.gz` → 10 表 `count(*)` 比对基线 → catalog reset → `recon_lake_wh.sh` → 当日重跑 | 60~120 min | 上次周备份之后的新增 |
+| **S3** | 湖侧 `lake.ods` 某 dt 缺/坏 | replay 静默 0 条、重放写坏 | **真源缺失** | ① ≤30 天：Kafka 重放该天（`lake_ods_replay.sh --date`）→ 下游重算（**实测：重放 30 s、行数逐字不变、对账 23 项 OK**）；② >30 天：找 warehouse 备份恢复该表目录；③ 两者都无：数据永久丢失（这就是要备份的理由） | 30~60 min | ≤1 个 dt |
+| **S4** | DS 元库损坏/误删 | 误 `DROP DATABASE`、磁盘坏 | 调度瘫痪 | 停 DS → `DROP/CREATE DATABASE` → 导入最近 dump → 起 DS → 核对流程/定时/告警 → **用带 `scheduleTime` 的 API 触发一次工作流**（漏这个参数报 50014） | **实测 60 s**（停→导 6 s→起 44 s） | 上次 dump 后新增的实例历史 |
+| **S5** | FE 元数据损坏 | 升级失败、误删 `meta/` | 仓侧不可查 | 停 starrocks → `mv meta/bdb` 移走 → 还原 `meta/image` → **`fe.conf` 临时加 `start_with_incomplete_meta = true`**（不加 FE 拒启）→ 起（实测 16 s）→ 成功后删该行再重启 → 跑 `sr_catalog_reset.sh` | **实测 2 min 内** | 上次 image 后的 catalog 变更 |
+| **S6** | Iceberg warehouse 损坏/误删 | `rm -rf` 误伤、磁盘坏 | **湖全没了** | 停 spark/starrocks 对湖的写入 → 还原 `lake_warehouse.tar.gz` → 10 表 `count(*)` 比对基线 → catalog reset → `recon_lake_wh.sh` → 当日重跑 | 实测：解包 1~2 s + 独立 catalog 校验 10 表一致；**真实 swap 到原路径未做**（演练用隔离目录，不碰生产） | 上次周备份之后的新增 |
 
 > ⚠️ **S6 必须恢复到原路径**：Iceberg metadata 里记的是绝对路径（`file:///opt/offline-dw/lake/warehouse/...`），解到 `/tmp` 或别的目录再指 catalog 是无效演练（读到的是新目录里的旧 metadata，数据仍指向原文件）。正确做法是 §7.3 的 swap 流程。
 | **S7** | 整机重装 / WSL 毁 | 系统事故 | 全停 | 按 §6.2 顺序恢复（compose → 容器 → 4 类数据 → 代码 → 全链路验收） | 2~4 h | 取决于备份 |
@@ -259,11 +262,9 @@ bash scripts/backup/backup_weekly.sh --with-kafka
 | 踩到的坑 | |
 | 对备份脚本的修改 | |
 
-### 7.3 首次演练计划（建议 10 月内完成）
+### 7.3 首次演练（2026-10-21 已完成，记录见 §10）
 
-- **S4（最容易、最有价值）**：在**另一个 scratch MySQL 库**上导入 dump、核对 65 表 + 流程定义 + 定时 crontab，不碰生产。这一步今天就能做（验证员已在做，结果见回报）。
-- **S6（最关键）**：**必须恢复到原路径**（见 §4 的 S6 警告，Iceberg metadata 是绝对路径）。流程：`docker compose stop spark` → `mv lake lake.bak.<时间戳>` → `tar -xzf lake_warehouse.tar.gz` → `start spark` → 用 `spark-sql` 或 StarRocks `lake` catalog 核 10 表行数（基线 §8）→ **验证通过后决定保留新目录还是 `mv` 回旧目录**（演练不通过时 `mv lake.bak.* lake` 即回滚）。整个过程生产停 Spark 约 2~4 分钟，建议在 02:00 批量之后、无报表查询的时段做。
-- **S5（需要停机窗）**：选一个不跑批的时段，**先在临时目录里演练** `meta/image` 替换流程，再决定是否真停 FE 演练。至少确认"只替换 image 目录、重启后 catalog 正常、reset 后能查湖"。
+S1、S3-a、S4、S5、S6 已在真实环境实机演练并通过；S7 整机重装为桌面推演（分步命令已分别由 D2/D3/D4/D5 验证）。**结论：备份可用，RTO 全部低于原估计。** 下次建议做 S7 端到端（换机或重建 WSL 时顺带补做）。
 
 ### 7.4 验收判据（恢复成功的定义）
 
@@ -285,6 +286,7 @@ bash scripts/backup/backup_weekly.sh --with-kafka
 | DS dump 导入 scratch 库 | 65 表 / 5 流程定义 / 5 条定时（1 条上线）可查 | DS 调度真能跑 |
 | FE image `crc32(image.<id>) == checksum.<id>` | 镜像自身完整（checksum 是 CRC32 十进制实测证实） | FE 真能起 |
 | lake 解档后 md5 清单比对 | 与现场逐字节一致 | Spark 真能写 |
+| 真停 FE → 换 image → 起 → `current_version()` + 10 表计数 | FE 真能用这份 image 起起来（2026-10-21 演练新增，第一次就因为缺 `start_with_incomplete_meta` 失败） | 恢复后新写入是否与 BE 一致 |
 | Kafka 解档条目 / offset 基线 | 日志齐全 | broker 能起；热备不保证崩溃一致 |
 
 **能恢复 ≠ 校验通过**：真正的"能恢复"只有 §7.3 演练能证明。
@@ -311,11 +313,11 @@ bash scripts/backup/backup_weekly.sh --with-kafka
 
 | # | 限制 | 影响 | 处置 |
 |---|---|---|---|
-| 1 | **当天首次跑真实定时尚未发生**（02:00 未触发过） | 不知道自动定时是否稳 | 10-21 09:00 提醒核对（已有） |
-| 2 | WSL 里没有常驻 cron | 每日备份可能不自动跑 | 二选一：`service cron start` + `crontab`；或把备份做成 DS 第 12 个节点（推荐后者，复用告警与台账） |
+| 1 | **02:00 真实定时尚未触发过**（10-19/10-20/10-21 三次均未触发；根因：Docker Desktop `AutoStart=False`，WSL 08:58 才起） | 不知道自动定时是否稳 | 二选一：打开 Docker Desktop 开机自启；或建 01:50 的 Windows 计划任务拉起 Docker |
+| 2 | ~~WSL 里没有常驻 cron~~ **已解决** | — | 备份已改成 DS 两个独立工作流（2026-10-20/21），cron 仅作兜底 |
 | 3 | Kafka 备份需停 Kafka 或接受不一致 | 周备窗口 30 秒级停机 | 先只做"topic 元数据 + offset 快照"，Kafka 数据本身等放量后再议 |
 | 4 | Iceberg 快照回滚（`rollback_to_snapshot`）未验证 | S3 的"窗口外恢复"少一条路 | 标记 ⏳ 待验证；当前一律用 warehouse tar 恢复 |
-| 5 | BE 重建 RTO 未实测 | S5/S6 的 RTO 是估计值 | 首次演练补测 |
+| 5 | ~~BE 重建 RTO 未实测~~ **已实测** | — | 仓侧 dws/ads 全量 `--truncate` 重建 **5 s**（见 §10 D5） |
 | 6 | 备份未进 git（体积大） | 备份清单/基线文件要进 git，数据不进 | 只提交 `scripts/backup/`、基线文件、本文档 |
 | 7 | FE image 生成要等 checkpoint 周期（实测 0.2 s 返回、最晚 72 s 落盘；FE 自己也约 2 分钟轮转一次） | 每日备份耗时 ≈80 s | 可接受（03:00 无批处理）；校验必须轮询 journalId，不能只看"号变了" |
 | 8 | image 每轮转一次 `MetaCleaner` 立刻删旧 image | 打包瞬间撞车可能 tar 到正在删的文件 | 归档后立刻 `tar -tzf` 校验；失败重试一次 |
@@ -324,6 +326,30 @@ bash scripts/backup/backup_weekly.sh --with-kafka
 | 11 | README 金丝雀写 `bdb` 期望 33 项、`image/v2` 2 项 | 数字会随 journal 轮转变化（实测现 46 个 .jdb） | 金丝雀只判"非空且可读 + clusterId 对"，别比固定数字（README 已同步改） |
 
 ---
+
+## 10. 首次恢复演练记录（2026-10-21，实机）
+
+> 执行方式：真实生产容器上做，每步先取基线、失败自动回滚；S7 为桌面推演。基线 = §8 + 湖 10 表行数 + `recon 26 项`。
+
+| 编号 | 场景 | 动作 | 实测结果 | 耗时 |
+|---|---|---|---|---|
+| D0 | 基线 | 采集版本/catalog/10 表行数/仓侧行数/DS 元数据/FE image | 全部留档，`recon 26/26 OK` | 20 s |
+| D1 | S3-a（窗口内补数） | `lake_ods_replay.sh --date 2026-10-20` 重放 | 分区行数 `10000 / 33680` 逐字不变、对账 23 项 OK（幂等） | 30 s |
+| D2 | S6（warehouse） | 周备 `lake_warehouse.tar.gz`（129 MB / 6230 条目）解到隔离目录，独立 catalog `lake_rst` 读 10 表 | 10 表行数与生产逐项一致；解包 2 s；**生产目录未被触碰** | ~40 s |
+| D3 | S5（FE image） | 停 starrocks → `mv bdb`（46 个 .jdb / 315 MB）→ 还原 image → 起 | 首次失败（见下方坑 1）；加 `start_with_incomplete_meta` 后 **16 s 起**，版本 `3.5.0-10d7323`、`default_catalog+lake`、湖表/`dws`/`ads` 行数全一致；去掉开关再重启 12 s 仍正常；`recon 26/26 OK` | ~2 min |
+| D4 | S4（DS 元库） | 现做 dump（92 K）→ 停 DS → `DROP/CREATE DATABASE` → 导入（6 s）→ 起 DS（44 s） | 7 定义 / 33 任务 / 7 定时（3 上线）/ 395 实例 / admin 逐项一致；再用 API 触发备份工作流 → **实例 409 全绿** | ~1 min |
+| D5 | S1（仓侧重建） | `run_dws_ads_from_lake.sh --truncate` | dws 18000 行 / ads 90 行重建，`paid=119749476.90`、`net=105680366.50` 与重建前逐字一致；自检 + 对账 26 项 OK | **5 s** |
+| D6 | S7（整机） | 桌面推演：按 §6.2 顺序逐条核对命令 | 各步已由 D2/D3/D4/D5 单独验证；缺"从零 compose + 数据卷"端到端 | — |
+
+**踩到并已修回的坑：**
+
+1. **FE 只放 image 会拒启**：`image exists, but bdb dir is empty, set start_with_incomplete_meta to true ...` → `restore_fe.sh` 已内置"加开关 → 恢复 → 删开关并重启"；
+2. **`tar` 顶层是 `lake/warehouse/...`**：解到隔离目录必须 `--strip-components=1`，否则 catalog 指向空目录；
+3. **Spark 读 Iceberg 必须显式写 catalog 类**：`--conf spark.sql.catalog.X=org.apache.iceberg.spark.SparkCatalog`（只给 `.type` 会 `Catalog 'X' plugin class not found`）；或 `--conf spark.sql.defaultCatalog=X` 后写两段式表名；
+4. **DS API 手工触发必须带 `scheduleTime`**（漏了报 `MissingServletRequestParameterException` → 50014）；返回的 `data` 是定义 code，实例 id 要查 `t_ds_process_instance`；
+5. **`/mnt/d` 镜像不能用 `cp -a`**（9p 刷 `Operation not permitted`）→ 周报镜像已改 `cp -r --no-preserve=ownership,timestamps`。
+
+**结论**：S1 / S3-a / S4 / S5 / S6 的恢复动作全部实测可用；RTO 均低于原估计（S1 5 s、S4 60 s、S5 2 min）；唯一未实机的是 S7 整机重装。
 
 ## 附录 A：命令速查
 
@@ -356,6 +382,7 @@ docker compose -f /home/l/offline-dw/docker-compose.yml stop starrocks
 mv /home/l/offline-dw/starrocks/fe/meta/bdb /home/l/offline-dw/starrocks/fe/meta/bdb.bak.$(date +%s)
 rm -rf /home/l/offline-dw/starrocks/fe/meta/image/*
 tar -xzf fe_image.tar.gz -C /home/l/offline-dw/starrocks/fe/meta       # 归档根是 image/
+echo 'start_with_incomplete_meta = true' >> /home/l/offline-dw/starrocks/fe/conf/fe.conf   # ★ 实测必需（否则 FE 拒启）
 docker compose -f /home/l/offline-dw/docker-compose.yml start starrocks
 bash /home/l/offline-dw/scripts/lake/sr_catalog_reset.sh
 # 湖数据
