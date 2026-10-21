@@ -993,6 +993,16 @@ docker compose restart dolphinscheduler
     `dl.min.io` 上的 server 与 `mc` 二进制均返回 **410 Gone**，`quay.io`/`bitnami`/各加速站全不可用。
     免费路径只剩 `cgr.dev/chainguard/minio`。**故湖层第一阶段先用本地文件系统。**
 
+23. ⭐ **02:00 定时能不能触发，取决于 Docker Desktop 是否在运行**（2026-10-21 补充）——
+    容器都是 `restart: unless-stopped`，但 **Docker Desktop 没启动时 Docker daemon 和 WSL 都不存在，容器根本不会起来，DS 也就无从触发**。
+    实测：`%APPDATA%\Docker\settings-store.json` 里 `AutoStart=false`，于是 **2026-10-19 / 10-20 / 10-21 三天 02:00 全部缺跑**；
+    10-21 那天 WSL 直到 08:58 才随 Docker Desktop 启动（容器 08:58:30 起），首次真实自动跑仍未发生。
+    - 修法（二选一）：① Docker Desktop → Settings → General → 勾 **Start Docker Desktop when you sign in**；
+      ② Windows 任务计划程序建 01:50 任务运行 `"C:\Program Files\Docker\Docker\Docker Desktop.exe"`（选"不管用户是否登录都要运行"）。
+    - 缺跑补跑：DS UI 点「执行」；或临时令牌调 OpenAPI（`t_ds_access_token` 插一行 → `POST /projects/23142056525568/executors/start-process-instance`，
+      form 必带 `processDefinitionCode` / `scheduleTime` / `warningGroupId=2`，**不要传 `timeout`**，用完删令牌）。
+    - 补跑实例的台账 `dt` = 前一天；同一 dt 多次运行各留一行（去重判据按 dt，见上文台账章节）。
+
 ## 后续方向
 
 - [x] 维度建模：商品维度、缓慢变化维（SCD1 + SCD2 拉链表）
@@ -1417,7 +1427,7 @@ wsl -u l bash -lc 'docker exec dolphinscheduler cat /opt/dolphinscheduler/logs/o
 docker exec dolphinscheduler awk -F, 'NR>1 && $11=="OK" && $26=="" && !seen[$1]++ {n++; last=$1} END{print n" 天 recon=OK（去重），最新 "last}' /opt/dolphinscheduler/logs/ops/ledger.csv
 ```
 
-⚠️ 首次生效：v8 于 2026-10-18 上线。**原定首个定时写入 2026-10-19 02:00，但 10-19 / 10-20 凌晨容器未启动、均未触发**；首次实际写入是 10-19 09:59（实例 398），首次真实自动跑待 **2026-10-21 02:00**；
+⚠️ 首次生效：v8 于 2026-10-18 上线。**原定首个定时写入 2026-10-19 02:00，但 10-19 / 10-20 / 10-21 凌晨 Docker Desktop 均未运行，三次都没触发**（根因见「已知限制 23」；首个实际写入是 10-19 09:59 手动跑的实例 398）。10-21 09:00 手工补跑两次（实例 405 UI 执行 129 秒 / 406 OpenAPI 触发 110 秒，均 11/11 绿、recon 26 项 OK），台账 dt=2026-10-20 已留痕、去重后 **4 天**（10-17 ~ 10-20）；下一次真实自动跑看 **10-22 02:00**；
 所以「连续 7 天零差异」最早在 **2026-10-25** 出数。
 
 ### ⭐ DWD / DWS / ADS / 累积快照 灌回仓侧（2026-10-14，第 2 步主体）
