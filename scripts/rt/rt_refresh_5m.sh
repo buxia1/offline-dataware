@@ -13,7 +13,10 @@ LOCK_DIR="${LOCK_DIR:-/tmp/.spark_job.lock}"      # ★ 容器内路径
 source "$PROJ/scripts/lake/_spark_lib.sh"
 
 spark_ensure_running
-spark_acquire_lock
+LOCK_WAIT_SECONDS="${LOCK_WAIT_SECONDS:-0}"   # 5 分钟一轮：忙就跳过，绝不和 02:00 抢
+if ! spark_acquire_lock; then
+  echo "另一 Spark 作业占锁，本次跳过"; exit 0
+fi
 DATE="$(TZ=Asia/Shanghai date +%F)"
 DRIVER_MEM="${DRIVER_MEM:-700m}" SPARK_MASTER="${SPARK_MASTER:-local[2]}" \
   bash "$PROJ/scripts/lake/lake_ods_replay.sh" --date "$DATE"

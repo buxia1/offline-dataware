@@ -43,7 +43,13 @@ spark_acquire_lock() {
     echo "!!! 锁目录不可写：$LOCK_DIR（容器 $SPARK_CT 内）" >&2
     exit 70
   fi
+  LOCK_WAIT_SECONDS="${LOCK_WAIT_SECONDS:-1800}"   # 调用方可压小；0 = 拿不到锁立刻跳过
+  _lock_start=${SECONDS}
   while ! docker exec "$SPARK_CT" mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ "${LOCK_WAIT_SECONDS}" -ge 0 ] && [ $(( SECONDS - _lock_start )) -ge "${LOCK_WAIT_SECONDS}" ]; then
+      echo "… 等锁超过 ${LOCK_WAIT_SECONDS}s，本次跳过（锁仍被占用，交给下一轮）"
+      return 3
+    fi
     if docker exec "$SPARK_CT" test -d "$LOCK_DIR" 2>/dev/null; then
       age=$(( $(date +%s) - $(docker exec "$SPARK_CT" stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
       if [ "$age" -gt 1800 ]; then
