@@ -94,6 +94,21 @@
 > ✅ **失败告警已配**（2026-10-16）：该定时 `warning_type=2` + 告警组 `2`，与四个旧流程一致
 > （实测 `t_ds_schedules` id 7）。每天 02:00 这一跑失败会发通知。
 
+### ⭐ 实时化 A0（2026-10-21 起：当天 ODS 层 5 分钟新鲜）
+
+- 工作流 `rt_refresh_5m`（定义 id 57 / `release_state=1`，SHELL 任务 id 41，超时 4 分钟；定时 schedule id 10
+  `0 0/5 * * * ? *` 每 5 分钟）→ `bash scripts/rt/rt_refresh_5m.sh`。
+- 原理：复用 `lake_ods_replay.sh --date $(TZ=Asia/Shanghai date +%F)` 做**按 dt 覆盖写**（天然幂等）；与 02:00
+  批链路**共用同一把串行锁**（容器内 `/tmp/.spark_job.lock`），`DRIVER_MEM=700m` + `local[2]`。
+- 实测：单次 **25~30s**；连跑两次结果一致（总数 3,108,472、`dt=2026-10-21` 33,605、当日 `ods_order` 10,000）；
+  `spark` 容器 `OOMKilled=false / RestartCount=0`；`dwd/dws/ads` 行数不变。
+- ⚠️ **范围**：只让**湖侧 ODS** 新鲜，`dwd/dws/ads` 仍是 T+1（02:00 那跑物化）。要端到端分钟级查询需 A1
+  （独立 `spark-rt` 容器，+1.2g 内存），见 `docs/realtime-stage-design.md`。
+- ⚠️ **运维注意（2026-10-21 实测踩到）**：手工跑到一半被中断（Ctrl+C / 关终端）会残留锁，后续每 5 分钟的
+  实例都在等锁（共享库的残留判定是 **30 分钟**）→ DS 里连续几个实例超时（4 分钟）标红，30 分钟后自愈。
+  清理：`docker exec spark rm -rf /tmp/.spark_job.lock`。
+
+
 **每天 11 个节点**（1 → 2 → 3 → 4 → 5 → 6 串行；7 / 8 / 9 并行挂在 6 之后；10 挂在 7 / 8 / 9 全部结束之后；11 挂在 10 之后）：
 
 | # | 节点 | 脚本 | 建议超时 |
@@ -244,6 +259,7 @@ offline-dw/
 │   │   ── 湖侧链路（当前主线：Spark 读湖写湖）──
 │   ├── lake/                       run_ods_replay.sh / run_dim.sh / run_dwd.sh / sr_catalog_reset.sh
 │   │                                + lake_*_build.py + lake_maintain.py（见 scripts/lake/README.md）
+│   ├── rt/rt_refresh_5m.sh         ⭐ A0 实时化：每 5 分钟幂等覆盖「当天」ODS 分区（复用 lake_ods_replay.sh）
 │   │   ── 模拟数据（手工造数，不进调度）──
 │   ├── gen/                        gen_mock_orders*.py / gen_mock_products.py
 │   │   ── 仓侧物化 / 校验（DS 当前调度的入口）──

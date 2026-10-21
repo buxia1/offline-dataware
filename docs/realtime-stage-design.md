@@ -676,6 +676,25 @@ docker inspect spark --format 'oom={{.State.OOMKilled}} restarts={{.RestartCount
 
 ---
 
+### 5.9 A0 落地验收记录（2026-10-21）
+
+| 项 | 实测 |
+|---|---|
+| 代码 | `scripts/rt/rt_refresh_5m.sh`（新增 988B）+ `scripts/lake/lake_ods_replay.sh:50` 改为 `--driver-memory "${DRIVER_MEM:-1g}"`（默认值不变 → T+1 零影响） |
+| DS 定义 | `rt_refresh_5m` id **57** / code **23440390609024** / version 1 / `release_state=1`；任务 id **41**（SHELL，`bash /opt/offline-dw/scripts/rt/rt_refresh_5m.sh`，超时 **4 分钟**，失败策略 CONTINUE） |
+| 定时 | schedule id **10**，cron **`0 0/5 * * * ? *`**，`release_state=1`，Asia/Shanghai |
+| 单次耗时 | 手动 **30.1s / 25.8s**；定时实例 412（13:35）= **25s**、411（13:30）= 51s（含串行等待） |
+| 幂等性 | 连跑两次：总行数 **3,108,472** 不变、`dt=2026-10-21` **33,605** 不变、当日 `ods_order` **10,000** 不变 |
+| 资源 | `OOMKilled=false`、`RestartCount=0`；锁正常释放 |
+| 副作用 | `lake.dwd` 854,844 / 900,000、`dws` 18,000、`ads` 90 均不变（A0 只写湖 ODS 当日分区） |
+
+**踩坑（2026-10-21 实证）**：手工跑到一半被中断会残留 `/tmp/.spark_job.lock`；共享库的残留判定是 **30 分钟**，
+期间每 5 分钟的实例都在等锁 → DS 超时（4 分钟）标红；实例 410（13:25）就是这样等了 326s 才跑完并变绿。
+**改进建议**：`_spark_lib.sh` 增加可配置等待上限（如 `LOCK_WAIT_SECONDS`），A0 设 0（忙则跳过）或 60s；
+或把 A0 超时压到 2 分钟且等待上限 < 超时。
+
+---
+
 ## 6. 本阶段明确不做
 
 | 不做 | 原因 / 何时再做 |
